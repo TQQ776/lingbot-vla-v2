@@ -51,17 +51,31 @@ class RunningStats:
         Args:
             vectors (np.ndarray): A 2D array where each row is a new vector.
         """
+        # Accumulate moments in float64.  The previous float32 path computed
+        # variance as E[x^2] - E[x]^2 and could lose all precision for values
+        # clustered near 1 (for example, the scalar component of a small
+        # relative quaternion), incorrectly producing std == 0.
+        batch = np.asarray(batch, dtype=np.float64)
         if batch.ndim == 1:
             batch = batch.reshape(-1, 1)
+        if batch.ndim != 2:
+            raise ValueError(f"Expected a 1D or 2D batch, got shape {batch.shape}.")
+        if batch.shape[0] == 0:
+            raise ValueError("Cannot update running statistics with an empty batch.")
+        if not np.isfinite(batch).all():
+            raise ValueError("Cannot update running statistics with NaN/Inf values.")
 
         num_elements, vector_length = batch.shape
 
         if self._count == 0:
-            self._mean = np.mean(batch, axis=0)
-            self._mean_of_squares = np.mean(batch**2, axis=0)
+            self._mean = np.mean(batch, axis=0, dtype=np.float64)
+            self._mean_of_squares = np.mean(np.square(batch), axis=0, dtype=np.float64)
             self._min = np.min(batch, axis=0)
             self._max = np.max(batch, axis=0)
-            self._histograms = [np.zeros(self._num_quantile_bins) for _ in range(vector_length)]
+            self._histograms = [
+                np.zeros(self._num_quantile_bins, dtype=np.float64)
+                for _ in range(vector_length)
+            ]
             self._bin_edges = [
                 np.linspace(self._min[i] - 1e-10, self._max[i] + 1e-10, self._num_quantile_bins + 1)
                 for i in range(vector_length)
@@ -81,8 +95,8 @@ class RunningStats:
 
         self._count += num_elements
 
-        batch_mean = np.mean(batch, axis=0)
-        batch_mean_of_squares = np.mean(batch**2, axis=0)
+        batch_mean = np.mean(batch, axis=0, dtype=np.float64)
+        batch_mean_of_squares = np.mean(np.square(batch), axis=0, dtype=np.float64)
 
         # Update running mean and mean of squares.
         self._mean += (batch_mean - self._mean) * (num_elements / self._count)
@@ -100,8 +114,36 @@ class RunningStats:
         if self._count < 2:
             raise ValueError("Cannot compute statistics for less than 2 vectors.")
 
-        variance = self._mean_of_squares - self._mean**2
-        stddev = np.sqrt(np.maximum(0, variance))
+        variance = self._mean_of_squares - np.square(self._mean)
+        # Tiny negative values can still occur at float64 round-off scale.
+        # Reject materially negative variance instead of silently hiding it,
+        # then clamp only the harmless round-off residue.
+        moment_scale = np.maximum(np.abs(self._mean_of_squares), np.square(self._mean))
+        roundoff_tolerance = 32 * np.finfo(np.float64).eps * np.maximum(1.0, moment_scale)
+        invalid_variance = variance < -roundoff_tolerance
+        if np.any(invalid_variance):
+            dims = np.flatnonzero(invalid_variance).tolist()
+            raise ValueError(f"Computed materially negative variance for dimensions {dims}.")
+        stddev = np.sqrt(np.maximum(0.0, variance))
+
+        non_finite = ~(
+            np.isfinite(self._mean)
+            & np.isfinite(stddev)
+            & np.isfinite(self._min)
+            & np.isfinite(self._max)
+        )
+        if np.any(non_finite):
+            dims = np.flatnonzero(non_finite).tolist()
+            raise ValueError(f"Computed non-finite normalization statistics for dimensions {dims}.")
+
+        varying = self._max > self._min
+        invalid_dynamic_std = varying & (stddev <= 0)
+        if np.any(invalid_dynamic_std):
+            dims = np.flatnonzero(invalid_dynamic_std).tolist()
+            raise ValueError(
+                "Computed non-positive std for non-constant dimensions "
+                f"{dims}; use numerically stable float64 accumulation."
+            )
         q01, q99 = self._compute_quantiles([0.01, 0.99])
         q02, q98 = self._compute_quantiles([0.02, 0.98])
 
@@ -170,15 +212,15 @@ class RunningStats:
         instance = cls()
         instance._num_quantile_bins = state.num_quantile_bins
         instance._count = state.count
-        instance._mean = np.asarray(state.mean)
-        instance._mean_of_squares = np.asarray(state.mean_of_squares)
-        instance._min = np.asarray(state.min_val)
-        instance._max = np.asarray(state.max_val)
+        instance._mean = np.asarray(state.mean, dtype=np.float64)
+        instance._mean_of_squares = np.asarray(state.mean_of_squares, dtype=np.float64)
+        instance._min = np.asarray(state.min_val, dtype=np.float64)
+        instance._max = np.asarray(state.max_val, dtype=np.float64)
         # After numpydantic serialization, histograms/bin_edges become a single 2D array.
         # Internally we split it back into a list[1D-array] per dim, so that
         # _update_histograms / _adjust_histograms can be reused.
-        hist = np.asarray(state.histograms)
-        edges = np.asarray(state.bin_edges)
+        hist = np.asarray(state.histograms, dtype=np.float64)
+        edges = np.asarray(state.bin_edges, dtype=np.float64)
         instance._histograms = [hist[i] for i in range(hist.shape[0])]
         instance._bin_edges = [edges[i] for i in range(edges.shape[0])]
         return instance
@@ -225,7 +267,7 @@ class RunningStats:
             new_edges = np.linspace(
                 merged_min[dim] - 1e-10, merged_max[dim] + 1e-10, num_bins + 1
             )
-            acc = np.zeros(num_bins)
+            acc = np.zeros(num_bins, dtype=np.float64)
             for o in valid:
                 old_edges = o._bin_edges[dim]
                 old_hist = o._histograms[dim]

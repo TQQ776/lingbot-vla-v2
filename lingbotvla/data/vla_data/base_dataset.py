@@ -13,8 +13,10 @@
 # limitations under the License.
 
 
-import os
 import inspect
+import math
+import os
+from collections.abc import Mapping
 from pathlib import Path
 
 import torch
@@ -40,6 +42,80 @@ from .video_utils import decode_video_frames
 
 
 logger = logging.get_logger(__name__)
+
+
+TACTHRU_UMI_V2_DATA_NAME = "tacthru_umi_v2"
+TACTHRU_UMI_V2_FPS = 30.0
+TACTHRU_UMI_V2_CHUNK_SIZE = 50
+
+
+def _config_name(value):
+    """Return a normalized dataset/robot-config name."""
+
+    if value is None:
+        return ""
+    return Path(str(value)).stem.lower().replace("-", "_")
+
+
+def is_tacthru_umi_v2(data_name=None, robot_config_path=None):
+    """Identify the TacThru v2 dataset by data name or robot-config file."""
+
+    return any(
+        _config_name(candidate) == TACTHRU_UMI_V2_DATA_NAME
+        for candidate in (data_name, robot_config_path)
+    )
+
+
+def _episode_records(episodes):
+    """Yield episode metadata records across common LeRobot representations."""
+
+    if episodes is None:
+        return
+    if hasattr(episodes, "iterrows"):
+        for _, record in episodes.iterrows():
+            yield record
+        return
+    if isinstance(episodes, Mapping):
+        # Some metadata readers expose a dict keyed by episode index.
+        if "dataset_from_index" not in episodes:
+            yield from episodes.values()
+            return
+        # Also accept column-oriented metadata for small tests/tooling.
+        starts = episodes["dataset_from_index"]
+        ends = episodes["dataset_to_index"]
+        if not hasattr(starts, "__len__"):
+            yield episodes
+            return
+        for start, end in zip(starts, ends):
+            yield {"dataset_from_index": start, "dataset_to_index": end}
+        return
+    yield from episodes
+
+
+def build_complete_chunk_anchor_indices(episodes, chunk_size):
+    """Return physical anchors whose full action chunk stays in one episode.
+
+    ``dataset_to_index`` follows LeRobot's exclusive-end convention.  A chunk
+    of length 50 therefore removes the final 49 anchors of every episode.
+    """
+
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+
+    required_future = chunk_size - 1
+    anchors = []
+    for record in _episode_records(episodes):
+        try:
+            start = int(record["dataset_from_index"])
+            end = int(record["dataset_to_index"])
+        except (KeyError, TypeError) as exc:
+            raise ValueError(
+                "Episode metadata must contain dataset_from_index and dataset_to_index"
+            ) from exc
+        if end < start:
+            raise ValueError(f"Invalid episode bounds: [{start}, {end})")
+        anchors.extend(range(start, max(start, end - required_future)))
+    return anchors
 
 
 def _to_relative_indices(dataset, query_indices):
@@ -195,12 +271,14 @@ class VLADataset(Dataset):
         self.use_future_image = use_future_image
 
         load_image = True if do_nomalize else False
+        robot_config = os.path.join(robot_config_root, f'{data_name}.yaml')
+        self.is_tacthru_umi_v2 = is_tacthru_umi_v2(data_name, robot_config)
 
         if feature_transform is None:
-            robot_config = os.path.join(robot_config_root, f'{data_name}.yaml')
             self.feature_transform = FeatureTransform(robot_config, dataset_config, self.config, \
                         processor, disabled_image_features, do_nomalize, \
                         chunk_size=chunk_size, return_item_befor_padding=return_item,\
+                        norm_stats_path=getattr(dataset_config, 'norm_stats_file', None),
                         image_augment=image_augment, use_depth_align=use_depth_align,
                         use_future_image=use_future_image)
         else:
@@ -225,10 +303,29 @@ class VLADataset(Dataset):
             load_image=load_image
         )
 
+        self.sample_indices = None
+        if self.is_tacthru_umi_v2:
+            fps = float(self.dataset_meta.fps)
+            if not math.isclose(fps, TACTHRU_UMI_V2_FPS, rel_tol=0.0, abs_tol=1e-6):
+                raise ValueError(
+                    f"{TACTHRU_UMI_V2_DATA_NAME} must be a 30 Hz LeRobot dataset, got {fps} Hz"
+                )
+            if self.chunk_size != TACTHRU_UMI_V2_CHUNK_SIZE:
+                raise ValueError(
+                    f"{TACTHRU_UMI_V2_DATA_NAME} requires the official chunk_size=50, "
+                    f"got {self.chunk_size}"
+                )
+            self.sample_indices = build_complete_chunk_anchor_indices(
+                self.dataset_meta.episodes,
+                self.chunk_size,
+            )
+
         self.return_item = return_item
         self.transform = transform
 
     def __len__(self):
+        if self.sample_indices is not None:
+            return len(self.sample_indices)
         return len(self.dataset)
 
     def get_features(self):
@@ -258,7 +355,7 @@ class VLADataset(Dataset):
         fps = self.dataset_meta.fps
         if self.use_future_image:
             offsets = [0, (self.chunk_size - 1) / fps]
-            return {cam: offsets for cam in self.feature_transform.org_features['images']}
+            return dict.fromkeys(self.feature_transform.org_features['images'], offsets)
         else:
             return {}
 
@@ -279,6 +376,12 @@ class VLADataset(Dataset):
         return item
 
     def getitem(self, idx):
+        if self.sample_indices is not None:
+            if idx < 0:
+                idx += len(self.sample_indices)
+            if idx < 0 or idx >= len(self.sample_indices):
+                raise IndexError(f"Index {idx} out of bounds for dataset of size {len(self)}")
+            idx = self.sample_indices[idx]
         raw_item = self.check_lerobot_item(self.dataset[idx])
         if (
             self.use_future_image

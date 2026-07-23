@@ -19,6 +19,7 @@ import torch.nn.functional as F
 
 logger = logging_utils.get_logger(__name__)
 
+
 def compute_image_token_count(images, image_grid_thw=None, merge_size=2, use_vision_boundaries=True):
     if not isinstance(images, torch.Tensor) or images.numel() == 0:
         return 0
@@ -112,14 +113,17 @@ class FeatureTransform:
             self.image_augment = image_augment
         
         # keep the self.feature_to_keep in lerobot item when convert to new item
-        self.feature_to_keep = set([
+        self.feature_to_keep = {
             'timestamp',
             'frame_index',
             'episode_index',
             'task_index',
             'action_is_pad',
             'task',
-        ])
+            # Native-depth/DINO training needs the actual temporal distance
+            # between the current image and the final action-horizon image.
+            'future_video_effective_fps',
+        }
 
         target_features  = {'states':[], 'actions':[], 'images':[]}
         org_features  = {'states':set(), 'actions':set(), 'images':set()}
@@ -451,6 +455,7 @@ class FeatureTransform:
         
         lang_tokens, lang_masks = prepare_language(self.model_config, self.tokenizer, batch_dict) # bs, seq_len
         action_is_pad = batch_dict['action_is_pad']
+        future_video_effective_fps = batch_dict.get('future_video_effective_fps')
 
         state_joint_mask = batch_dict['state_joint_mask']
         assert self.model_config.max_state_dim >= state_joint_mask.shape[-1], f"max_action_dim is smaller than the state joint dimension: {self.model_config.max_action_dim} < {state_joint_mask.shape[-1]}"
@@ -479,6 +484,8 @@ class FeatureTransform:
             }
         if image_grid_thw is not None:
             batch_dict['image_grid_thw'] = image_grid_thw
+        if future_video_effective_fps is not None:
+            batch_dict['future_video_effective_fps'] = future_video_effective_fps
 
         if self.use_depth_align: 
             batch_dict['pil_images'] = pil_images

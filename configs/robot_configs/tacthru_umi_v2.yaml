@@ -1,0 +1,34 @@
+states:
+  - observation.state.end.position:
+      origin_keys:
+        - observation.state:
+            start: 0
+            end: 7
+
+  - observation.state.effector.position:
+      origin_keys:
+        - observation.state:
+            start: 7
+            end: 8
+
+actions:
+  - action.end.position:
+      origin_keys:
+        - action:
+            start: 0
+            end: 7
+      subtract_state: true
+      relative_type: quaternion_local
+
+  - action.effector.position:
+      origin_keys:
+        - action:
+            start: 7
+            end: 8
+      subtract_state: false
+
+images:
+  # The converter maps physical camera0_rgb here. No tactile visual is copied.
+  - observation.images.camera_wrist_left
+
+norm_stats: assets/norm_stats/tacthru_umi_v2.json

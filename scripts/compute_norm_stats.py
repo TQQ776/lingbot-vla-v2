@@ -143,10 +143,17 @@ def compute_norm(dataset, batch_size, stats, state_norm_keys, acton_norm_keys, d
         )
         for batch in pbar:
             for key in state_norm_keys:
-                values = np.asarray(batch[key])
+                values = np.asarray(batch[key], dtype=np.float64)
                 stats[key].update(values.reshape(-1, values.shape[-1]))
             for key in acton_norm_keys:
-                values = np.asarray(batch[key]) if (not delta_norm[key] or norm_merge_chunk_dim) else np.asarray(batch[key].reshape(batch[key].shape[0], -1))
+                values = (
+                    np.asarray(batch[key], dtype=np.float64)
+                    if (not delta_norm[key] or norm_merge_chunk_dim)
+                    else np.asarray(
+                        batch[key].reshape(batch[key].shape[0], -1),
+                        dtype=np.float64,
+                    )
+                )
                 stats[key].update(values.reshape(-1, values.shape[-1]))
 
     del pool
@@ -210,12 +217,16 @@ if __name__ == "__main__":
 
 
     filename = '_'.join(list(set(data_names)))
-    tmp_dir = f"tmp/"
+    # Keep per-run temporary manifests under the selected output directory.
+    # The project-level tmp/ directory may be owned by the container image's
+    # root user and is not guaranteed to be writable by the training user.
+    tmp_root = Path(args.train.output_dir) if args.train.output_dir else Path(args.data.norm_path).parent
+    tmp_dir = tmp_root / "tmp"
     if rank == 0:
-        os.makedirs(tmp_dir, exist_ok=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
     if world_size > 1:
         dist.barrier()
-    filename = os.path.join(tmp_dir, f"tmp_{filename}_rank{rank}.txt")
+    filename = str(tmp_dir / f"tmp_{filename}_rank{rank}.txt")
     with open(filename, 'w') as f:
         for robot, task in zip(data_names, repo_ids):
             f.write(f"{robot} {task}\n")

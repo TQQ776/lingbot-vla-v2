@@ -118,14 +118,16 @@ class MultiVLADataset(Dataset):
         start_index = 0
         for dataset in self._datasets:
             dataset_start_index.append(start_index)
-            start_index += dataset.dataset.num_frames
+            # VLADataset may expose a filtered logical index space (for
+            # example TacThru UMI drops incomplete episode-tail chunks).
+            start_index += len(dataset)
         self.dataset_start_index = dataset_start_index
 
 
     @property
     def num_frames(self) -> int:
         """Number of samples/frames."""
-        return sum(d.dataset.num_frames for d in self._datasets)
+        return sum(len(d) for d in self._datasets)
 
    
     @property
@@ -143,7 +145,13 @@ class MultiVLADataset(Dataset):
         dataset_idx = np.searchsorted(self.dataset_start_index,  np.array([idx]), side='right') - 1
         dataset_idx = dataset_idx[0]
         dataset = self._datasets[dataset_idx]
-        item = dataset.getitem(idx - self.dataset_start_index[dataset_idx])
+        local_idx = idx - self.dataset_start_index[dataset_idx]
+        if local_idx < 0 or local_idx >= len(dataset):
+            raise IndexError(
+                f"Local index {local_idx} out of bounds for dataset {dataset.data_name} "
+                f"of size {len(dataset)}"
+            )
+        item = dataset.getitem(local_idx)
 
         if isinstance(item, list):
             if len(item) != 1:

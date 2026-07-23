@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Project-local environments and caches
+.venv/
+.uv/
+.hf/
+
+# Server-only runtime artifacts (repository-root directories only)
+/models/
+/data/
+/output/
+/wandb/
+/runs/
+/tmp/
+log.txt
+/logs/
+/.rollback/
+
+# TacThru source/converted datasets and generated statistics
+*.zarr
+*.zarr.zip
+/assets/norm_stats/tacthru*.json
