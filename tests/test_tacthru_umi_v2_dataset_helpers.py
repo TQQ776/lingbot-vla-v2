@@ -40,6 +40,10 @@ def test_tacthru_v2_detection_accepts_data_name_or_config_path():
     assert is_tacthru_umi_v2(data_name="tacthru_umi_v2")
     assert is_tacthru_umi_v2(data_name="tacthru-umi-v2")
     assert is_tacthru_umi_v2(robot_config_path="configs/robot_configs/tacthru_umi_v2.yaml")
+    assert is_tacthru_umi_v2(data_name="tacthru_umi_v2_tactile")
+    assert is_tacthru_umi_v2(
+        robot_config_path="configs/robot_configs/tacthru_umi_v2_tactile.yaml"
+    )
     assert not is_tacthru_umi_v2(data_name="robotwin")
 
 
@@ -238,6 +242,67 @@ def test_tacthru_v2_actions_use_contiguous_30_hz_frames():
     )
 
     assert dataset.get_delta_timestamps()["action"] == [step / 30 for step in range(50)]
+
+
+def test_tactile_history_offsets_are_independent_from_action_and_future_video():
+    dataset = VLADataset.__new__(VLADataset)
+    dataset.chunk_size = 50
+    dataset.use_future_image = True
+    dataset.dataset_meta = SimpleNamespace(fps=30)
+    dataset.feature_transform = SimpleNamespace(
+        actions_convert_from_state={},
+        org_features={
+            "actions": ["action"],
+            "states": [],
+            "images": ["observation.images.camera_wrist_left"],
+        },
+    )
+    dataset.tactile_rgb_enabled = True
+    dataset.tactile_marker_enabled = True
+    dataset.tactile_history_steps = 4
+    dataset.tactile_history_stride = 1
+    dataset.tactile_rgb_key = "observation.images.tactile_left"
+    dataset.tactile_marker_key = "observation.tactile.marker_flow_left"
+    dataset.tactile_marker_valid_key = "observation.tactile.marker_valid_left"
+    dataset.tactile_timestamp_key = "observation.tactile.timestamp"
+
+    deltas = dataset.get_delta_timestamps()
+    expected_history = [-3 / 30, -2 / 30, -1 / 30, 0.0]
+    assert deltas["action"] == [step / 30 for step in range(50)]
+    assert deltas[dataset.tactile_marker_key] == expected_history
+    assert deltas[dataset.tactile_marker_valid_key] == expected_history
+    assert deltas[dataset.tactile_timestamp_key] == expected_history
+
+    video_deltas = dataset.get_video_delta_timestamps()
+    assert video_deltas["observation.images.camera_wrist_left"] == [0, 49 / 30]
+    assert video_deltas[dataset.tactile_rgb_key] == expected_history
+
+
+def test_feature_transform_emits_canonical_tactile_batch_keys_without_dropout():
+    transform = FeatureTransform.__new__(FeatureTransform)
+    transform.tactile_rgb_enabled = True
+    transform.tactile_marker_enabled = True
+    transform.tactile_params = {"rgb_augment": False}
+    transform.tactile_rgb_key = "observation.images.tactile_left"
+    transform.tactile_marker_key = "observation.tactile.marker_flow_left"
+    transform.tactile_marker_valid_key = "observation.tactile.marker_valid_left"
+    transform.tactile_timestamp_key = "observation.tactile.timestamp"
+    item = {
+        transform.tactile_rgb_key: torch.ones(4, 3, 8, 8, dtype=torch.uint8) * 255,
+        f"{transform.tactile_rgb_key}_is_pad": torch.tensor([True, True, False, False]),
+        transform.tactile_marker_key: torch.ones(4, 48, 2),
+        transform.tactile_marker_valid_key: torch.ones(4, 48, dtype=torch.bool),
+        f"{transform.tactile_marker_key}_is_pad": torch.tensor([True, True, False, False]),
+        transform.tactile_timestamp_key: torch.arange(4, dtype=torch.float64).unsqueeze(-1),
+    }
+    transform._tactile_train_for_current_sample = False
+    payload = transform._prepare_tactile_payload(item, train=False)
+    assert payload["tactile_rgb_history"].shape == (4, 3, 8, 8)
+    assert payload["tactile_rgb_history_mask"].tolist() == [False, False, True, True]
+    assert payload["tactile_marker_flow"].shape == (4, 48, 2)
+    assert payload["tactile_marker_valid_mask"].shape == (4, 48)
+    assert payload["tactile_marker_history_mask"].tolist() == [False, False, True, True]
+    assert payload["tactile_history_timestamps"].shape == (4,)
 
 
 class _FakeVLADataset:

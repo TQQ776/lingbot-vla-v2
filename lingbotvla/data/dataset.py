@@ -34,6 +34,27 @@ from .vla_data import *
 
 logger = logging.get_logger(__name__)
 
+
+def _resolve_tactile_dataset_options(config, dataset_config):
+    """Resolve architecture flags without introducing a second user-facing switch."""
+
+    def _value(name, default=None):
+        if config is not None and hasattr(config, name):
+            return getattr(config, name)
+        return getattr(dataset_config, name, default)
+
+    params = _value("tactile_params", {}) or {}
+    if not isinstance(params, dict):
+        try:
+            params = vars(params)
+        except TypeError:
+            params = {}
+    return {
+        "tactile_rgb_enabled": bool(_value("tactile_rgb_enabled", False)),
+        "tactile_marker_enabled": bool(_value("tactile_marker_enabled", False)),
+        "tactile_params": dict(params),
+    }
+
 try:
     import datasets.features.features as features
 
@@ -89,6 +110,7 @@ def build_vla_dataset(
     img_size = getattr(dataset_config, 'img_size', 256)
     image_augment = bool(getattr(dataset_config, "image_augment", False))
     use_future_image = getattr(dataset_config, 'use_future_image', False)
+    tactile_options = _resolve_tactile_dataset_options(config, dataset_config)
 
     if data_name == 'multi':
         dataset = MultiVLADataset(
@@ -105,7 +127,8 @@ def build_vla_dataset(
             return_item=return_item,
             image_augment=image_augment,
             use_depth_align=use_depth_align,
-            use_future_image=use_future_image
+            use_future_image=use_future_image,
+            **tactile_options,
         )
     else:
         dataset = VLADataset(
@@ -122,7 +145,8 @@ def build_vla_dataset(
             disabled_image_features=disabled_image_features,
             image_augment=image_augment,
             use_depth_align=use_depth_align,
-            use_future_image=use_future_image
+            use_future_image=use_future_image,
+            **tactile_options,
         )
 
     return dataset

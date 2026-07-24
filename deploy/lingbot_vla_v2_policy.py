@@ -54,11 +54,36 @@ BASE_MODEL_PATH = {
 }
 
 class PolicyPreprocessMixin:
+    _TACTILE_MODEL_KEYS = (
+        "tactile_rgb_history",
+        "tactile_rgb_history_mask",
+        "tactile_marker_flow",
+        "tactile_marker_valid_mask",
+        "tactile_marker_history_mask",
+        "tactile_history_timestamps",
+        "tactile_rgb_present",
+        "tactile_marker_present",
+    )
+
     @staticmethod
     def _to_device_image_grid_thw(image_grid_thw, device):
         if image_grid_thw is None:
             return None
         return image_grid_thw.to(device=device, dtype=torch.long)
+
+    @classmethod
+    def _tactile_model_kwargs(cls, observation, *, device, add_batch_dim):
+        kwargs = {}
+        for key in cls._TACTILE_MODEL_KEYS:
+            value = observation.get(key)
+            if value is None:
+                continue
+            if not isinstance(value, torch.Tensor):
+                value = torch.as_tensor(value)
+            if add_batch_dim:
+                value = value.unsqueeze(0)
+            kwargs[key] = value.to(device=device)
+        return kwargs
 
     @torch.no_grad
     def select_action(
@@ -83,6 +108,7 @@ class PolicyPreprocessMixin:
             observation['lang_masks'].unsqueeze(0).to(device=device),
             observation['state'].unsqueeze(0).to(dtype=dtype, device=device),
             image_grid_thw=self._to_device_image_grid_thw(observation.get('image_grid_thw'), device),
+            **self._tactile_model_kwargs(observation, device=device, add_batch_dim=True),
         )
         delta_time = time.time() - s1
         print(f'sample_actions cost {delta_time} s')
@@ -130,6 +156,11 @@ class PolicyPreprocessMixin:
             lang_masks = lang_masks.unsqueeze(0)
         if state.ndim == 1:
             state = state.unsqueeze(0)
+        tactile_kwargs = self._tactile_model_kwargs(
+            observation,
+            device=device,
+            add_batch_dim=not has_batch_dim,
+        )
 
         if capture_time:
             with torch.inference_mode():
@@ -141,6 +172,7 @@ class PolicyPreprocessMixin:
                             lang_masks.to(device=device),
                             state.to(dtype=dtype, device=device),
                             image_grid_thw=self._to_device_image_grid_thw(image_grid_thw, device),
+                            **tactile_kwargs,
                     )
                 torch.cuda.synchronize()
 
@@ -156,6 +188,7 @@ class PolicyPreprocessMixin:
                                     lang_masks.to(device=device),
                                     state.to(dtype=dtype, device=device),
                                     image_grid_thw=self._to_device_image_grid_thw(image_grid_thw, device),
+                                    **tactile_kwargs,
                     )
                     ends[i].record()
                 torch.cuda.synchronize()
@@ -169,6 +202,7 @@ class PolicyPreprocessMixin:
                             lang_masks.to(device=device),
                             state.to(dtype=dtype, device=device),
                             image_grid_thw=self._to_device_image_grid_thw(image_grid_thw, device),
+                            **tactile_kwargs,
             )
 
         delta_time = time.time() - s1
@@ -355,8 +389,37 @@ class LingbotVLAv2Server:
         with open(robot_config, 'r') as f:
           self.robot_config = yaml.safe_load(f)
 
-        feature_transform = FeatureTransform(robot_config, self.data_config, self.config, self.processor,\
-                    chunk_size=self.config.chunk_size, norm_stats_path=self.robot_norm_path)
+        feature_transform = FeatureTransform(
+            robot_config,
+            self.data_config,
+            self.config,
+            self.processor,
+            chunk_size=self.config.chunk_size,
+            norm_stats_path=self.robot_norm_path,
+            tactile_rgb_enabled=bool(getattr(self.config, "tactile_rgb_enabled", False)),
+            tactile_marker_enabled=bool(getattr(self.config, "tactile_marker_enabled", False)),
+            tactile_params=dict(getattr(self.config, "tactile_params", {}) or {}),
+            tactile_rgb_key=getattr(
+                self.data_config,
+                "tactile_rgb_key",
+                "observation.images.tactile_left",
+            ),
+            tactile_marker_key=getattr(
+                self.data_config,
+                "tactile_marker_key",
+                "observation.tactile.marker_flow_left",
+            ),
+            tactile_marker_valid_key=getattr(
+                self.data_config,
+                "tactile_marker_valid_key",
+                "observation.tactile.marker_valid_left",
+            ),
+            tactile_timestamp_key=getattr(
+                self.data_config,
+                "tactile_timestamp_key",
+                "observation.tactile.timestamp",
+            ),
+        )
         # Load data processors
         self.vla.feature_transform = feature_transform
         self.action_key = feature_transform.org_features["actions"]
@@ -401,6 +464,7 @@ class LingbotVLAv2Server:
     def _prepare_model_input(self, observation):
         # not modify input observation
         observation = dict(observation)
+        self._inject_tactile_feature_inputs(observation)
         self.resize_image(observation)
         for k, v in list(observation.items()):
             if isinstance(v, np.ndarray):
@@ -409,6 +473,59 @@ class LingbotVLAv2Server:
         if self.use_bf16:
             observation['state'] = observation['state'].to(torch.bfloat16)
         return observation
+
+    def _inject_tactile_feature_inputs(self, observation):
+        """Map protocol batch keys to the checkpoint's canonical dataset keys."""
+
+        rgb_enabled = bool(getattr(self.config, "tactile_rgb_enabled", False))
+        marker_enabled = bool(getattr(self.config, "tactile_marker_enabled", False))
+        if not (rgb_enabled or marker_enabled):
+            return
+        rgb_key = getattr(
+            self.data_config,
+            "tactile_rgb_key",
+            "observation.images.tactile_left",
+        )
+        marker_key = getattr(
+            self.data_config,
+            "tactile_marker_key",
+            "observation.tactile.marker_flow_left",
+        )
+        marker_valid_key = getattr(
+            self.data_config,
+            "tactile_marker_valid_key",
+            "observation.tactile.marker_valid_left",
+        )
+        timestamp_key = getattr(
+            self.data_config,
+            "tactile_timestamp_key",
+            "observation.tactile.timestamp",
+        )
+        timestamp = None
+        if "tactile_history_timestamps" in observation:
+            timestamp = observation.pop("tactile_history_timestamps")
+        if rgb_enabled and "tactile_rgb_history" in observation:
+            history = np.asarray(observation.pop("tactile_rgb_history"))
+            if history.ndim != 4 or history.shape[-1] != 3:
+                raise ValueError(
+                    f"Protocol tactile_rgb_history must be [K,H,W,3], got {history.shape}"
+                )
+            observation[rgb_key] = np.ascontiguousarray(history.transpose(0, 3, 1, 2))
+            mask = np.asarray(
+                observation.pop("tactile_rgb_history_mask"), dtype=np.bool_
+            )
+            observation[f"{rgb_key}_is_pad"] = ~mask
+        if marker_enabled and "tactile_marker_flow" in observation:
+            observation[marker_key] = observation.pop("tactile_marker_flow")
+            valid = observation.pop("tactile_marker_valid_mask")
+            observation[marker_valid_key] = valid
+            mask = np.asarray(
+                observation.pop("tactile_marker_history_mask"), dtype=np.bool_
+            )
+            observation[f"{marker_key}_is_pad"] = ~mask
+            observation[f"{marker_valid_key}_is_pad"] = ~mask
+        if timestamp is not None:
+            observation[timestamp_key] = timestamp
 
     @staticmethod
     def _pad_and_stack_tensors(values):

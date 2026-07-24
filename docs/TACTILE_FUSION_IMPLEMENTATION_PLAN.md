@@ -1,9 +1,31 @@
 # LingBot VLA V2 触觉融合详细修改计划
 
-> 状态：设计计划，尚未实施代码修改
+> 状态：代码实现与 CPU 回归已完成；GPU、正式训练和真机验证待执行
 > 目标任务：Realman + Gloria 执行 Insert Ethernet Cable
 > 修改范围：只修改 `lingbot-vla-v2`；TacThru 项目只作为只读数据和算法参考
 > 核心约束：默认行为保持当前 wrist-only 基线，所有新功能可配置、可消融、可回退
+
+## 实施状态（2026-07-24）
+
+本计划已在独立分支 `feature/tactile-fusion-v1` 落地为可测试实现。当前
+wrist-only 基线固定为提交 `43ba7421feedaf6b7a08213096694e67be170c01`，并同时保存为：
+
+- tag：`tacthru-umi-v2-wrist-only-20260724`
+- backup branch：`backup/tacthru-umi-v2-wrist-only-20260724`
+
+已完成代码层的 P1-P7：版本化触觉数据、RGB/marker 独立消融、K 帧时序编码、
+gated Qwen prefix、严格 checkpoint 兼容、protocol v2、独立 18082 服务和本地
+fail-closed guard。原 wrist-only 配置、protocol v1、18081 服务脚本和
+`scripts/real_insert_ethernet.sh` 保持可用。
+
+尚未在本机声明完成的门槛是：完整 6B GPU eager/compile smoke、正式训练、离线
+held-out 评估和真机 tactile dry-run/执行。这些必须在具备完整权重、CUDA 环境和
+真实硬件的服务器/机械臂上按顺序验证，不能用单元测试替代。
+
+实际使用与回退说明：
+
+- [TACTILE_FUSION_USAGE.md](./TACTILE_FUSION_USAGE.md)
+- [TACTILE_FUSION_ROLLBACK.md](./TACTILE_FUSION_ROLLBACK.md)
 
 > 基线警告：当前 `tacthru-umi-v2` 工作树包含大量尚未提交的可运行 V2 适配代码，`origin/main` 不能作为“触觉修改前版本”。实施任何触觉代码前，必须先按第 15 节建立当前 wrist-only 定向快照。
 

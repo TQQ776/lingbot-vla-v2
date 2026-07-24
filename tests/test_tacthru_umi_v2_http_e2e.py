@@ -152,6 +152,23 @@ def test_contract_allows_checkpoint_norm_to_override_robot_default(tmp_path: Pat
     assert contract["robot_default_norm_stats"].endswith("assets/norm_stats/default.json")
 
 
+def test_protocol_v1_checkpoint_does_not_require_tactile_experiment_contract(tmp_path: Path) -> None:
+    project_root, checkpoint, norm_stats, robot_config_path = make_contract_paths(tmp_path)
+    assert not (checkpoint.parent.parent.parent / "tactile_experiment.json").exists()
+
+    contract = _validate_deployment_contract(
+        project_root=project_root,
+        checkpoint=checkpoint,
+        norm_stats=norm_stats,
+        robot_config_path=robot_config_path,
+    )
+
+    assert contract["version"] == 1
+    assert contract["tactile"]["experiment_contract_sha256"] is None
+    assert contract["tactile"]["dataset_manifest_sha256"] is None
+    assert contract["tactile"]["rgb_backbone_sha256"] is None
+
+
 def test_contract_still_rejects_checkpoint_training_norm_mismatch(tmp_path: Path) -> None:
     project_root, checkpoint, norm_stats, robot_config_path = make_contract_paths(
         tmp_path,

@@ -39,12 +39,20 @@ from datasets import load_dataset as _hf_load_dataset
 from ...utils import logging
 from .utils import FeatureTransform
 from .video_utils import decode_video_frames
+from ...tactile.schema import (
+    TACTILE_MARKER_FLOW_KEY,
+    TACTILE_MARKER_VALID_KEY,
+    TACTILE_RGB_KEY,
+    TACTILE_TIMESTAMP_KEY,
+    history_offsets,
+)
 
 
 logger = logging.get_logger(__name__)
 
 
 TACTHRU_UMI_V2_DATA_NAME = "tacthru_umi_v2"
+TACTHRU_UMI_V2_TACTILE_DATA_NAME = "tacthru_umi_v2_tactile"
 TACTHRU_UMI_V2_FPS = 30.0
 TACTHRU_UMI_V2_CHUNK_SIZE = 50
 
@@ -60,10 +68,8 @@ def _config_name(value):
 def is_tacthru_umi_v2(data_name=None, robot_config_path=None):
     """Identify the TacThru v2 dataset by data name or robot-config file."""
 
-    return any(
-        _config_name(candidate) == TACTHRU_UMI_V2_DATA_NAME
-        for candidate in (data_name, robot_config_path)
-    )
+    supported_names = {TACTHRU_UMI_V2_DATA_NAME, TACTHRU_UMI_V2_TACTILE_DATA_NAME}
+    return any(_config_name(candidate) in supported_names for candidate in (data_name, robot_config_path))
 
 
 def _episode_records(episodes):
@@ -149,10 +155,14 @@ class LeRobotDataset(BaseLeRobotDataset):
         self,
         repo_id: str,
         load_image: bool = True,
+        video_keys_to_load: list[str] | tuple[str, ...] | None = None,
         **kwargs,
     ):
         super().__init__(repo_id, **kwargs)
         self.load_image = load_image
+        self.video_keys_to_load = (
+            None if video_keys_to_load is None else frozenset(video_keys_to_load)
+        )
 
     def _query_hf_dataset(self, query_indices: dict[str, list[int]]) -> dict:
         """
@@ -224,13 +234,20 @@ class LeRobotDataset(BaseLeRobotDataset):
         if len(self.meta.video_keys) > 0 and self.load_image:
             current_ts = item["timestamp"].item()
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
+            if self.video_keys_to_load is not None:
+                query_timestamps = {
+                    key: timestamps
+                    for key, timestamps in query_timestamps.items()
+                    if key in self.video_keys_to_load
+                }
             video_frames = self._query_videos(query_timestamps, ep_idx)
             item = {**video_frames, **item}
 
         if self.image_transforms is not None and self.load_image:
             image_keys = self.meta.camera_keys
             for cam in image_keys:
-                item[cam] = self.image_transforms(item[cam])
+                if cam in item:
+                    item[cam] = self.image_transforms(item[cam])
         # Add task as a string
         task_idx = item["task_index"].item()
         item["task"] = _get_task_name(self.meta.tasks, task_idx)
@@ -258,6 +275,9 @@ class VLADataset(Dataset):
         image_augment = False,
         use_depth_align = False,
         use_future_image = False,
+        tactile_rgb_enabled = False,
+        tactile_marker_enabled = False,
+        tactile_params = None,
     ):
         if do_nomalize and config is None:
             raise ValueError("VLADataset requires a model config; pass model.config via build_vla_dataset.")
@@ -269,6 +289,23 @@ class VLADataset(Dataset):
         self.disabled_image_features = disabled_image_features
         self.use_depth_align = use_depth_align
         self.use_future_image = use_future_image
+        self.tactile_rgb_enabled = bool(tactile_rgb_enabled)
+        self.tactile_marker_enabled = bool(tactile_marker_enabled)
+        self.tactile_params = dict(tactile_params or {})
+        self.tactile_history_steps = int(self.tactile_params.get("history_steps", 1))
+        self.tactile_history_stride = int(self.tactile_params.get("history_stride", 1))
+        # Validate once and keep a stable oldest-to-current layout.
+        history_offsets(self.tactile_history_steps, self.tactile_history_stride)
+        self.tactile_rgb_key = getattr(dataset_config, "tactile_rgb_key", TACTILE_RGB_KEY)
+        self.tactile_marker_key = getattr(
+            dataset_config, "tactile_marker_key", TACTILE_MARKER_FLOW_KEY
+        )
+        self.tactile_marker_valid_key = getattr(
+            dataset_config, "tactile_marker_valid_key", TACTILE_MARKER_VALID_KEY
+        )
+        self.tactile_timestamp_key = getattr(
+            dataset_config, "tactile_timestamp_key", TACTILE_TIMESTAMP_KEY
+        )
 
         load_image = True if do_nomalize else False
         robot_config = os.path.join(robot_config_root, f'{data_name}.yaml')
@@ -280,7 +317,14 @@ class VLADataset(Dataset):
                         chunk_size=chunk_size, return_item_befor_padding=return_item,\
                         norm_stats_path=getattr(dataset_config, 'norm_stats_file', None),
                         image_augment=image_augment, use_depth_align=use_depth_align,
-                        use_future_image=use_future_image)
+                        use_future_image=use_future_image,
+                        tactile_rgb_enabled=self.tactile_rgb_enabled,
+                        tactile_marker_enabled=self.tactile_marker_enabled,
+                        tactile_params=self.tactile_params,
+                        tactile_rgb_key=self.tactile_rgb_key,
+                        tactile_marker_key=self.tactile_marker_key,
+                        tactile_marker_valid_key=self.tactile_marker_valid_key,
+                        tactile_timestamp_key=self.tactile_timestamp_key)
         else:
             self.feature_transform = feature_transform
 
@@ -294,13 +338,37 @@ class VLADataset(Dataset):
             {"repo_id": lerobot_repo_id, "root": lerobot_root},
         )
         self.dataset_meta = LeRobotDatasetMetadata(**metadata_kwargs)
+        required_tactile_features = set()
+        if self.tactile_rgb_enabled:
+            required_tactile_features.add(self.tactile_rgb_key)
+        if self.tactile_marker_enabled:
+            required_tactile_features.update(
+                (self.tactile_marker_key, self.tactile_marker_valid_key)
+            )
+        if required_tactile_features:
+            required_tactile_features.add(self.tactile_timestamp_key)
+        missing_tactile_features = (
+            required_tactile_features - set(self.dataset_meta.features)
+            if required_tactile_features
+            else set()
+        )
+        if missing_tactile_features:
+            raise ValueError(
+                "Tactile architecture is enabled but the dataset is missing canonical features: "
+                f"{sorted(missing_tactile_features)}"
+            )
         merged_delta = {**self.get_delta_timestamps(), **self.get_video_delta_timestamps()}
+
+        video_keys_to_load = list(self.feature_transform.org_features["images"])
+        if self.tactile_rgb_enabled:
+            video_keys_to_load.append(self.tactile_rgb_key)
 
         self.dataset = LeRobotDataset(
             repo_id=repo_id,
             image_transforms=Resize(image_size),
             delta_timestamps=merged_delta,
-            load_image=load_image
+            load_image=load_image,
+            video_keys_to_load=video_keys_to_load,
         )
 
         self.sample_indices = None
@@ -347,17 +415,37 @@ class VLADataset(Dataset):
         else:
             for state_feature in self.feature_transform.org_features['states']:
                 delta_timestamps[state_feature] = [t / fps if fps else t for t in range(self.chunk_size+1)]
+        tactile_rgb_enabled = bool(getattr(self, "tactile_rgb_enabled", False))
+        tactile_marker_enabled = bool(getattr(self, "tactile_marker_enabled", False))
+        if tactile_rgb_enabled or tactile_marker_enabled:
+            tactile_offsets = history_offsets(
+                getattr(self, "tactile_history_steps", 1),
+                getattr(self, "tactile_history_stride", 1),
+            )
+            tactile_deltas = [offset / fps if fps else offset for offset in tactile_offsets]
+            if tactile_marker_enabled:
+                delta_timestamps[self.tactile_marker_key] = tactile_deltas
+                delta_timestamps[self.tactile_marker_valid_key] = tactile_deltas
+            delta_timestamps[self.tactile_timestamp_key] = tactile_deltas
         return delta_timestamps
 
     def get_video_delta_timestamps(self):
         """Multi-frame time offsets for video keys; returns an empty dict when disabled."""
 
         fps = self.dataset_meta.fps
+        video_offsets = {}
         if self.use_future_image:
             offsets = [0, (self.chunk_size - 1) / fps]
-            return dict.fromkeys(self.feature_transform.org_features['images'], offsets)
-        else:
-            return {}
+            video_offsets.update(
+                dict.fromkeys(self.feature_transform.org_features['images'], offsets)
+            )
+        if bool(getattr(self, "tactile_rgb_enabled", False)):
+            tactile_offsets = history_offsets(
+                self.tactile_history_steps,
+                self.tactile_history_stride,
+            )
+            video_offsets[self.tactile_rgb_key] = [offset / fps for offset in tactile_offsets]
+        return video_offsets
 
     def check_lerobot_item(self, item):
         # if state or action is a 0-d tensor, convert it to 1-d tensor

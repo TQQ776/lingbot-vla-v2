@@ -10,6 +10,11 @@ import torch.nn.functional as F
 from torch import Tensor
 from torchvision.transforms import v2
 from lingbotvla.utils import logging as logging_utils
+from lingbotvla.tactile.transforms import (
+    apply_tactile_rgb_augmentation,
+    sample_tactile_rgb_augmentation_params,
+    sanitize_marker_flow,
+)
 
 logger = logging_utils.get_logger(__name__)
 
@@ -275,6 +280,81 @@ def apply_visual_augmentation(
     else:
         image = image.to(orig_dtype)
     return image.squeeze(0) if squeeze else image
+
+
+def prepare_tactile_rgb_history(
+    history: Tensor,
+    is_pad: Tensor | None = None,
+    *,
+    train: bool = False,
+    augment: bool = True,
+    force_mask: bool = False,
+    dropout: bool = False,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Prepare dedicated tactile-RGB input as float32 ``[K,3,H,W]`` in [0,1]."""
+
+    if history.ndim == 3:
+        history = history.unsqueeze(0)
+    if history.ndim != 4 or history.shape[1] != 3:
+        raise ValueError(f"Expected tactile RGB [K,3,H,W], got {tuple(history.shape)}")
+    history = history.to(dtype=torch.float32)
+    if history.numel() and float(history.max()) > 1.0:
+        history = history / 255.0
+    if train and augment:
+        params = sample_tactile_rgb_augmentation_params(history)
+        history = apply_tactile_rgb_augmentation(history, params)
+    else:
+        history = history.clamp(0.0, 1.0)
+
+    if is_pad is None:
+        history_mask = torch.ones(history.shape[0], dtype=torch.bool, device=history.device)
+    else:
+        history_mask = ~torch.as_tensor(is_pad, device=history.device, dtype=torch.bool).reshape(-1)
+        if history_mask.numel() != history.shape[0]:
+            raise ValueError(
+                f"tactile RGB pad mask has {history_mask.numel()} steps, expected {history.shape[0]}"
+            )
+    if force_mask or dropout:
+        history_mask.zero_()
+    history = history * history_mask[:, None, None, None].to(history.dtype)
+    present = history_mask.any()
+    return history, history_mask, present
+
+
+def prepare_tactile_marker_history(
+    marker_flow: Tensor,
+    marker_valid: Tensor | None = None,
+    is_pad: Tensor | None = None,
+    *,
+    force_mask: bool = False,
+    dropout: bool = False,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Prepare marker flow, per-point validity and temporal presence masks."""
+
+    if marker_flow.ndim == 2:
+        marker_flow = marker_flow.unsqueeze(0)
+    if marker_flow.ndim != 3 or marker_flow.shape[-1] != 2:
+        raise ValueError(f"Expected marker flow [K,M,2], got {tuple(marker_flow.shape)}")
+    marker_flow, finite_mask = sanitize_marker_flow(marker_flow, marker_valid)
+    if is_pad is None:
+        history_mask = torch.ones(
+            marker_flow.shape[0], dtype=torch.bool, device=marker_flow.device
+        )
+    else:
+        history_mask = ~torch.as_tensor(
+            is_pad, device=marker_flow.device, dtype=torch.bool
+        ).reshape(-1)
+        if history_mask.numel() != marker_flow.shape[0]:
+            raise ValueError(
+                f"marker pad mask has {history_mask.numel()} steps, expected {marker_flow.shape[0]}"
+            )
+    valid_mask = finite_mask & history_mask[:, None]
+    if force_mask or dropout:
+        history_mask.zero_()
+        valid_mask.zero_()
+    marker_flow = marker_flow * valid_mask.unsqueeze(-1).to(marker_flow.dtype)
+    present = valid_mask.any()
+    return marker_flow, valid_mask, history_mask, present
 
 def prepare_images(
     image_processor,

@@ -11,6 +11,7 @@ from tools.convert_tacthru_zarr_to_lerobot_v2 import (  # noqa: E402
     CONVERTER_VERSION,
     DATASET_FPS,
     _requested_manifest,
+    build_features,
     build_pose8,
     make_episode_plan,
 )
@@ -93,3 +94,47 @@ def test_pose8_is_xyzw_normalized_and_canonical() -> None:
     assert np.all(pose[:, 6] >= 0.0)
     np.testing.assert_allclose(pose[:, :3], position)
     np.testing.assert_allclose(pose[:, 7:], gripper)
+
+
+def test_tactile_manifest_and_features_use_canonical_superset_keys() -> None:
+    plan = make_episode_plan(np.asarray([60], dtype=np.int64), num_source_episodes=1)
+    manifest = _requested_manifest(
+        signature={"source": "/tmp/source.zarr"},
+        task="Insert the Ethernet cable.",
+        repo_id="tactile-v1",
+        source_episodes=1,
+        source_frames=60,
+        plan=plan,
+        wrist_shape=(224, 224, 3),
+        excluded_tactile_source_keys=["tacthru_l_rgb", "tacthru_l_marker"],
+        include_tactile_rgb=True,
+        include_tactile_marker=True,
+        tactile_rgb_shape=(224, 224, 3),
+        tactile_marker_shape=(48, 2),
+        marker_input_space="normalized",
+        marker_image_width=640,
+        marker_image_height=480,
+    )
+
+    assert manifest["converter_version"] == 5
+    assert manifest["image_features"] == [
+        "observation.images.camera_wrist_left",
+        "observation.images.tactile_left",
+    ]
+    tactile = manifest["tactile_inputs"]
+    assert tactile["schema_version"] == 1
+    assert tactile["marker_flow_key"] == "observation.tactile.marker_flow_left"
+    assert tactile["marker_valid_key"] == "observation.tactile.marker_valid_left"
+    assert tactile["marker_normalization"]["target"] == "image_size_xy"
+    assert tactile["marker_normalization"]["correction"] == "none_already_normalized"
+
+    features = build_features(
+        (224, 224, 3),
+        include_tactile_rgb=True,
+        include_tactile_marker=True,
+        tactile_rgb_shape=(224, 224, 3),
+        tactile_marker_shape=(48, 2),
+    )
+    assert features["observation.images.tactile_left"]["dtype"] == "video"
+    assert features["observation.tactile.marker_flow_left"]["shape"] == (48, 2)
+    assert features["observation.tactile.marker_valid_left"]["shape"] == (48,)

@@ -282,7 +282,42 @@ def load_model_weights(
         _dispatch_buffer(model, name, buffer)
 
     if post_training:
-        assert len(parameter_names) == 0, f"Missing {parameter_names} during Post-Training. This is not allowed!!!"
+        allowed_missing = weight_loader.get_allowed_missing_parameter_names(model)
+        if parameter_names:
+            disallowed_missing = parameter_names - allowed_missing
+            if disallowed_missing:
+                raise AssertionError(
+                    "Missing non-tactile parameters during Post-Training: "
+                    f"{sorted(disallowed_missing)}"
+                )
+            # A checkpoint is either a strict tactile checkpoint (no missing
+            # keys) or an old wrist-only checkpoint (all tactile keys missing).
+            # Reject partial tactile branches instead of silently mixing weights.
+            if parameter_names != allowed_missing:
+                loaded_tactile = allowed_missing - parameter_names
+                raise AssertionError(
+                    "Partially populated tactile checkpoint is not allowed. "
+                    f"Loaded tactile keys include {sorted(loaded_tactile)[:20]}, "
+                    f"missing={sorted(parameter_names)[:20]}."
+                )
+            reset_tactile = getattr(model, "reset_tactile_parameters", None)
+            if not callable(reset_tactile):
+                raise RuntimeError(
+                    "Tactile parameters are missing but the model has no strict tactile initializer."
+                )
+            reset_tactile()
+            initialize_external = getattr(model, "initialize_tactile_from_external", None)
+            if callable(initialize_external):
+                initialize_external()
+            logger.info_rank0(
+                "Initialized %d whitelisted tactile parameters from the model "
+                "configuration/local tactile backbone; all non-tactile weights loaded strictly."
+                % len(parameter_names)
+            )
+            parameter_names.clear()
+        assert len(parameter_names) == 0, (
+            f"Missing {parameter_names} during Post-Training. This is not allowed!!!"
+        )
         if adanorm_time:
             logger.info_rank0(">>> Parameters in AdaNorm has been ZERO initialized.")
             exclude_keywords = [

@@ -23,6 +23,7 @@ from lingbotvla.utils import helper
 from lingbotvla.utils.arguments import parse_args
 from lingbotvla.utils.dist_utils import all_reduce
 import lingbotvla.utils.normalize as normalize
+from lingbotvla.tactile.schema import TACTILE_MARKER_FLOW_KEY
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tasks.vla.train_lingbotvla import MyTrainingArguments, MyDataArguments
@@ -107,7 +108,8 @@ def get_batch_indices(target_ids, batch_size):
 
 
 def compute_norm(dataset, batch_size, stats, state_norm_keys, acton_norm_keys, delta_norm, ratio,
-                 rank=0, world_size=1, num_workers=8, norm_merge_chunk_dim=False):
+                 rank=0, world_size=1, num_workers=8, norm_merge_chunk_dim=False,
+                 tactile_norm_keys=()):
     if ratio < 1:
         num_step = int(len(dataset)*ratio)
         # Fix the seed so every rank samples the same global subset; slicing it
@@ -155,6 +157,13 @@ def compute_norm(dataset, batch_size, stats, state_norm_keys, acton_norm_keys, d
                     )
                 )
                 stats[key].update(values.reshape(-1, values.shape[-1]))
+            for key in tactile_norm_keys:
+                values = np.asarray(batch[key], dtype=np.float64)
+                # History is [B,K,M,2]. Statistics describe the current frame
+                # distribution and therefore avoid repeat-first padding bias.
+                if values.ndim == 4:
+                    values = values[:, -1]
+                stats[key].update(values.reshape(-1, values.shape[-1]))
 
     del pool
     del dataset
@@ -173,6 +182,13 @@ def _init_dataset_worker(
 ) -> 'LeRobotDataset':
     
     args.data.chunk_size = args.train.chunk_size
+    args.data.tactile_rgb_enabled = bool(
+        getattr(args.train, "tactile_rgb_enabled", False)
+    )
+    args.data.tactile_marker_enabled = bool(
+        getattr(args.train, "tactile_marker_enabled", False)
+    )
+    args.data.tactile_params = dict(getattr(args.train, "tactile_params", {}) or {})
     dataset = build_vla_dataset(dataset_config=args.data, 
                                 model_config=None, 
                                 config=None, 
@@ -241,13 +257,22 @@ if __name__ == "__main__":
     state_norm_keys = dataset._datasets[0].state_features
     acton_norm_keys = dataset._datasets[0].action_features
     delta_norm = dataset._datasets[0].feature_transform.action_subtract_state
-    stats = {key: normalize.RunningStats() for key in acton_norm_keys+state_norm_keys}
+    tactile_norm_keys = []
+    if bool(getattr(args.train, "tactile_marker_enabled", False)):
+        tactile_norm_keys.append(
+            getattr(args.data, "tactile_marker_key", TACTILE_MARKER_FLOW_KEY)
+        )
+    stats = {
+        key: normalize.RunningStats()
+        for key in acton_norm_keys + state_norm_keys + tactile_norm_keys
+    }
     chunk_size = args.data.chunk_size
     
     ratio = args.data.data_ratio_for_norm_compute
     compute_norm(dataset, args.train.micro_batch_size, stats, state_norm_keys, acton_norm_keys,
                  delta_norm, ratio=ratio, rank=rank, world_size=world_size,
-                 num_workers=args.data.num_workers, norm_merge_chunk_dim=args.data.norm_merge_chunk_dim)
+                 num_workers=args.data.num_workers, norm_merge_chunk_dim=args.data.norm_merge_chunk_dim,
+                 tactile_norm_keys=tactile_norm_keys)
 
     # Cross-rank merge: each rank serializes its local stats and all_gather_object's
     # them to all ranks; rank0 performs the actual merge and persists the result.

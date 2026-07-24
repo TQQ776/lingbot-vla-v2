@@ -60,6 +60,9 @@ class MultiVLADataset(Dataset):
         image_augment = False,
         use_depth_align=False,
         use_future_image=False,
+        tactile_rgb_enabled=False,
+        tactile_marker_enabled=False,
+        tactile_params=None,
     ):
         
         self.config = config
@@ -107,6 +110,9 @@ class MultiVLADataset(Dataset):
                         image_augment = image_augment,
                         use_depth_align = use_depth_align,
                         use_future_image=use_future_image,
+                        tactile_rgb_enabled=tactile_rgb_enabled,
+                        tactile_marker_enabled=tactile_marker_enabled,
+                        tactile_params=tactile_params,
                     )
                 if self.data_names[i] not in self.feature_transforms:
                     self.feature_transforms[self.data_names[i]] = dataset.feature_transform

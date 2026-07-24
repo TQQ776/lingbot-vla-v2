@@ -117,6 +117,36 @@ def get_moe_param_groups(model: "torch.nn.Module", args_train) -> Optional[List[
 
 @dataclass
 class MyTrainingArguments(TrainingArguments):
+    tactile_rgb_enabled: bool = field(
+        default=False,
+        metadata={"help": "Instantiate and train the tactile RGB prefix encoder."},
+    )
+    tactile_marker_enabled: bool = field(
+        default=False,
+        metadata={"help": "Instantiate and train the temporal marker-flow prefix encoder."},
+    )
+    tactile_train_stage: Literal["adapters", "expert", "full"] = field(
+        default="full",
+        metadata={
+            "help": "Tactile fine-tuning stage: adapters only, adapters+action expert, or full."
+        },
+    )
+    tactile_experiment_contract_sha256: Optional[str] = field(
+        default=None,
+        metadata={"help": "Immutable tactile launcher contract saved with the checkpoint."},
+    )
+    tactile_dataset_manifest_sha256: Optional[str] = field(
+        default=None,
+        metadata={"help": "SHA256 of the tactile converter manifest used for training."},
+    )
+    tactile_rgb_backbone_sha256: Optional[str] = field(
+        default=None,
+        metadata={"help": "SHA256 of the local tactile RGB backbone, when enabled."},
+    )
+    tactile_params: Optional[Dict[str, Any]] = field(
+        default_factory=dict,
+        metadata={"help": "Tactile encoder, temporal, fusion, and modality-dropout parameters."},
+    )
     freeze_vit: bool = field(
         default=False,
         metadata={"help": "Whether or not to freeze the vit parameters."},
@@ -318,6 +348,34 @@ class MyDataArguments(DataArguments):
         default=False,
         metadata={"help": "Whether to use future image."},
     )
+    tactile_rgb_key: str = field(
+        default="observation.images.tactile_left",
+        metadata={"help": "Canonical LeRobot key for tactile RGB."},
+    )
+    tactile_marker_key: str = field(
+        default="observation.tactile.marker_flow_left",
+        metadata={"help": "Canonical LeRobot key for normalized tactile marker flow."},
+    )
+    tactile_marker_valid_key: str = field(
+        default="observation.tactile.marker_valid_left",
+        metadata={"help": "Canonical LeRobot key for marker validity."},
+    )
+    tactile_timestamp_key: str = field(
+        default="observation.tactile.timestamp",
+        metadata={"help": "Canonical LeRobot key for tactile synchronization timestamps."},
+    )
+
+
+@dataclass
+class MyEvalArguments(EvalArguments):
+    force_mask_tactile_rgb: bool = field(
+        default=False,
+        metadata={"help": "Force-mask an existing tactile RGB branch for offline ablation."},
+    )
+    force_mask_tactile_marker: bool = field(
+        default=False,
+        metadata={"help": "Force-mask an existing marker branch for offline ablation."},
+    )
 
 
 @dataclass
@@ -326,7 +384,7 @@ class Arguments:
     model: "ModelArguments" = field(default_factory=ModelArguments)
     data: "MyDataArguments" = field(default_factory=MyDataArguments)
     train: "MyTrainingArguments" = field(default_factory=MyTrainingArguments)
-    eval: "EvalArguments" = field(default_factory=EvalArguments)
+    eval: "MyEvalArguments" = field(default_factory=MyEvalArguments)
 
 
 def main():
@@ -357,7 +415,24 @@ def main():
     )
 
     logger.info_rank0("Prepare model")
-    config_kwargs = {**vars(args.model), **vars(args.train)}
+    config_kwargs = {
+        **vars(args.model),
+        **vars(args.train),
+        "force_mask_tactile_rgb": args.eval.force_mask_tactile_rgb,
+        "force_mask_tactile_marker": args.eval.force_mask_tactile_marker,
+    }
+    if args.eval.force_mask_tactile_rgb and not args.train.tactile_rgb_enabled:
+        raise ValueError("--eval.force_mask_tactile_rgb requires --train.tactile_rgb_enabled=true.")
+    if args.eval.force_mask_tactile_marker and not args.train.tactile_marker_enabled:
+        raise ValueError("--eval.force_mask_tactile_marker requires --train.tactile_marker_enabled=true.")
+    if args.train.allow_partial_checkpoint and (
+        args.train.tactile_rgb_enabled or args.train.tactile_marker_enabled
+    ):
+        raise ValueError(
+            "allow_partial_checkpoint is not accepted for tactile training because it can "
+            "silently ignore non-tactile checkpoint mismatches. Initialize from the strict "
+            "HF wrist checkpoint; only the tactile parameter whitelist is permitted there."
+        )
     config_registry = get_config_registry()
 
     config_key = args.model.config_key
