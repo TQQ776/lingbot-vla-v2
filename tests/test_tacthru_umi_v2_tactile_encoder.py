@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import builtins
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -23,6 +25,7 @@ def _params(**overrides):
         "rgb_backbone_path": None,
         "freeze_rgb_backbone": False,
         "rgb_input_size": 16,
+        "rgb_backbone_pretrain_size": 16,
         "rgb_patch_size": 8,
         "rgb_encoder_dim": 16,
         "rgb_encoder_layers": 1,
@@ -111,3 +114,42 @@ def test_rgb_history_shape_is_strict():
         assert "Expected K=2" in str(exc)
     else:
         raise AssertionError("history length mismatch must fail")
+
+
+def test_dinov2_uses_pretrain_grid_and_keeps_tactile_input_size(monkeypatch):
+    captured = {}
+
+    class FakeBackbone(torch.nn.Module):
+        embed_dim = 384
+
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(()))
+
+    def fake_dinov2_vits14(**kwargs):
+        captured.update(kwargs)
+        return FakeBackbone()
+
+    real_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name.endswith("moge.model.dinov2.hub.backbones"):
+            return SimpleNamespace(dinov2_vits14=fake_dinov2_vits14)
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    params = _params(
+        rgb_backbone="dinov2_vits14",
+        rgb_backbone_path="/tmp/dinov2_vits14_pretrain.pth",
+        rgb_input_size=224,
+        rgb_backbone_pretrain_size=518,
+        rgb_patch_size=14,
+        rgb_encoder_dim=384,
+        rgb_encoder_heads=6,
+    )
+
+    encoder = TACTILE.TactileRGBEncoder(params, prefix_hidden_dim=12)
+
+    assert captured["img_size"] == 518
+    assert encoder.input_size == 224
+    assert encoder.backbone_pretrain_size == 518

@@ -58,6 +58,7 @@ train:
     rgb_backbone_path: models/dinov2_vits14_pretrain.pth
     freeze_rgb_backbone: true
     rgb_input_size: 224
+    rgb_backbone_pretrain_size: 518
     rgb_patch_size: 14
     rgb_encoder_dim: 384
     rgb_tokens: 8

@@ -33,6 +33,10 @@ DEFAULT_TACTILE_PARAMS: Dict[str, Any] = {
     "rgb_backbone_path": None,
     "freeze_rgb_backbone": True,
     "rgb_input_size": 224,
+    # Official DINOv2 ViT-S/14 weights were pretrained at 518px.  The
+    # backbone interpolates those positional embeddings for 224px tactile
+    # frames at runtime, so construction and input sizes must stay separate.
+    "rgb_backbone_pretrain_size": 518,
     "rgb_patch_size": 14,
     "rgb_encoder_dim": 384,
     "rgb_encoder_layers": 4,
@@ -72,6 +76,7 @@ def _normalize_tactile_params(params: Optional[Dict[str, Any]]) -> Dict[str, Any
         "history_steps",
         "history_stride",
         "rgb_input_size",
+        "rgb_backbone_pretrain_size",
         "rgb_patch_size",
         "rgb_encoder_dim",
         "rgb_encoder_layers",
@@ -93,6 +98,13 @@ def _normalize_tactile_params(params: Optional[Dict[str, Any]]) -> Dict[str, Any
         raise ValueError(
             "tactile_params.rgb_input_size must be divisible by rgb_patch_size "
             f"(got {normalized['rgb_input_size']} and {normalized['rgb_patch_size']})."
+        )
+    if normalized["rgb_backbone_pretrain_size"] % normalized["rgb_patch_size"] != 0:
+        raise ValueError(
+            "tactile_params.rgb_backbone_pretrain_size must be divisible by "
+            "rgb_patch_size "
+            f"(got {normalized['rgb_backbone_pretrain_size']} and "
+            f"{normalized['rgb_patch_size']})."
         )
     if normalized["rgb_encoder_dim"] % normalized["rgb_encoder_heads"] != 0:
         raise ValueError("tactile RGB encoder_dim must be divisible by encoder_heads.")

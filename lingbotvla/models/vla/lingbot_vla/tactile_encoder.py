@@ -105,13 +105,21 @@ class TactileRGBEncoder(nn.Module):
                     "dinov2_vits14 requires tactile_params.rgb_backbone_path pointing "
                     "to local pretrained weights; online download is intentionally disabled."
                 )
+            self.backbone_pretrain_size = int(
+                params.get("rgb_backbone_pretrain_size", 518)
+            )
+            if self.backbone_pretrain_size % patch_size != 0:
+                raise ValueError(
+                    "dinov2_vits14 requires rgb_backbone_pretrain_size to be "
+                    "divisible by rgb_patch_size."
+                )
             from lingbotvla.models.vla.vision_models.MoGe.moge.model.dinov2.hub.backbones import (
                 dinov2_vits14,
             )
 
             self.backbone = dinov2_vits14(
                 pretrained=False,
-                img_size=self.input_size,
+                img_size=self.backbone_pretrain_size,
                 block_chunks=0,
             )
             dim = int(self.backbone.embed_dim)
@@ -119,6 +127,7 @@ class TactileRGBEncoder(nn.Module):
             self.native_spatial_embedding = None
             self.native_frame_encoder = None
         elif self.backbone_name == "native_patch_transformer":
+            self.backbone_pretrain_size = self.input_size
             dim = int(params["rgb_encoder_dim"])
             layers = int(params["rgb_encoder_layers"])
             self.backbone = None

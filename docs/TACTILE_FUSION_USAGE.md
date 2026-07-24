@@ -64,6 +64,9 @@ Future-Video teacher；如果忘记修改 `MODEL_DIR`，T2/T3 会重新从基础
 models/dinov2_vits14_pretrain.pth
 ```
 
+该权重使用官方 518×518 预训练位置编码；编码器会按 DINOv2 标准方式插值到实际
+224×224 触觉输入，不能用 224×224 重新构造骨干后再严格加载权重。
+
 readiness 会检查文件存在、大小和 SHA256。`marker`、`none` 模式不要求该文件。
 若只做代码 smoke，可显式把配置改为 `native_patch_transformer`；它不是推荐正式模型。
 
