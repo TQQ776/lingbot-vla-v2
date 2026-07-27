@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import http.client
 import json
@@ -13,6 +14,7 @@ import threading
 import time
 import tty
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from multiprocessing.managers import SharedMemoryManager
 from pathlib import Path
@@ -46,13 +48,20 @@ from .protocol import (
     observation_to_json,
     validate_action_spec,
 )
-from .realman_runtime import RealmanConfig, RealmanEpisodeRuntime, SafetyViolation
+from .realman_runtime import (
+    HistoricalAlignmentNotReady,
+    RealmanConfig,
+    RealmanEpisodeRuntime,
+    SafetyViolation,
+)
 from .transforms import validate_state8
 
 
 DEFAULT_IMAGE_SIZE = 224
 CAMERA_FRESHNESS_FRACTION = 0.80
 RETRYABLE_HTTP_STATUSES = frozenset({408, 503})
+TACTILE_ALIGNMENT_WARMUP_TIMEOUT_S = 2.0
+TACTILE_ALIGNMENT_RETRY_INTERVAL_S = 0.02
 
 
 class RetryableInferenceError(RuntimeError):
@@ -145,6 +154,7 @@ class WristCamera:
         max_frame_age_s: float = 0.10,
         initial_frame_timeout_s: float = 2.0,
         frame_timeout_s: float = 0.25,
+        history_seconds: float = 1.0,
     ) -> None:
         self.output_size = int(output_size)
         self.expected_width = int(width)
@@ -154,10 +164,12 @@ class WristCamera:
         self.max_frame_age_s = float(max_frame_age_s)
         self.initial_frame_timeout_s = float(initial_frame_timeout_s)
         self.frame_timeout_s = float(frame_timeout_s)
+        self.history_seconds = float(history_seconds)
         for name, value in (
             ("max_frame_age_s", self.max_frame_age_s),
             ("initial_frame_timeout_s", self.initial_frame_timeout_s),
             ("frame_timeout_s", self.frame_timeout_s),
+            ("history_seconds", self.history_seconds),
         ):
             if not np.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be a positive finite value, got {value}")
@@ -179,8 +191,15 @@ class WristCamera:
         self._capture_released = False
         self._worker_error: BaseException | None = None
         self._latest_frame: CameraFrame | None = None
+        history_frames = max(8, int(np.ceil(fps * self.history_seconds)) + 4)
+        self._frame_history: deque[CameraFrame] = deque(maxlen=history_frames)
         self._latest_sequence = 0
         self._last_delivered_sequence = 0
+
+    def start(self) -> None:
+        """Start background capture so tactile-aligned history is ready before inference."""
+
+        self._start_worker()
 
     def capture(self) -> CameraFrame:
         self._start_worker()
@@ -216,6 +235,89 @@ class WristCamera:
                         "No fresh wrist camera frame arrived within "
                         f"{timeout_s:.3f}s (latest_age={age_detail}, "
                         f"max_age={self.max_frame_age_s:.4f}s)"
+                    )
+                self._condition.wait(timeout=remaining_s)
+
+    def capture_at_or_before(
+        self,
+        target_timestamp: float,
+        *,
+        max_skew_s: float,
+        timeout_s: float | None = None,
+    ) -> CameraFrame:
+        """Return the newest buffered wrist frame no later than ``target_timestamp``.
+
+        TacThru timestamps are corrected for the tactile camera's calibrated
+        receive latency.  Matching them against only the latest wrist frame
+        creates a deterministic ~100 ms skew, so tactile protocol-v2 uses the
+        short wrist history retained by the background worker instead.
+        """
+
+        target_timestamp = float(target_timestamp)
+        max_skew_s = float(max_skew_s)
+        if not np.isfinite(target_timestamp) or target_timestamp <= 0.0:
+            raise ValueError(f"target_timestamp must be positive and finite, got {target_timestamp}")
+        if not np.isfinite(max_skew_s) or max_skew_s <= 0.0:
+            raise ValueError(f"max_skew_s must be positive and finite, got {max_skew_s}")
+
+        self._start_worker()
+        effective_timeout_s = self.initial_frame_timeout_s if timeout_s is None else float(timeout_s)
+        if not np.isfinite(effective_timeout_s) or effective_timeout_s <= 0.0:
+            raise ValueError(f"timeout_s must be positive and finite, got {effective_timeout_s}")
+        deadline = time.monotonic() + effective_timeout_s
+
+        with self._condition:
+            while True:
+                if self._worker_error is not None:
+                    raise RuntimeError("Wrist camera capture worker failed") from self._worker_error
+                if self._closed:
+                    raise RuntimeError("Wrist camera is closed")
+
+                latest = self._latest_frame
+                history = tuple(self._frame_history)
+                latest_age_s = None if latest is None else time.time() - latest.capture_timestamp
+                if latest is not None and latest_age_s is not None and -0.02 <= latest_age_s <= self.max_frame_age_s:
+                    candidates = [
+                        frame
+                        for frame in history
+                        if frame.capture_timestamp <= target_timestamp + 1e-9
+                    ]
+                    if candidates:
+                        selected = max(candidates, key=lambda frame: frame.capture_timestamp)
+                        skew_s = target_timestamp - selected.capture_timestamp
+                        if skew_s <= max_skew_s:
+                            return CameraFrame(
+                                rgb=selected.rgb.copy(),
+                                capture_timestamp=selected.capture_timestamp,
+                                receive_timestamp=selected.receive_timestamp,
+                            )
+                        if latest.capture_timestamp >= target_timestamp:
+                            raise HistoricalAlignmentNotReady(
+                                "Wrist camera history has no frame close enough before the tactile target: "
+                                f"target={target_timestamp:.6f}, selected={selected.capture_timestamp:.6f}, "
+                                f"skew={skew_s:.4f}s, limit={max_skew_s:.4f}s"
+                            )
+                    elif history and history[0].capture_timestamp > target_timestamp + 1e-9:
+                        raise HistoricalAlignmentNotReady(
+                            "Wrist camera history started after the tactile target: "
+                            f"target={target_timestamp:.6f}, earliest={history[0].capture_timestamp:.6f}, "
+                            f"limit={max_skew_s:.4f}s"
+                        )
+
+                remaining_s = deadline - time.monotonic()
+                if remaining_s <= 0.0:
+                    if history:
+                        history_detail = (
+                            f"history=[{history[0].capture_timestamp:.6f}, "
+                            f"{history[-1].capture_timestamp:.6f}]"
+                        )
+                    else:
+                        history_detail = "history=empty"
+                    age_detail = "unavailable" if latest_age_s is None else f"{latest_age_s:.4f}s"
+                    raise RuntimeError(
+                        "Timed out waiting for a wrist frame aligned to tactile input: "
+                        f"target={target_timestamp:.6f}, limit={max_skew_s:.4f}s, "
+                        f"latest_age={age_detail}, {history_detail}"
                     )
                 self._condition.wait(timeout=remaining_s)
 
@@ -267,6 +369,7 @@ class WristCamera:
                     if self._stop_event.is_set():
                         break
                     self._latest_frame = frame
+                    self._frame_history.append(frame)
                     self._latest_sequence += 1
                     self._condition.notify_all()
         except BaseException as exc:
@@ -346,6 +449,12 @@ class TacThruTactileSource:
 
         with self.sensor_cfg_path.open("r", encoding="utf-8") as file:
             raw_cfg = yaml.safe_load(file) or {}
+        self.receive_latency_s = float(raw_cfg.get("receive_latency", 0.0))
+        if not np.isfinite(self.receive_latency_s) or self.receive_latency_s < 0.0:
+            raise ValueError(
+                "TacThru receive_latency must be a non-negative finite value, "
+                f"got {self.receive_latency_s}"
+            )
         tracking = raw_cfg.get("tracking") or {}
         tracking_path = tracking.get("tracking_pts_path")
         if tracking_path:
@@ -399,6 +508,7 @@ class TacThruTactileSource:
             history_stride=self.history_stride,
             include_rgb=self.include_rgb,
             include_marker=self.include_marker,
+            receive_latency_s=self.receive_latency_s,
         )
 
     def close(self) -> None:
@@ -415,6 +525,11 @@ class TacThruTactileSource:
                 if sensor.is_alive():
                     sensor.terminate()
                     sensor.join(timeout=1.0)
+            # TacThru's multiprocessing base class calls stop() again from
+            # __del__.  Finalize it while the SharedMemoryManager events are
+            # still valid instead of after manager.shutdown().
+            del sensor
+            gc.collect()
         manager = getattr(self, "_manager", None)
         self._manager = None
         if manager is not None:
@@ -431,6 +546,7 @@ def build_tactile_history(
     history_stride: int,
     include_rgb: bool,
     include_marker: bool,
+    receive_latency_s: float = 0.0,
 ) -> TactileHistory:
     """Build chronological fixed-K tactile tensors with left-padding masks."""
 
@@ -438,6 +554,11 @@ def build_tactile_history(
     stride = int(history_stride)
     if steps <= 0 or stride <= 0:
         raise ValueError("history_steps and history_stride must be positive")
+    receive_latency_s = float(receive_latency_s)
+    if not np.isfinite(receive_latency_s) or receive_latency_s < 0.0:
+        raise ValueError(
+            f"receive_latency_s must be a non-negative finite value, got {receive_latency_s}"
+        )
     timestamps_all = np.asarray(sensor_data.get("timestamp"), dtype=np.float64)
     if timestamps_all.ndim != 1 or len(timestamps_all) == 0:
         raise ValueError("TacThru sensor history must contain a non-empty timestamp vector")
@@ -532,6 +653,9 @@ def build_tactile_history(
             "available_sensor_frames": int(len(timestamps_all)),
             "history_mask": history_mask.astype(bool).tolist(),
             "latest_timestamp": float(timestamps[-1]),
+            "latest_capture_timestamp": float(timestamps[-1]),
+            "estimated_latest_receive_timestamp": float(timestamps[-1] + receive_latency_s),
+            "receive_latency_s": receive_latency_s,
             **marker_debug,
         },
     )
@@ -560,26 +684,44 @@ def validate_local_tactile_guard(
     if not timestamp_vectors:
         raise SafetyViolation("local tactile guard received no tactile timestamps")
     latest_timestamp = min(float(value[-1]) for value in timestamp_vectors)
-    age_s = float(now) - latest_timestamp
-    if not np.isfinite(age_s) or age_s < -0.02:
-        raise SafetyViolation(f"tactile timestamp is invalid or in the future: age={age_s:.4f}s")
-    if age_s > float(max_tactile_age_s):
+    estimated_receive_timestamp = float(
+        history.debug.get("estimated_latest_receive_timestamp", latest_timestamp)
+    )
+    capture_age_s = float(now) - latest_timestamp
+    receive_age_s = float(now) - estimated_receive_timestamp
+    if not np.isfinite(capture_age_s) or capture_age_s < -0.02:
         raise SafetyViolation(
-            f"tactile_stale: age {age_s:.4f}s exceeds limit {float(max_tactile_age_s):.4f}s"
+            f"tactile capture timestamp is invalid or in the future: age={capture_age_s:.4f}s"
+        )
+    if not np.isfinite(receive_age_s) or receive_age_s < -0.02:
+        raise SafetyViolation(
+            f"tactile receive timestamp is invalid or in the future: age={receive_age_s:.4f}s"
+        )
+    if receive_age_s > float(max_tactile_age_s):
+        raise SafetyViolation(
+            "tactile_stale: receive age "
+            f"{receive_age_s:.4f}s exceeds limit {float(max_tactile_age_s):.4f}s "
+            f"(capture_age={capture_age_s:.4f}s)"
         )
     skew_to_wrist_s = abs(latest_timestamp - float(wrist_timestamp))
     skew_to_robot_s = abs(latest_timestamp - float(robot_timestamp))
     maximum_skew_s = max(skew_to_wrist_s, skew_to_robot_s)
     if maximum_skew_s > float(max_tactile_skew_s):
         raise SafetyViolation(
-            f"tactile_stale: tactile/wrist/state skew {maximum_skew_s:.4f}s exceeds "
-            f"limit {float(max_tactile_skew_s):.4f}s"
+            "tactile_stale: tactile/wrist/state skew "
+            f"max={maximum_skew_s:.4f}s (wrist={skew_to_wrist_s:.4f}s, "
+            f"robot={skew_to_robot_s:.4f}s) exceeds limit {float(max_tactile_skew_s):.4f}s"
         )
 
     debug: dict[str, Any] = {
         "enabled": True,
         "latest_timestamp": latest_timestamp,
-        "age_s": age_s,
+        "latest_capture_timestamp": latest_timestamp,
+        "estimated_latest_receive_timestamp": estimated_receive_timestamp,
+        "capture_age_s": capture_age_s,
+        "receive_age_s": receive_age_s,
+        # Backward-compatible log key now means the freshness age used by the guard.
+        "age_s": receive_age_s,
         "skew_to_wrist_s": skew_to_wrist_s,
         "skew_to_robot_s": skew_to_robot_s,
         "marker_required": bool(marker_required),
@@ -1568,6 +1710,10 @@ def run_realman(
     tactile_source: TacThruTactileSource | None = None
     camera: WristCamera | None = None
     runtime: RealmanEpisodeRuntime | None = None
+    effective_tactile_skew_s = min(
+        args.max_tactile_skew_s,
+        float(health.get("tactile_max_timestamp_skew_s", args.max_tactile_skew_s)),
+    )
     try:
         if any(args._tactile_requested.values()):
             try:
@@ -1592,6 +1738,10 @@ def run_realman(
             camera_cfg,
             max_frame_age_s=args.max_sensor_skew_s * CAMERA_FRESHNESS_FRACTION,
         )
+        if tactile_source is not None:
+            # Start before Realman setup / operator confirmation so the short
+            # history already covers the calibrated tactile timestamp.
+            camera.start()
         runtime = RealmanEpisodeRuntime(
             RealmanConfig(
             tacthru_repo=tacthru_repo,
@@ -1700,31 +1850,99 @@ def run_realman(
         while step_index < args.steps:
             request_attempt += 1
             loop_start = time.time()
-            camera_frame = camera.capture()
-            snapshot = runtime.read_policy_state()
+            tactile_history: TactileHistory | None = None
+            tactile_guard_debug: dict[str, Any] | None = None
+            tactile_capture_error: str | None = None
+            tactile_capture_s = 0.0
+            tactile_guard_s = 0.0
+            tactile_alignment_target_timestamp: float | None = None
+            tactile_alignment_retry_count = 0
+            tactile_alignment_wait_s = 0.0
+            tactile_alignment_started = time.monotonic()
+            tactile_alignment_deadline = (
+                tactile_alignment_started + TACTILE_ALIGNMENT_WARMUP_TIMEOUT_S
+            )
+            while True:
+                tactile_history = None
+                tactile_capture_error = None
+                tactile_alignment_target_timestamp = None
+                if tactile_source is not None:
+                    tactile_capture_started = time.perf_counter()
+                    try:
+                        tactile_history = tactile_source.capture()
+                    except Exception as exc:
+                        tactile_capture_error = f"{type(exc).__name__}: {exc}"
+                        if args.execute or not args.allow_missing_tactile:
+                            raise SafetyViolation(
+                                "tactile sensor capture failed; no action will be planned: "
+                                f"{tactile_capture_error}"
+                            ) from exc
+                    finally:
+                        tactile_capture_s += time.perf_counter() - tactile_capture_started
+                if tactile_history is not None:
+                    timestamp_vectors = [
+                        value
+                        for value in (
+                            tactile_history.rgb_timestamps,
+                            tactile_history.marker_timestamps,
+                        )
+                        if value is not None
+                    ]
+                    if not timestamp_vectors:
+                        raise SafetyViolation(
+                            "tactile history contains no timestamp for multimodal alignment"
+                        )
+                    tactile_alignment_target_timestamp = min(
+                        float(value[-1]) for value in timestamp_vectors
+                    )
+                    try:
+                        camera_frame = camera.capture_at_or_before(
+                            tactile_alignment_target_timestamp,
+                            max_skew_s=effective_tactile_skew_s,
+                        )
+                        snapshot = runtime.read_policy_state_at(
+                            tactile_alignment_target_timestamp,
+                            max_skew_s=effective_tactile_skew_s,
+                        )
+                    except HistoricalAlignmentNotReady as exc:
+                        if time.monotonic() >= tactile_alignment_deadline:
+                            raise SafetyViolation(
+                                "timed out warming wrist/robot history for tactile alignment; "
+                                "no inference request or action was sent: "
+                                f"{type(exc).__name__}: {exc}"
+                            ) from exc
+                        tactile_alignment_retry_count += 1
+                        if tactile_alignment_retry_count == 1:
+                            print(
+                                "[lingbot-v2-client] warming causal wrist/robot history "
+                                "for the calibrated tactile timestamp; no inference request "
+                                "or action has been sent",
+                                flush=True,
+                            )
+                        time.sleep(TACTILE_ALIGNMENT_RETRY_INTERVAL_S)
+                        continue
+                    except Exception as exc:
+                        raise SafetyViolation(
+                            "failed to align wrist/robot history to tactile timestamp; "
+                            f"no action will be planned: {type(exc).__name__}: {exc}"
+                        ) from exc
+                else:
+                    camera_frame = camera.capture()
+                    snapshot = runtime.read_policy_state()
+                break
+            if tactile_alignment_retry_count:
+                tactile_alignment_wait_s = time.monotonic() - tactile_alignment_started
+            if tactile_history is not None:
+                tactile_history.debug["historical_alignment"] = True
+                tactile_history.debug["alignment_retry_count"] = tactile_alignment_retry_count
+                tactile_history.debug["alignment_wait_s"] = tactile_alignment_wait_s
+
             sensor_skew_s = abs(camera_frame.capture_timestamp - snapshot.timestamp)
             if sensor_skew_s > args.max_sensor_skew_s:
                 raise SafetyViolation(
                     f"Wrist image/robot state skew {sensor_skew_s:.4f}s exceeds "
                     f"--max-sensor-skew-s {args.max_sensor_skew_s:.4f}s"
                 )
-            tactile_history: TactileHistory | None = None
-            tactile_guard_debug: dict[str, Any] | None = None
-            tactile_capture_error: str | None = None
-            tactile_capture_s = 0.0
-            tactile_guard_s = 0.0
-            if tactile_source is not None:
-                tactile_capture_started = time.perf_counter()
-                try:
-                    tactile_history = tactile_source.capture()
-                except BaseException as exc:
-                    tactile_capture_error = f"{type(exc).__name__}: {exc}"
-                    if args.execute or not args.allow_missing_tactile:
-                        raise SafetyViolation(
-                            f"tactile sensor capture failed; no action will be planned: {tactile_capture_error}"
-                        ) from exc
-                finally:
-                    tactile_capture_s = time.perf_counter() - tactile_capture_started
             if tactile_history is not None and args.local_tactile_guard:
                 tactile_guard_started = time.perf_counter()
                 tactile_guard_debug = validate_local_tactile_guard(
@@ -1734,10 +1952,7 @@ def run_realman(
                     now=time.time(),
                     marker_required=args._tactile_requested["tactile_marker"],
                     max_tactile_age_s=args.max_tactile_age_s,
-                    max_tactile_skew_s=min(
-                        args.max_tactile_skew_s,
-                        float(health.get("tactile_max_timestamp_skew_s", args.max_tactile_skew_s)),
-                    ),
+                    max_tactile_skew_s=effective_tactile_skew_s,
                     min_valid_markers=args.min_valid_markers,
                     max_marker_flow_norm=args.max_marker_flow_norm,
                     max_marker_velocity_norm_s=args.max_marker_velocity_norm_s,
@@ -1805,6 +2020,10 @@ def run_realman(
                     "robot_state_timestamp": snapshot.timestamp,
                     "sensor_skew_s": sensor_skew_s,
                     "tactile_mode": args.tactile_mode,
+                    "tactile_alignment_enabled": tactile_history is not None,
+                    "tactile_alignment_target_timestamp": tactile_alignment_target_timestamp,
+                    "tactile_alignment_retry_count": tactile_alignment_retry_count,
+                    "tactile_alignment_wait_s": tactile_alignment_wait_s,
                     "tactile_capture_error": tactile_capture_error,
                     "tactile": tactile_history.debug if tactile_history is not None else None,
                     "local_tactile_guard": tactile_guard_debug,

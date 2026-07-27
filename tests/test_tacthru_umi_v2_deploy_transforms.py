@@ -218,6 +218,28 @@ def test_wrist_camera_background_worker_returns_latest_frame(monkeypatch) -> Non
     assert camera._thread is not None and not camera._thread.is_alive()
 
 
+def test_wrist_camera_returns_causal_frame_aligned_to_tactile_timestamp(monkeypatch) -> None:
+    capture = FakeContinuousCapture()
+    camera = _make_wrist_camera(monkeypatch, capture, history_seconds=0.5)
+    try:
+        camera.start()
+        time.sleep(0.05)
+        with camera._condition:
+            history = tuple(camera._frame_history)
+        assert len(history) >= 4
+        reference_index = len(history) - 3
+        target_timestamp = history[reference_index].capture_timestamp + 0.001
+
+        aligned = camera.capture_at_or_before(target_timestamp, max_skew_s=0.02)
+
+        assert aligned.capture_timestamp == pytest.approx(
+            history[reference_index].capture_timestamp
+        )
+        assert 0.0 <= target_timestamp - aligned.capture_timestamp <= 0.02
+    finally:
+        camera.close()
+
+
 def test_wrist_camera_rejects_continuously_produced_old_frames(monkeypatch) -> None:
     capture = FakeContinuousCapture(timestamp_offset_s=-1.5)
     camera = _make_wrist_camera(

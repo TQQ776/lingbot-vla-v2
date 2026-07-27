@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from deploy.tacthru_umi_v2.realman_runtime import (
+    HistoricalAlignmentNotReady,
     ActionPlan,
     RealmanConfig,
     RealmanEpisodeRuntime,
@@ -28,6 +29,16 @@ class FakeRobot:
             "timestamp": time.time() if self.timestamp is None else self.timestamp,
             "eef_pos": self.pose[:3, 3],
             "eef_rot_axis_angle": Rotation.from_matrix(self.pose[:3, :3]).as_rotvec(),
+        }
+
+    def get_all_state(self):
+        state = self.get()
+        return {
+            "timestamp": np.asarray([state["timestamp"]], dtype=np.float64),
+            "eef_pos": np.asarray([state["eef_pos"]], dtype=np.float64),
+            "eef_rot_axis_angle": np.asarray(
+                [state["eef_rot_axis_angle"]], dtype=np.float64
+            ),
         }
 
     def start_episode(self):
@@ -245,6 +256,68 @@ def test_invalid_gripper_feedback_blocks_episode_start(monkeypatch) -> None:
     assert runtime.actuation_enabled is False
     assert runtime.robot.start_episode_calls == 0
     assert ("start_episode",) not in gripper.events
+
+
+def test_historical_robot_state_is_aligned_causally_to_tactile_timestamp() -> None:
+    runtime = make_runtime(max_robot_state_age_s=0.25)
+    now = time.time()
+    timestamps = np.asarray([now - 0.20, now - 0.16, now - 0.12], dtype=np.float64)
+    positions = np.asarray(
+        [[0.50, 0.0, 0.0], [0.51, 0.0, 0.0], [0.52, 0.0, 0.0]],
+        dtype=np.float64,
+    )
+    rotations = np.zeros((3, 3), dtype=np.float64)
+
+    class HistoricalRobot(FakeRobot):
+        def get_all_state(self):
+            return {
+                "timestamp": timestamps,
+                "eef_pos": positions,
+                "eef_rot_axis_angle": rotations,
+            }
+
+    runtime.robot = HistoricalRobot(runtime.base_start_pose.copy())
+    target_timestamp = now - 0.13
+
+    snapshot = runtime.read_policy_state_at(target_timestamp, max_skew_s=0.05)
+
+    assert snapshot.timestamp == pytest.approx(timestamps[1])
+    assert snapshot.state[0] == pytest.approx(0.01)
+    assert snapshot.debug["historical_alignment"] is True
+    assert snapshot.debug["robot_tactile_skew_s"] == pytest.approx(0.03, abs=1e-4)
+
+    with pytest.raises(SafetyViolation, match="not aligned to tactile input"):
+        runtime.read_policy_state_at(target_timestamp, max_skew_s=0.02)
+
+    with pytest.raises(HistoricalAlignmentNotReady, match="no sample at or before"):
+        runtime.read_policy_state_at(timestamps[0] - 0.01, max_skew_s=0.05)
+
+
+def test_runtime_close_finalizes_components_before_shared_memory_manager() -> None:
+    events = []
+
+    class ClosingComponent:
+        def stop(self, wait=True):
+            events.append(("stop", bool(wait)))
+
+        def __del__(self):
+            events.append(("del", True))
+
+    class ClosingManager:
+        def shutdown(self):
+            events.append(("manager", True))
+
+    runtime = make_runtime()
+    runtime.robot = ClosingComponent()
+    runtime.shm_manager = ClosingManager()
+
+    runtime.close()
+
+    event_names = [name for name, _ in events]
+    assert event_names.index("stop") < event_names.index("del")
+    assert event_names.index("del") < event_names.index("manager")
+    assert runtime.robot is None
+    assert runtime.shm_manager is None
 
 
 def test_startup_width_overrides_hardware_init_but_not_policy_open_target(monkeypatch) -> None:

@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from deploy.tacthru_umi_v2.realman_client import (
+    TacThruTactileSource,
     TactileHistory,
     _resolve_tactile_request_args,
     build_parser,
@@ -113,6 +114,88 @@ def test_local_tactile_guard_fails_closed_on_stale_or_lost_markers() -> None:
             max_tactile_skew_s=0.05,
             min_valid_markers=40,
         )
+
+
+def test_local_tactile_guard_separates_receive_freshness_from_capture_alignment() -> None:
+    now = time.time()
+    latest_capture = now - 0.135
+    rgb = np.zeros((2, 480, 640, 3), dtype=np.uint8)
+    marker_ref = np.zeros((2, 48, 2), dtype=np.float32)
+    history = build_tactile_history(
+        {
+            "timestamp": np.asarray([latest_capture - 1.0 / 30.0, latest_capture]),
+            "rgb": rgb,
+            "marker": marker_ref.copy(),
+            "marker_ref": marker_ref,
+        },
+        history_steps=4,
+        history_stride=1,
+        include_rgb=False,
+        include_marker=True,
+        receive_latency_s=0.115,
+    )
+
+    debug = validate_local_tactile_guard(
+        history,
+        wrist_timestamp=latest_capture - 0.020,
+        robot_timestamp=latest_capture - 0.030,
+        now=now,
+        marker_required=True,
+        max_tactile_age_s=0.10,
+        max_tactile_skew_s=0.05,
+        min_valid_markers=40,
+    )
+
+    assert debug["capture_age_s"] == pytest.approx(0.135, abs=1e-4)
+    assert debug["receive_age_s"] == pytest.approx(0.020, abs=1e-4)
+    assert debug["age_s"] == pytest.approx(debug["receive_age_s"])
+    assert debug["skew_to_wrist_s"] == pytest.approx(0.020, abs=1e-4)
+    assert debug["skew_to_robot_s"] == pytest.approx(0.030, abs=1e-4)
+
+    with pytest.raises(SafetyViolation, match=r"wrist=0\.135\d*s, robot=0\.135\d*s"):
+        validate_local_tactile_guard(
+            history,
+            wrist_timestamp=now,
+            robot_timestamp=now,
+            now=now,
+            marker_required=True,
+            max_tactile_age_s=0.10,
+            max_tactile_skew_s=0.05,
+            min_valid_markers=40,
+        )
+
+
+def test_tactile_source_close_finalizes_sensor_before_manager_shutdown() -> None:
+    events = []
+
+    class ClosingSensor:
+        def stop(self, wait=False):
+            events.append(("stop", bool(wait)))
+
+        def join(self, timeout=None):
+            events.append(("join", timeout))
+
+        def is_alive(self):
+            return False
+
+        def __del__(self):
+            events.append(("del", True))
+
+    class ClosingManager:
+        def shutdown(self):
+            events.append(("manager", True))
+
+    source = TacThruTactileSource.__new__(TacThruTactileSource)
+    source._sensor = ClosingSensor()
+    source._manager = ClosingManager()
+
+    source.close()
+
+    event_names = [name for name, _ in events]
+    assert event_names.index("stop") < event_names.index("del")
+    assert event_names.index("del") < event_names.index("manager")
+    assert source._sensor is None
+    assert source._manager is None
 
 
 def test_execute_requires_all_checkpoint_modalities_and_forbids_force_mask() -> None:

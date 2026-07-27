@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import math
 import sys
 import time
@@ -27,6 +28,51 @@ from .transforms import (
 
 class SafetyViolation(RuntimeError):
     """Raised before any actuator call when a proposed chunk is unsafe."""
+
+
+class HistoricalAlignmentNotReady(SafetyViolation):
+    """No causal history sample currently satisfies the timestamp contract."""
+
+
+def _history_index_at_or_before(
+    timestamps: np.ndarray,
+    target_timestamp: float,
+    *,
+    max_skew_s: float,
+    label: str,
+) -> tuple[int, float, float]:
+    """Select the latest causal history sample within the alignment limit."""
+
+    values = np.asarray(timestamps, dtype=np.float64).reshape(-1)
+    target_timestamp = float(target_timestamp)
+    max_skew_s = float(max_skew_s)
+    if not np.isfinite(target_timestamp) or target_timestamp <= 0.0:
+        raise ValueError(f"target_timestamp must be positive and finite, got {target_timestamp}")
+    if not np.isfinite(max_skew_s) or max_skew_s <= 0.0:
+        raise ValueError(f"max_skew_s must be positive and finite, got {max_skew_s}")
+    valid = np.isfinite(values) & (values > 0.0) & (values <= target_timestamp + 1e-9)
+    candidates = np.flatnonzero(valid)
+    if len(candidates) == 0:
+        finite = values[np.isfinite(values) & (values > 0.0)]
+        history_detail = (
+            "empty"
+            if len(finite) == 0
+            else f"[{float(finite.min()):.6f}, {float(finite.max()):.6f}]"
+        )
+        raise HistoricalAlignmentNotReady(
+            f"{label} history has no sample at or before tactile timestamp "
+            f"{target_timestamp:.6f}; history={history_detail}"
+        )
+    selected_index = int(candidates[np.argmax(values[candidates])])
+    selected_timestamp = float(values[selected_index])
+    skew_s = target_timestamp - selected_timestamp
+    if skew_s > max_skew_s:
+        raise HistoricalAlignmentNotReady(
+            f"{label} history is not aligned to tactile input: target={target_timestamp:.6f}, "
+            f"selected={selected_timestamp:.6f}, skew={skew_s:.4f}s, "
+            f"limit={max_skew_s:.4f}s"
+        )
+    return selected_index, selected_timestamp, skew_s
 
 
 @dataclass(frozen=True)
@@ -187,12 +233,19 @@ class RealmanEpisodeRuntime:
         return startup_verification
 
     def close(self) -> None:
-        if self.gripper is not None:
+        robot = self.robot
+        gripper = self.gripper
+        manager = self.shm_manager
+        self.robot = None
+        self.gripper = None
+        self.shm_manager = None
+        if gripper is not None:
             print(
                 "[lingbot-v2-client] stopping Gloria now; the driver will disable servo torque",
                 flush=True,
             )
-        for component in (self.robot, self.gripper):
+        components = [robot, gripper]
+        for component in components:
             if component is not None:
                 try:
                     component.stop(wait=True)
@@ -201,9 +254,17 @@ class RealmanEpisodeRuntime:
                         f"[lingbot-v2-client] warning: failed to stop {type(component).__name__}: {exc}",
                         flush=True,
                     )
-        if self.shm_manager is not None:
+        # Realman's multiprocessing base invokes stop() again from __del__.
+        # Drop the final component references while manager-backed Events are
+        # still alive, then shut the manager down.
+        components.clear()
+        del component
+        del robot
+        del gripper
+        gc.collect()
+        if manager is not None:
             try:
-                self.shm_manager.shutdown()
+                manager.shutdown()
             except Exception as exc:
                 print(f"[lingbot-v2-client] warning: failed to close shared memory: {exc}", flush=True)
 
@@ -243,6 +304,51 @@ class RealmanEpisodeRuntime:
                 "gripper_width_source": "assumed" if self._gripper_feedback_is_assumed else "hardware_feedback",
                 "robot_timestamp": float(robot_timestamp),
                 "robot_state_age_s": float(now - robot_timestamp),
+                "actuation_enabled": self._actuation_enabled,
+            },
+        )
+
+    def read_policy_state_at(
+        self,
+        target_timestamp: float,
+        *,
+        max_skew_s: float,
+    ) -> PolicyStateSnapshot:
+        """Read a historical robot pose aligned to a calibrated tactile frame."""
+
+        if self.base_start_pose is None:
+            raise RuntimeError("Episode start pose is not initialized")
+        robot_state, robot_timestamp, robot_skew_s = self._read_robot_state_at(
+            target_timestamp,
+            max_skew_s=max_skew_s,
+        )
+        base_current = pose_mat_from_rotvec(
+            robot_state["eef_pos"],
+            robot_state["eef_rot_axis_angle"],
+        )
+        # The insertion policy holds Gloria closed until the explicit release
+        # decision. Use verified current feedback for width while aligning the
+        # higher-rate arm pose from its history.
+        gripper_width = self._read_gripper_width()
+        state = episode_state_from_base_poses(self.base_start_pose, base_current, gripper_width)
+        now = time.time()
+        return PolicyStateSnapshot(
+            state=state,
+            base_pose=base_current,
+            timestamp=robot_timestamp,
+            debug={
+                "pose_frame": "episode_start_new_tcp",
+                "base_start_pos_m": self.base_start_pose[:3, 3].astype(float).tolist(),
+                "base_current_pos_m": base_current[:3, 3].astype(float).tolist(),
+                "episode_current_xyz_m": state[POSITION_SLICE].astype(float).tolist(),
+                "episode_current_quaternion_xyzw": state[QUATERNION_SLICE].astype(float).tolist(),
+                "gripper_width_m": float(gripper_width),
+                "gripper_width_source": "assumed" if self._gripper_feedback_is_assumed else "hardware_feedback",
+                "robot_timestamp": float(robot_timestamp),
+                "robot_state_age_s": float(now - robot_timestamp),
+                "tactile_alignment_target_timestamp": float(target_timestamp),
+                "robot_tactile_skew_s": float(robot_skew_s),
+                "historical_alignment": True,
                 "actuation_enabled": self._actuation_enabled,
             },
         )
@@ -650,6 +756,58 @@ class RealmanEpisodeRuntime:
         pose = pose_mat_from_rotvec(state["eef_pos"], state["eef_rot_axis_angle"])
         timestamp = float(np.asarray(state["timestamp"]).reshape(-1)[-1])
         return pose, timestamp
+
+    def _read_robot_state_at(
+        self,
+        target_timestamp: float,
+        *,
+        max_skew_s: float,
+    ) -> tuple[dict[str, np.ndarray | float], float, float]:
+        controller = getattr(self.robot, "controller", None)
+        if controller is not None and hasattr(controller, "is_alive") and not controller.is_alive():
+            raise RuntimeError("Realman controller process is not alive")
+        if hasattr(self.robot, "is_ready") and not self.robot.is_ready:
+            raise RuntimeError("Realman adapter is not ready")
+        if self.robot is None or not hasattr(self.robot, "get_all_state"):
+            raise RuntimeError("Realman adapter does not expose historical state required for tactile alignment")
+
+        history = self.robot.get_all_state()
+        timestamps = np.asarray(history.get("timestamp", []), dtype=np.float64).reshape(-1)
+        index, selected_timestamp, skew_s = _history_index_at_or_before(
+            timestamps,
+            target_timestamp,
+            max_skew_s=max_skew_s,
+            label="Realman state",
+        )
+        positions = np.asarray(history.get("eef_pos", []), dtype=np.float64)
+        rotations = np.asarray(history.get("eef_rot_axis_angle", []), dtype=np.float64)
+        if positions.shape != (len(timestamps), 3) or rotations.shape != (len(timestamps), 3):
+            raise RuntimeError(
+                "Realman historical state has inconsistent shapes: "
+                f"timestamps={timestamps.shape}, eef_pos={positions.shape}, "
+                f"eef_rot_axis_angle={rotations.shape}"
+            )
+        position = positions[index]
+        rotvec = rotations[index]
+        state_age_s = time.time() - selected_timestamp
+        if (
+            not np.isfinite(position).all()
+            or not np.isfinite(rotvec).all()
+            or not -0.05 <= state_age_s <= self.cfg.max_robot_state_age_s
+        ):
+            raise SafetyViolation(
+                "Aligned Realman state is invalid or stale: "
+                f"age={state_age_s:.4f}s, max={self.cfg.max_robot_state_age_s:.4f}s"
+            )
+        return (
+            {
+                "timestamp": selected_timestamp,
+                "eef_pos": position,
+                "eef_rot_axis_angle": rotvec,
+            },
+            selected_timestamp,
+            skew_s,
+        )
 
     def _read_robot_state(self, *, timeout_s: float = 2.0) -> dict[str, Any]:
         controller = getattr(self.robot, "controller", None)

@@ -254,6 +254,19 @@ bash scripts/run_tacthru_umi_v2_tactile_client.sh synthetic \
 STEPS=20 bash scripts/real_insert_ethernet_tactile.sh
 ```
 
+protocol v2 真机客户端会保留短时腕部图像和 Realman 状态历史，并以最新触觉的
+校准采集时间戳为目标，选择不晚于该时刻且偏差不超过 checkpoint
+`max_timestamp_skew_s` 的历史样本。`--max-tactile-age-s` 检查的是估算接收时间，
+而跨模态 skew 仍使用校准采集时间；不要通过把 TacThru `receive_latency` 改为 0
+或放宽服务器合同来伪造同步。日志中的 `capture_age_s`、`receive_age_s`、
+`skew_to_wrist_s` 和 `skew_to_robot_s` 应分别检查。
+
+启动首帧时，如果校准后的触觉时间早于刚启动的腕部或 Realman 历史，客户端会在
+不发送推理请求和动作的前提下丢弃该帧并自动预热历史，最长等待 2 秒。只有
+“当前历史里没有满足 50 ms 合同的因果样本”会重采整组观测；这也覆盖偶发相机
+丢帧，但不会把超限样本发给服务器。若连续 2 秒仍无法对齐，或触觉本身陈旧、
+设备故障，客户端仍会失败关闭。
+
 只有 synthetic、离线回放和 dry-run 均通过后，才可显式执行：
 
 ```bash
