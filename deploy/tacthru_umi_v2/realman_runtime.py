@@ -42,9 +42,14 @@ class RealmanConfig:
     gripper_max_width_m: float | None = None
     gripper_command_torque: int | None = None
     gripper_command_speed: int | None = None
+    gripper_startup_width_m: float | None = None
+    gripper_startup_tolerance_m: float = 0.005
+    gripper_startup_timeout_s: float = 3.0
     gripper_action_select: str | None = None
     gripper_hold_closed_below_m: float | None = None
     gripper_hold_closed_target_m: float | None = None
+    gripper_open_lookahead_start_step: int | None = None
+    gripper_open_lookahead_consecutive_steps: int | None = None
     exec_start_step: int = 2
     exec_end_step: int = 8
     preserve_exec_window_length: bool = True
@@ -81,6 +86,7 @@ class ActionPlan:
     gripper_width_m: np.ndarray
     timestamps: np.ndarray
     debug: dict[str, Any]
+    full_gripper_width_m: np.ndarray | None = None
 
     @property
     def is_empty(self) -> bool:
@@ -107,6 +113,7 @@ class RealmanEpisodeRuntime:
         self.base_start_pose: np.ndarray | None = None
         self._actuation_enabled = False
         self._gripper_max_width_m = float(cfg.gripper_max_width_m or 0.05)
+        self._gripper_initial_width_m = float(cfg.assumed_gripper_width_m)
         self._last_gripper_width_m = float(cfg.assumed_gripper_width_m)
         self._held_gripper_width_m: float | None = None
         self._gripper_action_select = "last"
@@ -146,24 +153,38 @@ class RealmanEpisodeRuntime:
             flush=True,
         )
 
-    def enable_actuation(self) -> None:
+    def enable_actuation(self) -> dict[str, float] | None:
         if self.robot is None:
             raise RuntimeError("Runtime must be started before enabling actuation")
         if self._actuation_enabled:
-            return
+            return None
 
+        startup_verification = None
         if self.cfg.enable_gripper:
             gripper_cfg = self._load_gripper_cfg()
             self.gripper = self._create_gripper(gripper_cfg)
+            startup_width = self.cfg.gripper_startup_width_m
+            startup_detail = (
+                f" to {startup_width * 1000.0:.1f}mm before inference"
+                if startup_width is not None
+                else ""
+            )
             print(
-                "[lingbot-v2-client] enabling Gloria gripper; its configured initialization may move the gripper",
+                f"[lingbot-v2-client] enabling Gloria gripper{startup_detail}; initialization will move the gripper",
                 flush=True,
             )
             self.gripper.start(wait=False)
             self.gripper.start_wait()
+            if startup_width is not None:
+                startup_verification = self._wait_for_gripper_target(
+                    float(startup_width),
+                    tolerance_m=self.cfg.gripper_startup_tolerance_m,
+                    timeout_s=self.cfg.gripper_startup_timeout_s,
+                )
 
         self._actuation_enabled = True
         self.reset_episode_start()
+        return startup_verification
 
     def close(self) -> None:
         if self.gripper is not None:
@@ -233,6 +254,7 @@ class RealmanEpisodeRuntime:
         observation_state: np.ndarray,
         observation_timestamp: float,
         control_frequency_hz: float,
+        compensate_inference_latency: bool = False,
         now: float | None = None,
     ) -> ActionPlan:
         if self.base_start_pose is None:
@@ -258,8 +280,10 @@ class RealmanEpisodeRuntime:
             observation_timestamp=float(observation_timestamp),
             control_frequency_hz=float(control_frequency_hz),
             now=now,
+            compensate_inference_latency=bool(compensate_inference_latency),
         )
         selected = actions[indices]
+        full_gripper = actions[:, GRIPPER_INDEX].astype(np.float64)
         if len(selected) == 0:
             return ActionPlan(
                 selected_indices=indices,
@@ -269,6 +293,7 @@ class RealmanEpisodeRuntime:
                 gripper_width_m=np.zeros((0,), dtype=np.float64),
                 timestamps=np.zeros((0,), dtype=np.float64),
                 debug={**timing_debug, "num_selected": 0, "safe": True},
+                full_gripper_width_m=full_gripper,
             )
 
         current_base = self._read_current_pose()
@@ -294,25 +319,67 @@ class RealmanEpisodeRuntime:
             axis=0,
         )
         gripper = selected[:, GRIPPER_INDEX].astype(np.float64)
+        gripper_policy_debug: dict[str, Any] = {}
+        gripper_preview = self._select_gripper_target(
+            gripper,
+            update_hold=False,
+            lookahead_widths=full_gripper,
+            decision_debug=gripper_policy_debug,
+        )
+        safety_gripper = np.full(gripper.shape, gripper_preview, dtype=np.float64)
         current_controller = self._umi_to_controller_pose(current_base)
-        controller_targets, table_z_lift_m = self._preview_adapter_targets(target_base, gripper)
+        controller_targets, table_z_lift_m = self._preview_adapter_targets(target_base, safety_gripper)
         self._validate_workspace(controller_targets)
-        segment_starts = np.concatenate([current_controller[None], controller_targets[:-1]], axis=0)
         target_delta = np.linalg.norm(
             controller_targets[:, :3, 3] - current_controller[:3, 3][None], axis=1
         )
-        step_delta = np.linalg.norm(controller_targets[:, :3, 3] - segment_starts[:, :3, 3], axis=1)
         target_rotation = np.asarray(
             [rotation_distance_rad(current_controller, target) for target in controller_targets], dtype=np.float64
         )
-        step_rotation = np.asarray(
-            [rotation_distance_rad(start, target) for start, target in zip(segment_starts, controller_targets)],
+        first_waypoint_delta = float(
+            np.linalg.norm(controller_targets[0, :3, 3] - current_controller[:3, 3])
+        )
+        first_waypoint_rotation = float(rotation_distance_rad(current_controller, controller_targets[0]))
+        consecutive_waypoint_delta = np.linalg.norm(
+            np.diff(controller_targets[:, :3, 3], axis=0), axis=1
+        )
+        consecutive_waypoint_rotation = np.asarray(
+            [
+                rotation_distance_rad(start, target)
+                for start, target in zip(controller_targets[:-1], controller_targets[1:])
+            ],
             dtype=np.float64,
+        )
+        step_delta = np.concatenate(
+            [np.asarray([first_waypoint_delta], dtype=np.float64), consecutive_waypoint_delta]
+        )
+        step_rotation = np.concatenate(
+            [np.asarray([first_waypoint_rotation], dtype=np.float64), consecutive_waypoint_rotation]
         )
         _reject_above(target_delta, self.cfg.max_target_delta_m, "target translation from current")
         _reject_above(target_rotation, self.cfg.max_target_rotation_rad, "target rotation from current")
-        _reject_above(step_delta, self.cfg.max_step_delta_m, "consecutive waypoint translation")
-        _reject_above(step_rotation, self.cfg.max_step_rotation_rad, "consecutive waypoint rotation")
+        _reject_above(
+            np.asarray([first_waypoint_delta]),
+            self.cfg.max_step_delta_m,
+            "first waypoint translation from current",
+        )
+        _reject_above(
+            np.asarray([first_waypoint_rotation]),
+            self.cfg.max_step_rotation_rad,
+            "first waypoint rotation from current",
+        )
+        if len(consecutive_waypoint_delta):
+            _reject_above(
+                consecutive_waypoint_delta,
+                self.cfg.max_step_delta_m,
+                "consecutive waypoint translation",
+            )
+        if len(consecutive_waypoint_rotation):
+            _reject_above(
+                consecutive_waypoint_rotation,
+                self.cfg.max_step_rotation_rad,
+                "consecutive waypoint rotation",
+            )
 
         timestamps = self._build_timestamps(
             target_base=controller_targets,
@@ -328,7 +395,6 @@ class RealmanEpisodeRuntime:
                 f"Speed-limited plan duration {scheduled_duration_s:.3f}s exceeds "
                 f"{self.cfg.max_scheduled_duration_s:.3f}s"
             )
-        gripper_preview = self._select_gripper_target(gripper, update_hold=False)
         debug = {
             **timing_debug,
             "safe": True,
@@ -346,10 +412,21 @@ class RealmanEpisodeRuntime:
             "observation_drift_rotation_rad": drift_rot,
             "max_target_delta_m": float(target_delta.max()),
             "max_target_rotation_rad": float(target_rotation.max()),
+            "first_waypoint_delta_m": first_waypoint_delta,
+            "first_waypoint_rotation_rad": first_waypoint_rotation,
+            "max_consecutive_waypoint_delta_m": float(consecutive_waypoint_delta.max())
+            if len(consecutive_waypoint_delta)
+            else 0.0,
+            "max_consecutive_waypoint_rotation_rad": float(consecutive_waypoint_rotation.max())
+            if len(consecutive_waypoint_rotation)
+            else 0.0,
             "max_step_delta_m": float(step_delta.max()),
             "max_step_rotation_rad": float(step_rotation.max()),
             "gripper_width_m": gripper.astype(float).tolist(),
+            "full_action_gripper_width_m": full_gripper.astype(float).tolist(),
+            "gripper_policy": gripper_policy_debug,
             "gripper_command_preview_m": float(gripper_preview),
+            "adapter_safety_gripper_width_m": safety_gripper.astype(float).tolist(),
             "timestamps": timestamps.astype(float).tolist(),
             "scheduled_duration_s": scheduled_duration_s,
             "limits": {
@@ -374,6 +451,7 @@ class RealmanEpisodeRuntime:
             gripper_width_m=gripper,
             timestamps=timestamps,
             debug=debug,
+            full_gripper_width_m=full_gripper,
         )
 
     def execute_plan(self, plan: ActionPlan) -> dict[str, Any]:
@@ -387,18 +465,26 @@ class RealmanEpisodeRuntime:
         if dispatch_time > float(plan.timestamps[-1]):
             raise SafetyViolation("Action plan expired before dispatch")
 
-        controller_targets, _ = self._preview_adapter_targets(
-            plan.target_base_poses, plan.gripper_width_m
+        gripper_preview = self._select_gripper_target(
+            plan.gripper_width_m,
+            update_hold=False,
+            lookahead_widths=plan.full_gripper_width_m,
         )
+        safety_gripper = np.full(plan.gripper_width_m.shape, gripper_preview, dtype=np.float64)
+        controller_targets, _ = self._preview_adapter_targets(plan.target_base_poses, safety_gripper)
         if not np.allclose(controller_targets, plan.validated_controller_poses, atol=1e-8):
             raise SafetyViolation("Adapter safety transform changed after planning; refusing stale plan")
 
         self.robot.execute_waypoints(
             umi_pose=plan.target_base_poses.astype(np.float64),
-            gripper_width=plan.gripper_width_m.astype(np.float64),
+            gripper_width=safety_gripper,
             timestamps=plan.timestamps.astype(np.float64),
         )
-        gripper_command = self._select_gripper_target(plan.gripper_width_m, update_hold=True)
+        gripper_command = self._select_gripper_target(
+            plan.gripper_width_m,
+            update_hold=True,
+            lookahead_widths=plan.full_gripper_width_m,
+        )
         if self.gripper is not None:
             self.gripper.goto_pos(float(gripper_command))
         adapter_debug = getattr(self.robot, "last_waypoint_debug", None)
@@ -476,10 +562,12 @@ class RealmanEpisodeRuntime:
         observation_timestamp: float,
         control_frequency_hz: float,
         now: float,
+        compensate_inference_latency: bool,
     ) -> tuple[np.ndarray, dict[str, Any]]:
         dt = 1.0 / control_frequency_hz
         online_delay_s = max(0.0, now - observation_timestamp + self.cfg.robot_action_latency_s)
-        delay_steps = max(0, math.ceil(online_delay_s / dt - 1e-9))
+        compensated_delay_s = online_delay_s if compensate_inference_latency else 0.0
+        delay_steps = max(0, math.ceil(compensated_delay_s / dt - 1e-9))
         configured_start = max(0, int(self.cfg.exec_start_step))
         configured_end = min(action_horizon, int(self.cfg.exec_end_step))
         if configured_end < configured_start:
@@ -497,6 +585,8 @@ class RealmanEpisodeRuntime:
             "observation_timestamp": float(observation_timestamp),
             "plan_timestamp": float(now),
             "online_delay_s": float(online_delay_s),
+            "latency_compensation_enabled": bool(compensate_inference_latency),
+            "compensated_delay_s": float(compensated_delay_s),
             "delay_steps": int(delay_steps),
             "configured_exec_window": [configured_start, configured_end],
             "effective_exec_window": [effective_start, effective_end],
@@ -591,10 +681,17 @@ class RealmanEpisodeRuntime:
                 )
             time.sleep(0.02)
 
-    def _read_gripper_width(self) -> float:
+    def _read_gripper_width(
+        self,
+        *,
+        require_hardware_feedback: bool = False,
+        timeout_s: float = 1.0,
+    ) -> float:
         if self.gripper is None:
+            if require_hardware_feedback:
+                raise RuntimeError("Gloria gripper is not running")
             return float(self._last_gripper_width_m)
-        deadline = time.monotonic() + 1.0
+        deadline = time.monotonic() + timeout_s
         last_error: Exception | None = None
         while time.monotonic() < deadline:
             try:
@@ -608,6 +705,10 @@ class RealmanEpisodeRuntime:
                     raise RuntimeError(
                         f"Gripper feedback age {age_s:.3f}s exceeds {self.cfg.max_gripper_state_age_s:.3f}s"
                     )
+                if require_hardware_feedback:
+                    valid = state.get("gripper_feedback_valid")
+                    if valid is None or not bool(np.asarray(valid).reshape(-1)[-1]):
+                        raise RuntimeError("Gloria state does not contain valid hardware position feedback")
                 for key in ("gripper_width", "width", "width_m"):
                     if key in state:
                         width = float(np.asarray(state[key]).reshape(-1)[-1])
@@ -619,29 +720,142 @@ class RealmanEpisodeRuntime:
             except Exception as exc:
                 last_error = exc
                 time.sleep(0.02)
-        if self._actuation_enabled:
+        if require_hardware_feedback or self._actuation_enabled:
             raise RuntimeError(f"No fresh Gloria gripper feedback: {last_error}") from last_error
         if not self._warned_gripper_read_failure:
             print(f"[lingbot-v2-client] warning: failed to read gripper feedback: {last_error}", flush=True)
             self._warned_gripper_read_failure = True
         return float(self._last_gripper_width_m)
 
-    def _select_gripper_target(self, widths: np.ndarray, *, update_hold: bool) -> float:
+    def _wait_for_gripper_target(
+        self,
+        target_width_m: float,
+        *,
+        tolerance_m: float,
+        timeout_s: float,
+    ) -> dict[str, float]:
+        deadline = time.monotonic() + timeout_s
+        last_width_m: float | None = None
+        last_error: Exception | None = None
+        while time.monotonic() < deadline:
+            remaining_s = max(0.01, deadline - time.monotonic())
+            try:
+                last_width_m = self._read_gripper_width(
+                    require_hardware_feedback=True,
+                    timeout_s=min(0.25, remaining_s),
+                )
+                error_m = abs(last_width_m - target_width_m)
+                if error_m <= tolerance_m:
+                    print(
+                        "[lingbot-v2-client] Gloria startup verified from hardware feedback: "
+                        f"target={target_width_m * 1000.0:.1f}mm, "
+                        f"actual={last_width_m * 1000.0:.1f}mm",
+                        flush=True,
+                    )
+                    return {
+                        "target_width_m": float(target_width_m),
+                        "actual_width_m": float(last_width_m),
+                        "error_m": float(error_m),
+                    }
+            except Exception as exc:
+                last_error = exc
+            time.sleep(0.02)
+        detail = f"last_width={last_width_m!r}m" if last_width_m is not None else f"last_error={last_error!r}"
+        raise SafetyViolation(
+            "Gloria did not reach the required pre-inference width from valid hardware feedback: "
+            f"target={target_width_m:.4f}m, tolerance={tolerance_m:.4f}m, {detail}"
+        )
+
+    def _select_gripper_target(
+        self,
+        widths: np.ndarray,
+        *,
+        update_hold: bool,
+        lookahead_widths: np.ndarray | None = None,
+        decision_debug: dict[str, Any] | None = None,
+    ) -> float:
         values = np.asarray(widths, dtype=np.float64).reshape(-1)
+        mode = self._gripper_action_select
+        if len(values) == 0 and mode == "threshold":
+            raise ValueError("Threshold gripper policy received an empty prediction window")
         if len(values) == 0:
             return float(self._last_gripper_width_m)
-        mode = self._gripper_action_select
         if mode == "threshold":
             threshold = self._gripper_hold_closed_below_m
             if threshold is None:
                 raise ValueError("gripper_action_select=threshold requires hold_closed_below_m")
-            target = (
-                self._gripper_hold_closed_target_m
-                if float(np.min(values)) <= threshold and self._gripper_hold_closed_target_m is not None
-                else self.cfg.gripper_min_width_m
-                if float(np.min(values)) <= threshold
-                else self._gripper_max_width_m
+            finite_values = values[np.isfinite(values)]
+            if len(finite_values) == 0:
+                raise ValueError("Threshold gripper policy received no finite predicted widths")
+            closed_width = (
+                self.cfg.gripper_min_width_m
+                if self._gripper_hold_closed_target_m is None
+                else float(self._gripper_hold_closed_target_m)
             )
+            threshold = float(threshold)
+            open_width = float(self._gripper_initial_width_m)
+            if not all(np.isfinite(value) for value in (closed_width, threshold, open_width)):
+                raise ValueError("Threshold gripper widths must be finite")
+            if not (
+                self.cfg.gripper_min_width_m
+                <= closed_width
+                < threshold
+                < open_width
+                <= self._gripper_max_width_m
+            ):
+                raise ValueError(
+                    "Threshold gripper policy requires "
+                    "min_width <= closed_width < threshold < initial_width <= max_width; "
+                    f"got min={self.cfg.gripper_min_width_m}, closed={closed_width}, "
+                    f"threshold={threshold}, initial={open_width}, max={self._gripper_max_width_m}"
+                )
+            selected_min = float(np.min(finite_values))
+            selected_max = float(np.max(finite_values))
+            selected_triggered = selected_min > threshold
+            lookahead_start = self.cfg.gripper_open_lookahead_start_step
+            lookahead_count = self.cfg.gripper_open_lookahead_consecutive_steps
+            lookahead_run_starts: list[int] = []
+            lookahead_triggered = False
+            if lookahead_start is not None:
+                if lookahead_count is None:
+                    raise ValueError(
+                        "gripper_open_lookahead_consecutive_steps is required when lookahead is enabled"
+                    )
+                if lookahead_widths is None:
+                    raise ValueError("Threshold gripper lookahead requires the full action chunk")
+                full_values = np.asarray(lookahead_widths, dtype=np.float64).reshape(-1)
+                if not np.isfinite(full_values).all():
+                    raise ValueError("Threshold gripper lookahead received non-finite predicted widths")
+                if lookahead_start + lookahead_count > len(full_values):
+                    raise ValueError(
+                        "Threshold gripper lookahead window does not fit the action chunk: "
+                        f"start={lookahead_start}, consecutive={lookahead_count}, horizon={len(full_values)}"
+                    )
+                above_threshold = full_values[lookahead_start:] > threshold
+                for offset in range(len(above_threshold) - lookahead_count + 1):
+                    if bool(np.all(above_threshold[offset : offset + lookahead_count])):
+                        lookahead_run_starts.append(int(lookahead_start + offset))
+                lookahead_triggered = bool(lookahead_run_starts)
+            should_open = bool(selected_triggered or lookahead_triggered)
+            target = open_width if should_open else closed_width
+            if decision_debug is not None:
+                decision_debug.update(
+                    {
+                        "mode": "threshold",
+                        "threshold_m": threshold,
+                        "selected_min_m": selected_min,
+                        "selected_max_m": selected_max,
+                        "selected_all_above_threshold": bool(selected_triggered),
+                        "lookahead_enabled": lookahead_start is not None,
+                        "lookahead_start_step": lookahead_start,
+                        "lookahead_consecutive_steps": lookahead_count,
+                        "lookahead_open_run_start_steps": lookahead_run_starts,
+                        "lookahead_triggered": bool(lookahead_triggered),
+                        "decision": "open" if should_open else "closed",
+                        "target_width_m": float(target),
+                    }
+                )
+            return float(np.clip(target, self.cfg.gripper_min_width_m, self._gripper_max_width_m))
         elif mode in ("first", "earliest"):
             target = float(values[0])
         elif mode in ("min", "close", "tightest"):
@@ -735,6 +949,9 @@ class RealmanEpisodeRuntime:
         return OmegaConf.load(self._resolve_tacthru_path(path))
 
     def _configure_gripper_policy(self, gripper_cfg) -> None:
+        self._gripper_initial_width_m = float(
+            _cfg_get(gripper_cfg, "initial_width_mm", self.cfg.assumed_gripper_width_m * 1000.0)
+        ) / 1000.0
         self._gripper_action_select = str(
             self.cfg.gripper_action_select
             if self.cfg.gripper_action_select is not None
@@ -750,6 +967,11 @@ class RealmanEpisodeRuntime:
             if self.cfg.gripper_hold_closed_target_m is not None
             else _cfg_get(gripper_cfg, "hold_closed_target_m", None)
         )
+        if (
+            self.cfg.gripper_open_lookahead_start_step is not None
+            and self._gripper_action_select != "threshold"
+        ):
+            raise ValueError("Gripper open lookahead requires gripper_action_select=threshold")
 
     def _create_gripper(self, gripper_cfg):
         driver = str(gripper_cfg.get("driver", "gloria")).lower()
@@ -757,6 +979,11 @@ class RealmanEpisodeRuntime:
             raise ValueError(f"Only the Gloria gripper is supported, got {driver!r}")
         from real_world.grippers.gloria_controller import GloriaGripperController
 
+        startup_width_mm = (
+            None
+            if self.cfg.gripper_startup_width_m is None
+            else float(self.cfg.gripper_startup_width_m) * 1000.0
+        )
         return GloriaGripperController(
             self.shm_manager,
             _resolve_gripper_port(gripper_cfg),
@@ -778,8 +1005,16 @@ class RealmanEpisodeRuntime:
                 if self.cfg.gripper_command_speed is not None
                 else gripper_cfg.get("command_speed", 2000)
             ),
-            initial_width_mm=float(gripper_cfg.get("initial_width_mm", 45.0)),
-            episode_start_width_mm=gripper_cfg.get("episode_start_width_mm", None),
+            initial_width_mm=(
+                startup_width_mm
+                if startup_width_mm is not None
+                else float(gripper_cfg.get("initial_width_mm", 45.0))
+            ),
+            episode_start_width_mm=(
+                startup_width_mm
+                if startup_width_mm is not None
+                else gripper_cfg.get("episode_start_width_mm", None)
+            ),
             episode_end_width_mm=gripper_cfg.get("episode_end_width_mm", None),
             initial_move_torque=int(gripper_cfg.get("initial_move_torque", 0)),
             initial_move_speed=int(gripper_cfg.get("initial_move_speed", 2000)),
@@ -801,6 +1036,8 @@ class RealmanEpisodeRuntime:
             "max_robot_state_age_s": self.cfg.max_robot_state_age_s,
             "max_gripper_state_age_s": self.cfg.max_gripper_state_age_s,
             "max_scheduled_duration_s": self.cfg.max_scheduled_duration_s,
+            "gripper_startup_tolerance_m": self.cfg.gripper_startup_tolerance_m,
+            "gripper_startup_timeout_s": self.cfg.gripper_startup_timeout_s,
         }
         for name, value in positive_limits.items():
             _require_positive(value, name)
@@ -808,6 +1045,18 @@ class RealmanEpisodeRuntime:
             raise ValueError(f"robot_action_latency_s must be finite and non-negative, got {self.cfg.robot_action_latency_s}")
         if self.cfg.exec_start_step < 0 or self.cfg.exec_end_step < self.cfg.exec_start_step:
             raise ValueError("Execution window must satisfy 0 <= exec_start_step <= exec_end_step")
+        lookahead_start = self.cfg.gripper_open_lookahead_start_step
+        lookahead_count = self.cfg.gripper_open_lookahead_consecutive_steps
+        if (lookahead_start is None) != (lookahead_count is None):
+            raise ValueError(
+                "gripper_open_lookahead_start_step and "
+                "gripper_open_lookahead_consecutive_steps must be configured together"
+            )
+        if lookahead_start is not None:
+            if isinstance(lookahead_start, bool) or int(lookahead_start) != lookahead_start or lookahead_start < 0:
+                raise ValueError("gripper_open_lookahead_start_step must be a non-negative integer")
+            if isinstance(lookahead_count, bool) or int(lookahead_count) != lookahead_count or lookahead_count <= 0:
+                raise ValueError("gripper_open_lookahead_consecutive_steps must be a positive integer")
         gripper_max = self.cfg.gripper_max_width_m
         if gripper_max is not None and (not np.isfinite(gripper_max) or gripper_max <= self.cfg.gripper_min_width_m):
             raise ValueError("gripper_max_width_m must be finite and greater than gripper_min_width_m")
@@ -815,6 +1064,18 @@ class RealmanEpisodeRuntime:
             raise ValueError("gripper_min_width_m must be finite and non-negative")
         if not np.isfinite(self.cfg.assumed_gripper_width_m):
             raise ValueError("assumed_gripper_width_m must be finite")
+        startup_width = self.cfg.gripper_startup_width_m
+        if not self.cfg.enable_gripper and startup_width is not None:
+            raise ValueError("gripper_startup_width_m requires enable_gripper=True")
+        if startup_width is not None:
+            effective_max = 0.05 if gripper_max is None else float(gripper_max)
+            if (
+                not np.isfinite(startup_width)
+                or not self.cfg.gripper_min_width_m <= startup_width <= effective_max
+            ):
+                raise ValueError(
+                    "gripper_startup_width_m must be finite and within the configured gripper range"
+                )
         for name, value in (
             ("workspace_min_xyz_m", self.cfg.workspace_min_xyz_m),
             ("workspace_max_xyz_m", self.cfg.workspace_max_xyz_m),

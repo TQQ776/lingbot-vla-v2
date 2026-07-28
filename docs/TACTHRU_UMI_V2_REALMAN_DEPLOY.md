@@ -84,10 +84,11 @@ LINGBOT_V2_HTTP_KEEP_ALIVE=0 \
 bash scripts/run_tacthru_umi_v2_server.sh \
   --host 127.0.0.1 \
   --port 18081 \
-  --use-compile \
   --warmup
 ```
 
+上面只回退 HTTP 传输，并保持启动时的 `torch.compile` 选择不变：如果原 server 是用
+`--use-compile` 启动的，回退命令中仍加上同一个 `--use-compile`；如果原来没有，就不要添加。
 服务端模式改变需要重启 server；模型、checkpoint 和 norm 不受影响。
 
 默认关闭 `torch.compile`，优先保证真机部署稳定。完成普通推理 dry-run 后，如果需要降低延迟，可重启时增加 `--use-compile`，并再次完成 synthetic 和 dry-run 验证。
@@ -95,12 +96,23 @@ bash scripts/run_tacthru_umi_v2_server.sh \
 真机执行默认要求 SSH 隧道，因为明文 HTTP 无法防止返回动作被网络中间人篡改：
 
 ```bash
-ssh -p <当前SSH端口> -N \
-  -L 18081:127.0.0.1:18081 \
+ssh -p <当前SSH端口> -N -T \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=30 \
+  -o ServerAliveCountMax=3 \
+  -L 127.0.0.1:18081:127.0.0.1:18081 \
   tqq@172.16.41.254
 ```
 
-使用隧道时，本地 `--server-url` 写 `http://127.0.0.1:18081`。
+使用隧道时，本地 `--server-url` 写 `http://127.0.0.1:18081`。端口绑定失败时
+`ExitOnForwardFailure` 会让 SSH 立即退出，避免误把旧服务当成当前 server；保持该终端运行，
+按 Ctrl-C 即可关闭隧道并回退。也可以使用项目内的前台封装，它会从本机 SSH 配置解析
+当前用户、主机和端口：
+
+```bash
+cd /mnt/models/VTLA-RDT/lingbot-vla-v2
+bash scripts/run_tacthru_umi_v2_tunnel.sh
+```
 
 平台 TCP 端口映射只建议用于可信内网中的 health、synthetic 和 dry-run。`--execute` 会拒绝非 localhost 的明文 HTTP；若不使用 SSH 隧道，必须在 server 前配置 HTTPS/mTLS。
 
@@ -128,6 +140,7 @@ action_spec.quaternion_order: xyzw
 action_spec.gripper_unit: m
 contract.robot_config_sha256: ...
 contract.norm_stats_sha256: ...
+transport.http_protocol: HTTP/1.1
 transport.http_keep_alive_enabled: true
 ```
 
@@ -145,6 +158,10 @@ bash scripts/run_tacthru_umi_v2_client.sh synthetic \
 成功标准是返回 `action_shape: [50, 8]`，且没有协议、norm、checkpoint 或 CUDA 错误。
 
 synthetic 和真机 step 日志会记录 `latency`，包括 JPEG/JSON 编码、TCP连接、请求写入、等待响应头、响应读取、解析、连接是否复用，以及服务端 `read/decode/lock/inference/encode` 分阶段时间。即使 `roundtrip_s` 超过安全上限，客户端也会先写入 `roundtrip_rejected` 事件，保留该响应的服务端推理时间，然后拒绝执行动作。
+
+回退到旧 `urllib + Connection: close` 时仍记录总请求往返时间和服务端 `Server-Timing`，
+但不会有持久连接的 connect/write/header/read 细分。`/predict` 在连接模糊断线时不会自动
+重放，避免同一请求被推理两次；只有幂等的 `/health` 允许安全重连一次。
 
 本地真机 wrapper 默认启用 Keep-Alive。只回退客户端、不重启 server：
 
@@ -195,36 +212,33 @@ logs/realman/YYYY.MM.DD/HH.MM.SS_tacthru_umi_v2_dryrun/
 
 执行前必须根据机械臂实际摆放填写 Base 坐标系 workspace 边界。边界约束的是经过 adapter 桌面安全修正后的最终 controller TCP，而不是模型原始 UMI 点。不要直接复制示例数值；从当前位姿、工作台尺寸和 dry-run 的 `controller_target_pos_after_adapter_safety_m` 确定边界。
 
+使用项目内的已审核真机入口，避免复制一份会逐渐漂移的安全参数：
+
 ```bash
-bash scripts/run_tacthru_umi_v2_client.sh run \
-  --server-url http://127.0.0.1:18081 \
-  --instruction "Pull the tissue" \
-  --realman-ip 192.168.1.18 \
-  --realman-port 8080 \
-  --preview \
-  --steps 1 \
-  --execute \
-  --gripper-action-select threshold \
-  --gripper-hold-closed-below-m 0.012 \
-  --gripper-hold-closed-target-m 0.004 \
-  --exec-start-step 2 \
-  --exec-end-step 3 \
-  --max-roundtrip-s 5 \
-  --max-pos-speed 0.03 \
-  --max-rot-speed 0.08 \
-  --max-target-delta-m 0.06 \
-  --max-target-rotation-rad 0.60 \
-  --max-step-delta-m 0.02 \
-  --max-step-rotation-rad 0.25 \
-  --workspace-min-xyz <X_MIN> <Y_MIN> <Z_MIN> \
-  --workspace-max-xyz <X_MAX> <Y_MAX> <Z_MAX>
+cd /mnt/models/VTLA-RDT/lingbot-vla-v2
+STEPS=1 bash scripts/real_realman.sh
+```
+
+该入口固定当前批准的安全边界、夹爪二值策略和 Keep-Alive；`STEPS=1` 表示只做一个
+推理循环，但该循环默认执行窗口 `[2,8)` 的 6 个 waypoint。确认通过后再逐步使用默认
+`STEPS=20`。如需临时回退传输层而不改变其他安全参数：
+
+```bash
+LINGBOT_V2_HTTP_KEEP_ALIVE=0 STEPS=1 bash scripts/real_realman.sh
 ```
 
 `--execute` 后还必须按一次 Space。只有按下 Space 后，client 才会启用轨迹下发并启动 Gloria gripper；夹爪初始化本身可能移动夹爪。首次运行应保持急停可触及，并只执行一个短 chunk。
 
-执行窗口是半开区间：`--exec-start-step 2 --exec-end-step 3` 实际只选择索引 `2`。夹爪对当前窗口的预测宽度做二值判断：最小值 `<12 mm` 时命令 `4 mm`，否则命令 Gloria 配置中的初始宽度 `45 mm`；等于阈值时打开，且不保留 episode 闭合锁存。正常退出时 client 会在关闭 Gloria、解除舵机力矩前再次等待 Space；先固定或取走夹持物，避免掉落。
+执行窗口是半开区间：当前脚本的 `--exec-start-step 2 --exec-end-step 8` 实际选择索引
+`2..7`。夹爪对当前窗口的预测宽度做二值判断：最小值 `<=12 mm` 时命令 `4 mm`，否则
+命令 Gloria 配置中的初始宽度 `45 mm`；只有严格大于阈值时打开，且不保留 episode 闭合锁存。
+正常退出时 client 会在关闭 Gloria、解除舵机力矩前再次等待 Space；先固定或取走夹持物，
+避免掉落。
 
 推理延迟会按 30 Hz 时间语义换算为已过期步数。client 会跳过过期前缀，并在 50 步范围内平移短执行窗口；它不会盲目执行已经过时的第 2 步。
+
+真机 `run` 在 health 检查后会主动丢弃可能空闲过久的连接，再建立第一条 `/predict`
+连接；这避免操作者在 Space 确认期间超过 keep-alive 空闲时间而误用 stale socket。
 
 ## 8. 内置安全检查
 

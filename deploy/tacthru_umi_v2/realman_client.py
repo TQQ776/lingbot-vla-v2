@@ -45,6 +45,21 @@ from .transforms import validate_state8
 
 DEFAULT_IMAGE_SIZE = 224
 CAMERA_FRESHNESS_FRACTION = 0.80
+RETRYABLE_HTTP_STATUSES = frozenset({408, 503})
+
+
+class RetryableInferenceError(RuntimeError):
+    """A prediction attempt failed transiently and may be retried with fresh sensors.
+
+    The HTTP layer must never replay ``POST /predict`` itself: after an
+    ambiguous timeout the server may already have processed the request.  The
+    real-robot loop catches this exception only in non-streaming mode, drops
+    the old observation/action, and captures a new image and robot state.
+    """
+
+    def __init__(self, message: str, *, timing: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.timing = dict(timing or {})
 
 
 @dataclass(frozen=True)
@@ -336,13 +351,23 @@ class LingBotV2HttpClient:
         encode_started = time.perf_counter()
         body = observation_to_json(observation, jpeg_quality=self.jpeg_quality)
         encode_s = time.perf_counter() - encode_started
-        data, transport_timing = self._request_bytes(
-            "POST",
-            "/predict",
-            body=body,
-            headers={**self._headers(), "Content-Type": "application/json"},
-            retry_safe=False,
-        )
+        try:
+            data, transport_timing = self._request_bytes(
+                "POST",
+                "/predict",
+                body=body,
+                headers={**self._headers(), "Content-Type": "application/json"},
+                retry_safe=False,
+            )
+        except RetryableInferenceError as exc:
+            timing = {
+                "encode_s": encode_s,
+                **exc.timing,
+                "total_s": time.perf_counter() - total_started,
+            }
+            exc.timing = timing
+            self.last_request_timing = timing
+            raise
         parse_started = time.perf_counter()
         response = action_response_from_json(
             data,
@@ -417,9 +442,34 @@ class LingBotV2HttpClient:
                 }
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
+            if exc.code in RETRYABLE_HTTP_STATUSES:
+                raise RetryableInferenceError(
+                    f"LingBot V2 server HTTP {exc.code}: {detail}",
+                    timing={
+                        "transport": "legacy_urllib",
+                        "connection_reused": False,
+                        "reconnect_count": 0,
+                        "request_response_s": time.perf_counter() - started,
+                        "response_status": int(exc.code),
+                        "response_connection": exc.headers.get("Connection"),
+                        "server_timing_header": exc.headers.get("Server-Timing"),
+                        "server_timing_s": _parse_server_timing(exc.headers.get("Server-Timing")),
+                        "request_trace_id": exc.headers.get("X-LingBot-Trace-Id"),
+                        "response_received": True,
+                    },
+                ) from exc
             raise RuntimeError(f"LingBot V2 server HTTP {exc.code}: {detail}") from exc
-        except URLError as exc:
-            raise RuntimeError(f"Cannot reach LingBot V2 server at {self.server_url}: {exc}") from exc
+        except (URLError, OSError) as exc:
+            raise RetryableInferenceError(
+                f"Cannot reach LingBot V2 server at {self.server_url}: {exc}",
+                timing={
+                    "transport": "legacy_urllib",
+                    "connection_reused": False,
+                    "reconnect_count": 0,
+                    "request_response_s": time.perf_counter() - started,
+                    "response_received": False,
+                },
+            ) from exc
 
     def _persistent_request_bytes(
         self,
@@ -468,9 +518,6 @@ class LingBotV2HttpClient:
                     attempt["server_will_close"] = will_close
                     if will_close:
                         self._drop_connection()
-                    if response.status >= 400:
-                        detail = data.decode("utf-8", errors="replace")
-                        raise RuntimeError(f"LingBot V2 server HTTP {response.status}: {detail}")
                     timing = {
                         "transport": "http_keep_alive",
                         "connection_reused": reused,
@@ -488,7 +535,16 @@ class LingBotV2HttpClient:
                         "server_timing_header": server_timing_header,
                         "server_timing_s": _parse_server_timing(server_timing_header),
                         "request_trace_id": trace_id,
+                        "response_received": True,
                     }
+                    if response.status >= 400:
+                        detail = data.decode("utf-8", errors="replace")
+                        if response.status in RETRYABLE_HTTP_STATUSES:
+                            raise RetryableInferenceError(
+                                f"LingBot V2 server HTTP {response.status}: {detail}",
+                                timing=timing,
+                            )
+                        raise RuntimeError(f"LingBot V2 server HTTP {response.status}: {detail}")
                     return data, timing
                 except RuntimeError:
                     raise
@@ -497,8 +553,25 @@ class LingBotV2HttpClient:
                     self._drop_connection()
                     if attempt_index + 1 < max_attempts:
                         continue
-                    raise RuntimeError(
-                        f"Cannot reach LingBot V2 server at {self.server_url}: {type(exc).__name__}: {exc}"
+                    raise RetryableInferenceError(
+                        f"Cannot reach LingBot V2 server at {self.server_url}: {type(exc).__name__}: {exc}",
+                        timing={
+                            "transport": "http_keep_alive",
+                            "connection_reused": bool(attempt.get("connection_reused", False)),
+                            "reconnect_count": attempt_index,
+                            "attempts": attempts,
+                            "connect_s": sum(float(item.get("connect_s", 0.0)) for item in attempts),
+                            "request_write_s": sum(
+                                float(item.get("request_write_s", 0.0)) for item in attempts
+                            ),
+                            "response_headers_wait_s": sum(
+                                float(item.get("response_headers_wait_s", 0.0)) for item in attempts
+                            ),
+                            "response_read_s": sum(
+                                float(item.get("response_read_s", 0.0)) for item in attempts
+                            ),
+                            "response_received": False,
+                        },
                     ) from exc
         raise RuntimeError("LingBot V2 persistent HTTP request failed without an exception")
 
@@ -534,6 +607,22 @@ class LingBotV2HttpClient:
                 connection.close()
             except OSError:
                 pass
+
+    def reset_connection(self) -> None:
+        """Discard the current HTTP connection without closing the client.
+
+        ``health`` is intentionally sent before opening hardware and waiting
+        for the operator's execution confirmation.  A keep-alive server may
+        close that idle socket while the operator is deciding; explicitly
+        dropping it here makes the first ``/predict`` establish a fresh
+        connection instead of mistaking a stale socket for a reusable one.
+        This method never retries or replays a prediction request.
+        """
+
+        with self._connection_lock:
+            if self._closed:
+                return
+            self._drop_connection()
 
     def close(self) -> None:
         with self._connection_lock:
@@ -616,6 +705,15 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--steps", type=int, default=1)
     run.add_argument("--rate-hz", type=float, default=1.0)
     run.add_argument("--max-roundtrip-s", type=float, default=30.0)
+    run.add_argument(
+        "--max-consecutive-roundtrip-rejects",
+        type=int,
+        default=0,
+        help=(
+            "In non-streaming mode, discard stale/transiently failed predictions and recapture fresh "
+            "sensors until this many consecutive rejects occur. 0 preserves fail-fast behavior."
+        ),
+    )
     run.add_argument("--execute", action="store_true", help="Enable real actuator commands after a mandatory Space confirmation")
     run.add_argument("--stream-replan", action="store_true", help="Do not wait for the dispatched short chunk to finish")
     run.add_argument("--preview", action="store_true", help="Show the exact 224x224 RGB frame sent to the server")
@@ -635,12 +733,23 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--gripper-command-torque", type=int, default=None)
     run.add_argument("--gripper-command-speed", type=int, default=None)
     run.add_argument(
+        "--gripper-startup-width-m",
+        type=float,
+        default=None,
+        help=(
+            "Move Gloria directly to this width during initialization, require fresh hardware "
+            "feedback within tolerance, then ask for a second Space confirmation before inference."
+        ),
+    )
+    run.add_argument("--gripper-startup-tolerance-m", type=float, default=0.005)
+    run.add_argument("--gripper-startup-timeout-s", type=float, default=3.0)
+    run.add_argument(
         "--gripper-action-select",
         choices=["last", "first", "min", "median", "threshold"],
         default=None,
         help=(
             "Select the commanded width from the executable action window. "
-            "threshold uses a non-latching binary policy: min prediction below "
+            "threshold uses a non-latching binary policy: min prediction at or below "
             "--gripper-hold-closed-below-m closes to --gripper-hold-closed-target-m; "
             "otherwise it opens to gripper initial_width_mm."
         ),
@@ -649,13 +758,31 @@ def build_parser() -> argparse.ArgumentParser:
         "--gripper-hold-closed-below-m",
         type=float,
         default=None,
-        help="Threshold in metres for threshold mode; also the latch threshold for non-threshold modes.",
+        help="Inclusive threshold in metres for threshold mode; also the latch threshold for non-threshold modes.",
     )
     run.add_argument(
         "--gripper-hold-closed-target-m",
         type=float,
         default=None,
         help="Closed target width in metres.",
+    )
+    run.add_argument(
+        "--gripper-open-lookahead-start-step",
+        type=int,
+        default=None,
+        help=(
+            "Enable threshold-mode release lookahead at this full action-chunk index. Motion still uses "
+            "--exec-start-step/--exec-end-step; omit this and the consecutive count to preserve old behavior."
+        ),
+    )
+    run.add_argument(
+        "--gripper-open-lookahead-consecutive-steps",
+        type=int,
+        default=None,
+        help=(
+            "Open when any run of this many predictions at/after the lookahead start are all above the "
+            "gripper threshold."
+        ),
     )
     run.add_argument("--exec-start-step", type=int, default=2)
     run.add_argument("--exec-end-step", type=int, default=8)
@@ -799,7 +926,10 @@ def run_realman(
 ) -> None:
     if args.steps <= 0:
         raise ValueError("--steps must be positive")
+    if args.max_consecutive_roundtrip_rejects < 0:
+        raise ValueError("--max-consecutive-roundtrip-rejects must be non-negative")
     for name in (
+        "timeout",
         "control_frequency",
         "rate_hz",
         "max_roundtrip_s",
@@ -808,6 +938,8 @@ def run_realman(
         "verify_rotation_tolerance_rad",
         "verify_gripper_tolerance_m",
         "verification_timeout_s",
+        "gripper_startup_tolerance_m",
+        "gripper_startup_timeout_s",
     ):
         _require_positive_cli(getattr(args, name), f"--{name.replace('_', '-')}")
     if args.execute and (args.workspace_min_xyz is None or args.workspace_max_xyz is None):
@@ -815,6 +947,39 @@ def run_realman(
             "Real execution requires explicit --workspace-min-xyz X Y Z and "
             "--workspace-max-xyz X Y Z bounds in the Realman base frame"
         )
+    if args.disable_gripper and args.gripper_startup_width_m is not None:
+        raise RuntimeError("--gripper-startup-width-m cannot be used with --disable-gripper")
+    lookahead_start = args.gripper_open_lookahead_start_step
+    lookahead_count = args.gripper_open_lookahead_consecutive_steps
+    if (lookahead_start is None) != (lookahead_count is None):
+        raise ValueError(
+            "--gripper-open-lookahead-start-step and "
+            "--gripper-open-lookahead-consecutive-steps must be supplied together"
+        )
+    if lookahead_start is not None and (lookahead_start < 0 or lookahead_count <= 0):
+        raise ValueError("Gripper lookahead start must be non-negative and consecutive steps must be positive")
+    if lookahead_start is not None and lookahead_start + lookahead_count > chunk_size:
+        raise ValueError(
+            "Gripper lookahead window exceeds the server action chunk: "
+            f"start={lookahead_start}, consecutive={lookahead_count}, chunk_size={chunk_size}"
+        )
+    if lookahead_start is not None and args.gripper_action_select != "threshold":
+        raise ValueError("Gripper open lookahead requires --gripper-action-select threshold")
+    if args.max_consecutive_roundtrip_rejects > 0 and args.stream_replan:
+        raise RuntimeError(
+            "Recoverable inference rejection cannot be combined with --stream-replan because a prior "
+            "trajectory may still be active"
+        )
+    if args.max_consecutive_roundtrip_rejects > 0 and health.get("requests_are_stateless") is not True:
+        raise RuntimeError(
+            "Recoverable inference rejection requires server health requests_are_stateless=true"
+        )
+    # ``main`` performs a health check before opening the camera and waiting
+    # for the Space safety gate.  Do not carry that potentially idle
+    # keep-alive socket into the first prediction: the server may have closed
+    # it during operator setup, and /predict must never be replayed after an
+    # ambiguous disconnect.
+    client.reset_connection()
     parsed_server_url = urlparse(args.server_url)
     if args.execute and parsed_server_url.scheme != "https" and parsed_server_url.hostname not in {
         "127.0.0.1",
@@ -846,9 +1011,14 @@ def run_realman(
             gripper_max_width_m=args.gripper_max_width_m,
             gripper_command_torque=args.gripper_command_torque,
             gripper_command_speed=args.gripper_command_speed,
+            gripper_startup_width_m=args.gripper_startup_width_m,
+            gripper_startup_tolerance_m=args.gripper_startup_tolerance_m,
+            gripper_startup_timeout_s=args.gripper_startup_timeout_s,
             gripper_action_select=args.gripper_action_select,
             gripper_hold_closed_below_m=args.gripper_hold_closed_below_m,
             gripper_hold_closed_target_m=args.gripper_hold_closed_target_m,
+            gripper_open_lookahead_start_step=args.gripper_open_lookahead_start_step,
+            gripper_open_lookahead_consecutive_steps=args.gripper_open_lookahead_consecutive_steps,
             exec_start_step=args.exec_start_step,
             exec_end_step=args.exec_end_step,
             preserve_exec_window_length=not args.no_preserve_exec_window_length,
@@ -883,13 +1053,39 @@ def run_realman(
     try:
         runtime.start()
         if args.execute:
+            if args.gripper_open_lookahead_start_step is not None:
+                print(
+                    "\n[SAFETY] Gripper release lookahead is enabled: a consecutive above-threshold "
+                    "run in the full future action chunk may open Gloria even though the arm still "
+                    "executes only the configured short window. Review a dry-run before relying on it.\n",
+                    flush=True,
+                )
             print(
                 "\n[SAFETY] --execute was supplied. Space confirmation will enable the arm trajectory "
                 "and may initialize/move the gripper. Keep an emergency stop within reach.\n",
                 flush=True,
             )
             _wait_for_space(camera if args.preview else None, execute=True)
-            runtime.enable_actuation()
+            startup_verification = runtime.enable_actuation()
+            if startup_verification is not None:
+                _append_log(
+                    log_path,
+                    {
+                        "event": "gripper_startup_verified",
+                        "timestamp": time.time(),
+                        **startup_verification,
+                    },
+                )
+                print(
+                    "[SAFETY] Gloria reached the startup width. Confirm the held object is secure; "
+                    "no inference request has been sent yet.",
+                    flush=True,
+                )
+                _wait_for_space(
+                    camera if args.preview else None,
+                    execute=True,
+                    label="CONFIRM OBJECT IS SECURE AND START INFERENCE",
+                )
         else:
             if args.wait_for_space:
                 _wait_for_space(camera if args.preview else None, execute=False)
@@ -897,7 +1093,11 @@ def run_realman(
 
         period = 1.0 / args.rate_hz if args.rate_hz > 0 else 0.0
         active_trajectory_until_s = 0.0
-        for step_index in range(args.steps):
+        step_index = 0
+        request_attempt = 0
+        consecutive_inference_rejects = 0
+        while step_index < args.steps:
+            request_attempt += 1
             loop_start = time.time()
             camera_frame = camera.capture()
             snapshot = runtime.read_policy_state()
@@ -916,8 +1116,15 @@ def run_realman(
                 session_id=session_id,
                 timestamp=observation_timestamp,
                 metadata={
-                    "episode_reset": step_index == 0,
+                    # Only the first request asks for an explicit reset. If an
+                    # ambiguous first request never reached the server, the
+                    # retry still resets because this new session_id differs
+                    # from the server's active session. Repeating
+                    # episode_reset after a response was lost could otherwise
+                    # reset a stateful policy twice.
+                    "episode_reset": request_attempt == 1,
                     "client_step": step_index,
+                    "client_request_attempt": request_attempt,
                     "pose_frame": POSE_FRAME,
                     "dry_run": not args.execute,
                     "camera_capture_timestamp": camera_frame.capture_timestamp,
@@ -929,21 +1136,82 @@ def run_realman(
             if args.preview:
                 _show_preview(camera_frame.rgb, f"step={step_index} sending")
             request_started = time.perf_counter()
-            response, latency = client.predict_timed(observation, expected_steps=chunk_size)
+            try:
+                response, latency = client.predict_timed(observation, expected_steps=chunk_size)
+            except RetryableInferenceError as exc:
+                roundtrip_s = time.perf_counter() - request_started
+                consecutive_inference_rejects += 1
+                will_retry = bool(
+                    args.max_consecutive_roundtrip_rejects > 0
+                    and consecutive_inference_rejects < args.max_consecutive_roundtrip_rejects
+                )
+                latency = dict(exc.timing)
+                latency["outer_roundtrip_s"] = roundtrip_s
+                client.reset_connection()
+                _append_log(
+                    log_path,
+                    {
+                        "event": "inference_transport_rejected",
+                        "timestamp": time.time(),
+                        "step": step_index,
+                        "request_attempt": request_attempt,
+                        "request_id": observation.request_id,
+                        "session_id": session_id,
+                        "execute": bool(args.execute),
+                        "roundtrip_s": roundtrip_s,
+                        "max_roundtrip_s": args.max_roundtrip_s,
+                        "response_received": bool(latency.get("response_received", False)),
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "latency": latency,
+                        "consecutive_inference_rejects": consecutive_inference_rejects,
+                        "max_consecutive_roundtrip_rejects": args.max_consecutive_roundtrip_rejects,
+                        "will_retry_with_fresh_observation": will_retry,
+                        "image": {
+                            **_image_debug(camera_frame.rgb),
+                            "capture_timestamp": camera_frame.capture_timestamp,
+                            "receive_timestamp": camera_frame.receive_timestamp,
+                            "sensor_skew_s": sensor_skew_s,
+                        },
+                        "state": snapshot.state.astype(float).tolist(),
+                        "state_debug": snapshot.debug,
+                    },
+                )
+                if will_retry:
+                    print(
+                        "[lingbot-v2-client] discarded transiently failed inference "
+                        f"for step={step_index} ({consecutive_inference_rejects}/"
+                        f"{args.max_consecutive_roundtrip_rejects}); no action was sent, "
+                        "holding position/gripper and recapturing fresh sensors",
+                        flush=True,
+                    )
+                    continue
+                raise SafetyViolation(
+                    "Inference transport failed after "
+                    f"{consecutive_inference_rejects} consecutive reject(s): {exc}"
+                ) from exc
             roundtrip_s = time.perf_counter() - request_started
             latency = dict(latency)
             latency["outer_roundtrip_s"] = roundtrip_s
             if roundtrip_s > args.max_roundtrip_s:
+                consecutive_inference_rejects += 1
+                will_retry = bool(
+                    args.max_consecutive_roundtrip_rejects > 0
+                    and consecutive_inference_rejects < args.max_consecutive_roundtrip_rejects
+                )
                 server_inference_s = response.metadata.get("inference_time_s")
                 non_inference_s = None
                 if isinstance(server_inference_s, (int, float)) and np.isfinite(server_inference_s):
                     non_inference_s = roundtrip_s - float(server_inference_s)
+                rejected_gripper_width_m = response.action_chunk[:, 7].astype(float)
+                client.reset_connection()
                 _append_log(
                     log_path,
                     {
                         "event": "roundtrip_rejected",
                         "timestamp": time.time(),
                         "step": step_index,
+                        "request_attempt": request_attempt,
                         "request_id": observation.request_id,
                         "session_id": session_id,
                         "execute": bool(args.execute),
@@ -954,6 +1222,12 @@ def run_realman(
                         "response_metadata": response.metadata,
                         "latency": latency,
                         "action_shape": list(response.action_chunk.shape),
+                        "rejected_action_gripper_width_m": rejected_gripper_width_m.tolist(),
+                        "rejected_action_gripper_min_m": float(rejected_gripper_width_m.min()),
+                        "rejected_action_gripper_max_m": float(rejected_gripper_width_m.max()),
+                        "consecutive_inference_rejects": consecutive_inference_rejects,
+                        "max_consecutive_roundtrip_rejects": args.max_consecutive_roundtrip_rejects,
+                        "will_retry_with_fresh_observation": will_retry,
                         "image": {
                             **_image_debug(camera_frame.rgb),
                             "capture_timestamp": camera_frame.capture_timestamp,
@@ -970,9 +1244,19 @@ def run_realman(
                         f" (server_inference={float(server_inference_s):.3f}s, "
                         f"non_inference={float(non_inference_s):.3f}s)"
                     )
+                if will_retry:
+                    print(
+                        f"[lingbot-v2-client] discarded stale inference for step={step_index}: "
+                        f"roundtrip={roundtrip_s:.3f}s > {args.max_roundtrip_s:.3f}s "
+                        f"({consecutive_inference_rejects}/{args.max_consecutive_roundtrip_rejects}); "
+                        "no action was sent, holding position/gripper and recapturing fresh sensors",
+                        flush=True,
+                    )
+                    continue
                 raise SafetyViolation(
                     f"Inference roundtrip {roundtrip_s:.3f}s exceeds "
-                    f"--max-roundtrip-s {args.max_roundtrip_s:.3f}s{detail}"
+                    f"--max-roundtrip-s {args.max_roundtrip_s:.3f}s{detail}; "
+                    f"consecutive rejects={consecutive_inference_rejects}"
                 )
             compensate_inference_latency = bool(
                 args.execute
@@ -1018,6 +1302,7 @@ def run_realman(
                 "event": "step",
                 "timestamp": time.time(),
                 "step": step_index,
+                "request_attempt": request_attempt,
                 "request_id": observation.request_id,
                 "session_id": session_id,
                 "execute": bool(args.execute),
@@ -1036,6 +1321,7 @@ def run_realman(
                 "plan": plan.debug,
                 "execution": execution,
                 "verification": verification,
+                "recovered_after_consecutive_inference_rejects": consecutive_inference_rejects,
             }
             _append_log(log_path, record)
             print(
@@ -1045,6 +1331,8 @@ def run_realman(
             )
             if args.preview:
                 _show_preview(camera_frame.rgb, f"step={step_index} done")
+            consecutive_inference_rejects = 0
+            step_index += 1
     except KeyboardInterrupt as exc:
         error = repr(exc)
         if runtime.actuation_enabled:

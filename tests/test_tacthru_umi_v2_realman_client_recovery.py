@@ -10,15 +10,10 @@ from deploy.tacthru_umi_v2.protocol import ActionResponse
 from deploy.tacthru_umi_v2.realman_client import (
     CameraFrame,
     RetryableInferenceError,
-    TactileHistory,
     build_parser,
     run_realman,
 )
-from deploy.tacthru_umi_v2.realman_runtime import (
-    HistoricalAlignmentNotReady,
-    PolicyStateSnapshot,
-    SafetyViolation,
-)
+from deploy.tacthru_umi_v2.realman_runtime import PolicyStateSnapshot, SafetyViolation
 
 
 def _actions(gripper_width_m: float) -> np.ndarray:
@@ -31,12 +26,7 @@ def _actions(gripper_width_m: float) -> np.ndarray:
 class FakeCamera:
     def __init__(self) -> None:
         self.capture_calls = 0
-        self.aligned_capture_calls = []
-        self.start_calls = 0
         self.closed = False
-
-    def start(self) -> None:
-        self.start_calls += 1
 
     def capture(self) -> CameraFrame:
         self.capture_calls += 1
@@ -45,14 +35,6 @@ class FakeCamera:
             rgb=np.zeros((224, 224, 3), dtype=np.uint8),
             capture_timestamp=now,
             receive_timestamp=now,
-        )
-
-    def capture_at_or_before(self, target_timestamp, *, max_skew_s):
-        self.aligned_capture_calls.append((float(target_timestamp), float(max_skew_s)))
-        return CameraFrame(
-            rgb=np.zeros((224, 224, 3), dtype=np.uint8),
-            capture_timestamp=float(target_timestamp) - 0.01,
-            receive_timestamp=time.time(),
         )
 
     def close(self) -> None:
@@ -64,7 +46,6 @@ class FakeRuntime:
         self.actuation_enabled = False
         self.gripper = None
         self.read_calls = 0
-        self.aligned_read_calls = []
         self.plan_calls = []
         self.execute_calls = 0
         self.verify_calls = 0
@@ -88,16 +69,6 @@ class FakeRuntime:
             base_pose=np.eye(4, dtype=np.float64),
             timestamp=time.time(),
             debug={"read_call": self.read_calls},
-        )
-
-    def read_policy_state_at(self, target_timestamp, *, max_skew_s) -> PolicyStateSnapshot:
-        self.aligned_read_calls.append((float(target_timestamp), float(max_skew_s)))
-        timestamp = float(target_timestamp) - 0.02
-        return PolicyStateSnapshot(
-            state=np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.004], dtype=np.float32),
-            base_pose=np.eye(4, dtype=np.float64),
-            timestamp=timestamp,
-            debug={"historical_alignment": True},
         )
 
     def plan_action_chunk(self, action_chunk, **_kwargs):
@@ -157,36 +128,6 @@ class FakeClient:
             ),
             {"transport": "fake", "response_received": True},
         )
-
-
-class FakeTactileSource:
-    def __init__(self, timestamp: float) -> None:
-        self.timestamp = float(timestamp)
-        self.capture_calls = 0
-        self.closed = False
-
-    def capture(self) -> TactileHistory:
-        self.capture_calls += 1
-        timestamps = np.asarray(
-            [self.timestamp - 3.0 / 30.0, self.timestamp - 2.0 / 30.0, self.timestamp - 1.0 / 30.0, self.timestamp],
-            dtype=np.float64,
-        )
-        return TactileHistory(
-            rgb=None,
-            rgb_timestamps=None,
-            rgb_history_mask=None,
-            marker_flow=np.zeros((4, 48, 2), dtype=np.float32),
-            marker_valid_mask=np.ones((4, 48), dtype=np.bool_),
-            marker_timestamps=timestamps,
-            marker_history_mask=np.ones(4, dtype=np.bool_),
-            debug={
-                "estimated_latest_receive_timestamp": self.timestamp + 0.115,
-                "latest_detected_marker_count": 48,
-            },
-        )
-
-    def close(self) -> None:
-        self.closed = True
 
 
 def _args(tmp_path, *, steps=1, execute=False, max_rejects=3, stream_replan=False):
@@ -270,103 +211,6 @@ def test_stale_response_is_discarded_and_successful_steps_use_fresh_observations
     assert rejected[0]["will_retry_with_fresh_observation"] is True
     assert rejected[0]["rejected_action_gripper_min_m"] == pytest.approx(0.049)
     assert [event["step"] for event in completed] == [0, 1]
-
-
-def test_tactile_run_uses_historical_wrist_and_robot_alignment(tmp_path, monkeypatch) -> None:
-    target_timestamp = time.time() - 0.13
-    tactile_source = FakeTactileSource(target_timestamp)
-    camera = FakeCamera()
-    runtime = FakeRuntime()
-    client = FakeClient(["success"])
-    _install_hardware_fakes(monkeypatch, camera, runtime)
-    monkeypatch.setattr(
-        client_module,
-        "_open_tactile_source",
-        lambda **_kwargs: tactile_source,
-    )
-    args = _args(tmp_path, steps=1)
-    args.tactile_mode = "marker"
-    args.local_tactile_guard = True
-    args._tactile_requested = {"tactile_rgb": False, "tactile_marker": True}
-    args._tactile_horizon = 4
-    args._tactile_stride = 1
-    args._protocol_version = 2
-    args._tactile_contract_sha256 = "c" * 64
-
-    run_realman(
-        args,
-        client,
-        {
-            "requests_are_stateless": True,
-            "tactile_max_timestamp_skew_s": 0.05,
-        },
-        chunk_size=50,
-    )
-
-    assert camera.start_calls == 1
-    assert camera.capture_calls == 0
-    assert camera.aligned_capture_calls == pytest.approx([(target_timestamp, 0.05)])
-    assert runtime.read_calls == 0
-    assert runtime.aligned_read_calls == pytest.approx([(target_timestamp, 0.05)])
-    assert tactile_source.capture_calls == 1
-    observation = client.observations[0]
-    assert observation.wrist_timestamp == pytest.approx(target_timestamp - 0.01)
-    assert observation.marker_timestamps[-1] == pytest.approx(target_timestamp)
-    assert observation.metadata["tactile_alignment_enabled"] is True
-    assert observation.metadata["tactile_alignment_target_timestamp"] == pytest.approx(target_timestamp)
-    assert observation.metadata["tactile_alignment_retry_count"] == 0
-
-
-def test_tactile_run_warms_startup_history_before_first_request(tmp_path, monkeypatch) -> None:
-    target_timestamp = time.time() - 0.13
-    tactile_source = FakeTactileSource(target_timestamp)
-    camera = FakeCamera()
-
-    class StartupLagRuntime(FakeRuntime):
-        def read_policy_state_at(self, target_timestamp, *, max_skew_s):
-            if not self.aligned_read_calls:
-                self.aligned_read_calls.append((float(target_timestamp), float(max_skew_s)))
-                raise HistoricalAlignmentNotReady("Realman history starts after tactile target")
-            return super().read_policy_state_at(
-                target_timestamp,
-                max_skew_s=max_skew_s,
-            )
-
-    runtime = StartupLagRuntime()
-    client = FakeClient(["success"])
-    _install_hardware_fakes(monkeypatch, camera, runtime)
-    monkeypatch.setattr(
-        client_module,
-        "_open_tactile_source",
-        lambda **_kwargs: tactile_source,
-    )
-    args = _args(tmp_path, steps=1)
-    args.tactile_mode = "marker"
-    args.local_tactile_guard = True
-    args._tactile_requested = {"tactile_rgb": False, "tactile_marker": True}
-    args._tactile_horizon = 4
-    args._tactile_stride = 1
-    args._protocol_version = 2
-    args._tactile_contract_sha256 = "c" * 64
-
-    run_realman(
-        args,
-        client,
-        {
-            "requests_are_stateless": True,
-            "tactile_max_timestamp_skew_s": 0.05,
-        },
-        chunk_size=50,
-    )
-
-    assert tactile_source.capture_calls == 2
-    assert len(camera.aligned_capture_calls) == 2
-    assert len(runtime.aligned_read_calls) == 2
-    assert len(client.observations) == 1
-    observation = client.observations[0]
-    assert observation.metadata["tactile_alignment_retry_count"] == 1
-    assert observation.metadata["tactile_alignment_wait_s"] >= 0.0
-    assert observation.metadata["tactile"]["historical_alignment"] is True
 
 
 def test_success_resets_consecutive_rejection_budget(tmp_path, monkeypatch) -> None:
