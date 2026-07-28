@@ -18,164 +18,6 @@ from typing import Any, Dict, Literal, Optional
 
 from transformers import AutoConfig, PretrainedConfig
 
-
-DEFAULT_TACTILE_PARAMS: Dict[str, Any] = {
-    "schema_version": 1,
-    "adapter_version": 1,
-    "history_steps": 4,
-    "history_stride": 1,
-    "history_frequency_hz": 30.0,
-    "max_timestamp_skew_s": 0.05,
-    # Use the repository's self-contained DINOv2 ViT-S/14 implementation.  Its
-    # pretrained weights must be supplied as a local file; no network fallback
-    # is permitted during training or deployment.
-    "rgb_backbone": "dinov2_vits14",
-    "rgb_backbone_path": None,
-    "freeze_rgb_backbone": True,
-    "rgb_input_size": 224,
-    # Official DINOv2 ViT-S/14 weights were pretrained at 518px.  The
-    # backbone interpolates those positional embeddings for 224px tactile
-    # frames at runtime, so construction and input sizes must stay separate.
-    "rgb_backbone_pretrain_size": 518,
-    "rgb_patch_size": 14,
-    "rgb_encoder_dim": 384,
-    "rgb_encoder_layers": 4,
-    "rgb_encoder_heads": 6,
-    "rgb_tokens": 8,
-    "rgb_mean": [0.485, 0.456, 0.406],
-    "rgb_std": [0.229, 0.224, 0.225],
-    "marker_count": 48,
-    "marker_dim": 2,
-    "marker_encoder_dim": 256,
-    "marker_encoder_layers": 2,
-    "marker_encoder_heads": 8,
-    "marker_tokens": 8,
-    "marker_reference_mode": "index",
-    "marker_include_velocity": True,
-    "marker_normalization": "image_size_xy",
-    "marker_normalization_size_xy": [640, 480],
-    "fusion_type": "gated_prefix",
-    "gate_init": -4.0,
-    "teacher_attention_to_tactile": False,
-    "missing_policy": "mask",
-    "rgb_dropout_prob": 0.10,
-    "marker_dropout_prob": 0.10,
-    "all_tactile_dropout_prob": 0.05,
-    "auxiliary_contact_loss_weight": 0.0,
-    "auxiliary_slip_loss_weight": 0.0,
-    "auxiliary_phase_loss_weight": 0.0,
-}
-
-
-def _normalize_tactile_params(params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    normalized = deepcopy(DEFAULT_TACTILE_PARAMS)
-    if params:
-        normalized.update(deepcopy(params))
-
-    positive_int_keys = (
-        "history_steps",
-        "history_stride",
-        "rgb_input_size",
-        "rgb_backbone_pretrain_size",
-        "rgb_patch_size",
-        "rgb_encoder_dim",
-        "rgb_encoder_layers",
-        "rgb_encoder_heads",
-        "rgb_tokens",
-        "marker_count",
-        "marker_dim",
-        "marker_encoder_dim",
-        "marker_encoder_layers",
-        "marker_encoder_heads",
-        "marker_tokens",
-    )
-    for key in positive_int_keys:
-        value = normalized[key]
-        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-            raise ValueError(f"tactile_params.{key} must be a positive integer, got {value!r}.")
-
-    if normalized["rgb_input_size"] % normalized["rgb_patch_size"] != 0:
-        raise ValueError(
-            "tactile_params.rgb_input_size must be divisible by rgb_patch_size "
-            f"(got {normalized['rgb_input_size']} and {normalized['rgb_patch_size']})."
-        )
-    if normalized["rgb_backbone_pretrain_size"] % normalized["rgb_patch_size"] != 0:
-        raise ValueError(
-            "tactile_params.rgb_backbone_pretrain_size must be divisible by "
-            "rgb_patch_size "
-            f"(got {normalized['rgb_backbone_pretrain_size']} and "
-            f"{normalized['rgb_patch_size']})."
-        )
-    if normalized["rgb_encoder_dim"] % normalized["rgb_encoder_heads"] != 0:
-        raise ValueError("tactile RGB encoder_dim must be divisible by encoder_heads.")
-    if normalized["marker_encoder_dim"] % normalized["marker_encoder_heads"] != 0:
-        raise ValueError("tactile marker encoder_dim must be divisible by encoder_heads.")
-
-    if normalized["fusion_type"] != "gated_prefix":
-        raise ValueError(
-            "Only tactile_params.fusion_type='gated_prefix' is supported in V2, "
-            f"got {normalized['fusion_type']!r}."
-        )
-    if normalized["missing_policy"] not in ("mask", "error"):
-        raise ValueError("tactile_params.missing_policy must be 'mask' or 'error'.")
-    if normalized["marker_normalization"] != "image_size_xy":
-        raise ValueError(
-            "Only marker_normalization='image_size_xy' is accepted; this prevents "
-            "the historical /400 train/inference scale mismatch."
-        )
-    marker_size = normalized["marker_normalization_size_xy"]
-    if (
-        not isinstance(marker_size, (list, tuple))
-        or len(marker_size) != 2
-        or any(
-            not isinstance(value, int) or isinstance(value, bool) or value <= 0
-            for value in marker_size
-        )
-    ):
-        raise ValueError(
-            "tactile_params.marker_normalization_size_xy must be [width, height] "
-            "with two positive values."
-        )
-    normalized["marker_normalization_size_xy"] = [
-        int(marker_size[0]),
-        int(marker_size[1]),
-    ]
-    if normalized["marker_reference_mode"] not in ("index", "auto"):
-        raise ValueError("tactile_params.marker_reference_mode must be 'index' or 'auto'.")
-
-    for key in ("rgb_dropout_prob", "marker_dropout_prob", "all_tactile_dropout_prob"):
-        value = float(normalized[key])
-        if not 0.0 <= value < 1.0:
-            raise ValueError(f"tactile_params.{key} must be in [0, 1), got {value}.")
-        normalized[key] = value
-
-    for key in ("rgb_mean", "rgb_std"):
-        value = normalized[key]
-        if not isinstance(value, (list, tuple)) or len(value) != 3:
-            raise ValueError(f"tactile_params.{key} must contain three RGB values.")
-        normalized[key] = [float(item) for item in value]
-    if any(value <= 0 for value in normalized["rgb_std"]):
-        raise ValueError("tactile_params.rgb_std values must be positive.")
-    history_frequency_hz = normalized["history_frequency_hz"]
-    if (
-        not isinstance(history_frequency_hz, (int, float))
-        or isinstance(history_frequency_hz, bool)
-        or history_frequency_hz <= 0
-    ):
-        raise ValueError("tactile_params.history_frequency_hz must be positive.")
-    normalized["history_frequency_hz"] = float(history_frequency_hz)
-
-    for key in (
-        "auxiliary_contact_loss_weight",
-        "auxiliary_slip_loss_weight",
-        "auxiliary_phase_loss_weight",
-    ):
-        if float(normalized[key]) != 0.0:
-            raise ValueError(
-                f"tactile_params.{key} is not implemented without reliable labels; keep it at 0.0."
-            )
-    return normalized
-
 class LingbotVLAConfig(PretrainedConfig):
     """Configuration class for Lingbot-VLA.
     This is the configuration class to store the configuration of a [`Lingbot-VLA`].
@@ -250,15 +92,6 @@ class LingbotVLAConfig(PretrainedConfig):
 
         train_expert_only: bool = False,
         train_state_proj: bool = True,
-
-        # Dormant by default.  When both switches are false no tactile module is
-        # instantiated, preserving the pre-tactile module graph and state_dict.
-        tactile_rgb_enabled: bool = False,
-        tactile_marker_enabled: bool = False,
-        tactile_train_stage: Literal["adapters", "expert", "full"] = "full",
-        tactile_params: Optional[Dict[str, Any]] = None,
-        force_mask_tactile_rgb: bool = False,
-        force_mask_tactile_marker: bool = False,
 
         **kwargs
     ):
@@ -344,27 +177,6 @@ class LingbotVLAConfig(PretrainedConfig):
         else:
             self.vocab_size = vocab_size
         self.vit_attn_implementation = vit_attn_implementation
-        self.tactile_rgb_enabled = bool(tactile_rgb_enabled)
-        self.tactile_marker_enabled = bool(tactile_marker_enabled)
-        if tactile_train_stage not in ("adapters", "expert", "full"):
-            raise ValueError(
-                "tactile_train_stage must be 'adapters', 'expert', or 'full', "
-                f"got {tactile_train_stage!r}."
-            )
-        self.tactile_train_stage = tactile_train_stage
-        if tactile_train_stage != "full" and not (
-            self.tactile_rgb_enabled or self.tactile_marker_enabled
-        ):
-            raise ValueError(
-                "tactile_train_stage adapters/expert requires at least one tactile branch."
-            )
-        self.tactile_params = _normalize_tactile_params(tactile_params)
-        self.force_mask_tactile_rgb = bool(force_mask_tactile_rgb)
-        self.force_mask_tactile_marker = bool(force_mask_tactile_marker)
-        if self.force_mask_tactile_rgb and not self.tactile_rgb_enabled:
-            raise ValueError("force_mask_tactile_rgb requires tactile_rgb_enabled=True.")
-        if self.force_mask_tactile_marker and not self.tactile_marker_enabled:
-            raise ValueError("force_mask_tactile_marker requires tactile_marker_enabled=True.")
 
 class LingbotVLAV2Config(LingbotVLAConfig):
     def __init__(self, **kwargs):
@@ -384,8 +196,4 @@ class LingbotVLAV2Config(LingbotVLAConfig):
 
 
 ConfigClass = [LingbotVLAConfig, LingbotVLAV2Config]
-__all__ = [
-    "DEFAULT_TACTILE_PARAMS",
-    "LingbotVLAConfig",
-    "LingbotVLAV2Config",
-]
+__all__ = ["LingbotVLAConfig", "LingbotVLAV2Config"]

@@ -12,14 +12,7 @@ import torch.nn.functional as F
 
 from ...utils import logging as logging_utils
 from .transform import Normalizer, prepare_images, prepare_state, prepare_language, prepare_action, expert_visual_transform
-from .transform import prepare_tactile_marker_history, prepare_tactile_rgb_history
 from .ee_pose_transform import *
-from ...tactile.schema import (
-    TACTILE_MARKER_FLOW_KEY,
-    TACTILE_MARKER_VALID_KEY,
-    TACTILE_RGB_KEY,
-    TACTILE_TIMESTAMP_KEY,
-)
 from typing import Dict, List, Optional
 import ast
 import torch.nn.functional as F
@@ -53,24 +46,10 @@ class FeatureInfo(BaseModel):
     joints: List[str] | None = None
     images: List[str] | None = None
     joints_max_dim: dict | None = None
-    tactile_rgb_key: str = TACTILE_RGB_KEY
-    tactile_marker_key: str = TACTILE_MARKER_FLOW_KEY
-    tactile_marker_valid_key: str = TACTILE_MARKER_VALID_KEY
-    tactile_timestamp_key: str = TACTILE_TIMESTAMP_KEY
 
     def update_info(self, data_config):
         joints_info = data_config.joints
         self.images = ['observation.images.'+image for image in data_config.cameras]
-        self.tactile_rgb_key = getattr(data_config, "tactile_rgb_key", TACTILE_RGB_KEY)
-        self.tactile_marker_key = getattr(
-            data_config, "tactile_marker_key", TACTILE_MARKER_FLOW_KEY
-        )
-        self.tactile_marker_valid_key = getattr(
-            data_config, "tactile_marker_valid_key", TACTILE_MARKER_VALID_KEY
-        )
-        self.tactile_timestamp_key = getattr(
-            data_config, "tactile_timestamp_key", TACTILE_TIMESTAMP_KEY
-        )
 
         joints= []
         joints_max_dim = {}
@@ -99,14 +78,7 @@ class FeatureTransform:
         norm_stats_path=None,
         use_depth_align=False,
         image_augment=False,
-        use_future_image=False,
-        tactile_rgb_enabled=False,
-        tactile_marker_enabled=False,
-        tactile_params=None,
-        tactile_rgb_key=TACTILE_RGB_KEY,
-        tactile_marker_key=TACTILE_MARKER_FLOW_KEY,
-        tactile_marker_valid_key=TACTILE_MARKER_VALID_KEY,
-        tactile_timestamp_key=TACTILE_TIMESTAMP_KEY,):
+        use_future_image=False,):
 
         assert os.path.exists(robot_config_path), f"{robot_config_path} does not exist."
         with open(robot_config_path, 'r') as f:
@@ -136,13 +108,6 @@ class FeatureTransform:
         self.disabled_image_features = disabled_image_features
         self.use_depth_align = use_depth_align
         self.use_future_image = use_future_image
-        self.tactile_rgb_enabled = bool(tactile_rgb_enabled)
-        self.tactile_marker_enabled = bool(tactile_marker_enabled)
-        self.tactile_params = dict(tactile_params or {})
-        self.tactile_rgb_key = tactile_rgb_key
-        self.tactile_marker_key = tactile_marker_key
-        self.tactile_marker_valid_key = tactile_marker_valid_key
-        self.tactile_timestamp_key = tactile_timestamp_key
 
         if not disabled_image_features:
             self.image_augment = image_augment
@@ -159,23 +124,6 @@ class FeatureTransform:
             # between the current image and the final action-horizon image.
             'future_video_effective_fps',
         }
-        if self.tactile_rgb_enabled:
-            self.feature_to_keep.update(
-                (self.tactile_rgb_key, f"{self.tactile_rgb_key}_is_pad")
-            )
-        if self.tactile_marker_enabled:
-            self.feature_to_keep.update(
-                (
-                    self.tactile_marker_key,
-                    self.tactile_marker_valid_key,
-                    f"{self.tactile_marker_key}_is_pad",
-                    f"{self.tactile_marker_valid_key}_is_pad",
-                )
-            )
-        if self.tactile_rgb_enabled or self.tactile_marker_enabled:
-            self.feature_to_keep.update(
-                (self.tactile_timestamp_key, f"{self.tactile_timestamp_key}_is_pad")
-            )
 
         target_features  = {'states':[], 'actions':[], 'images':[]}
         org_features  = {'states':set(), 'actions':set(), 'images':set()}
@@ -459,7 +407,6 @@ class FeatureTransform:
         if self.return_item_befor_padding:
             return item
 
-        self._tactile_train_for_current_sample = bool(w_action and not policy_eval)
         batch_dict = self.pad_and_concat(item, w_action)
 
         state = prepare_state(batch_dict, self.model_config.max_state_dim) 
@@ -509,11 +456,6 @@ class FeatureTransform:
         lang_tokens, lang_masks = prepare_language(self.model_config, self.tokenizer, batch_dict) # bs, seq_len
         action_is_pad = batch_dict['action_is_pad']
         future_video_effective_fps = batch_dict.get('future_video_effective_fps')
-        tactile_batch = {
-            key: value
-            for key, value in batch_dict.items()
-            if key.startswith("tactile_")
-        }
 
         state_joint_mask = batch_dict['state_joint_mask']
         assert self.model_config.max_state_dim >= state_joint_mask.shape[-1], f"max_action_dim is smaller than the state joint dimension: {self.model_config.max_action_dim} < {state_joint_mask.shape[-1]}"
@@ -544,7 +486,6 @@ class FeatureTransform:
             batch_dict['image_grid_thw'] = image_grid_thw
         if future_video_effective_fps is not None:
             batch_dict['future_video_effective_fps'] = future_video_effective_fps
-        batch_dict.update(tactile_batch)
 
         if self.use_depth_align: 
             batch_dict['pil_images'] = pil_images
@@ -552,58 +493,6 @@ class FeatureTransform:
                 #assert future_pil_images is not None and future_pil_images is not []:
                 batch_dict['future_pil_images'] = future_pil_images
         return batch_dict
-
-    def _prepare_tactile_payload(self, item, train: bool) -> dict:
-        if not (
-            getattr(self, "tactile_rgb_enabled", False)
-            or getattr(self, "tactile_marker_enabled", False)
-        ):
-            return {}
-
-        payload = {}
-        if self.tactile_rgb_enabled:
-            if self.tactile_rgb_key not in item:
-                raise ValueError(f"Enabled tactile RGB key is missing: {self.tactile_rgb_key}")
-            rgb_history, rgb_mask, rgb_present = prepare_tactile_rgb_history(
-                item[self.tactile_rgb_key],
-                item.get(f"{self.tactile_rgb_key}_is_pad"),
-                train=train,
-                augment=bool(self.tactile_params.get("rgb_augment", True)),
-            )
-            payload.update(
-                {
-                    "tactile_rgb_history": rgb_history,
-                    "tactile_rgb_history_mask": rgb_mask,
-                    "tactile_rgb_present": rgb_present,
-                }
-            )
-
-        if self.tactile_marker_enabled:
-            if self.tactile_marker_key not in item:
-                raise ValueError(f"Enabled tactile marker key is missing: {self.tactile_marker_key}")
-            marker_history, marker_valid, marker_mask, marker_present = (
-                prepare_tactile_marker_history(
-                    item[self.tactile_marker_key],
-                    item.get(self.tactile_marker_valid_key),
-                    item.get(f"{self.tactile_marker_key}_is_pad"),
-                )
-            )
-            payload.update(
-                {
-                    "tactile_marker_flow": marker_history,
-                    "tactile_marker_valid_mask": marker_valid,
-                    "tactile_marker_history_mask": marker_mask,
-                    "tactile_marker_present": marker_present,
-                }
-            )
-
-        timestamp = item.get(self.tactile_timestamp_key)
-        if timestamp is not None:
-            timestamp = torch.as_tensor(timestamp, dtype=torch.float64)
-            if timestamp.ndim > 1 and timestamp.shape[-1] == 1:
-                timestamp = timestamp.squeeze(-1)
-            payload["tactile_history_timestamps"] = timestamp.reshape(-1)
-        return payload
 
     def unapply(self, item):
         if not self.return_item_befor_padding:
@@ -711,11 +600,6 @@ class FeatureTransform:
         action = torch.cat(actions, dim=-1).to(torch.float32)
         chunk_joint_mask = action_joint_mask.clone().unsqueeze(0).repeat(self.chunk_size, 1)
 
-        tactile_payload = self._prepare_tactile_payload(
-            item,
-            train=bool(getattr(self, "_tactile_train_for_current_sample", False)),
-        )
-
         batch_dict =  {
             "image": images,
             "future_image": future_images,
@@ -729,6 +613,5 @@ class FeatureTransform:
         }
         if "future_video_effective_fps" in item:
             batch_dict["future_video_effective_fps"] = item["future_video_effective_fps"]
-        batch_dict.update(tactile_payload)
 
         return batch_dict

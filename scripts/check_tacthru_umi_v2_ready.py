@@ -4,24 +4,12 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import sys
 from pathlib import Path
 
 import numpy as np
-import yaml
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from lingbotvla.tactile.schema import (
-    TACTILE_MARKER_FLOW_KEY,
-    TACTILE_MARKER_VALID_KEY,
-    TACTILE_RGB_KEY,
-    TACTILE_SCHEMA_VERSION,
-    TACTILE_TIMESTAMP_KEY,
-)
 
 
 CHUNK_SIZE = 50
@@ -41,15 +29,6 @@ NORM_DIMS = {
     "action.end.position": 7,
     "action.effector.position": 1,
 }
-
-
-def _tactile_modalities(mode: str) -> set[str]:
-    return {
-        "none": set(),
-        "rgb": {"rgb"},
-        "marker": {"marker"},
-        "rgb-marker": {"rgb", "marker"},
-    }[mode]
 
 
 class Report:
@@ -217,90 +196,6 @@ def check_teacher_file(report: Report, name: str, path: Path, minimum_size: int)
         report.ok(name, f"{size:,} bytes at {path}")
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def check_tactile_config(report: Report, path: Path, tactile_mode: str) -> None:
-    """Validate tactile contract and only require DINO weights for RGB models."""
-
-    modalities = _tactile_modalities(tactile_mode)
-    if not modalities:
-        report.ok("Tactile architecture config", "disabled for wrist-only architecture")
-        return
-    if not path.is_file():
-        report.fail("Tactile architecture config", f"missing {path}")
-        return
-    try:
-        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        params = payload.get("train", {}).get("tactile_params", {})
-        data = payload.get("data", {})
-        errors = []
-        expected_keys = {
-            "tactile_rgb_key": TACTILE_RGB_KEY,
-            "tactile_marker_key": TACTILE_MARKER_FLOW_KEY,
-            "tactile_marker_valid_key": TACTILE_MARKER_VALID_KEY,
-            "tactile_timestamp_key": TACTILE_TIMESTAMP_KEY,
-        }
-        for key, expected in expected_keys.items():
-            if data.get(key) != expected:
-                errors.append(f"data.{key}={data.get(key)!r}, expected {expected!r}")
-        if int(params.get("history_steps", 0)) < 1:
-            errors.append("history_steps must be >= 1")
-        if float(params.get("history_frequency_hz", 0.0)) <= 0:
-            errors.append("history_frequency_hz must be positive")
-        if "marker" in modalities:
-            if int(params.get("marker_count", 0)) != 48 or int(params.get("marker_dim", 0)) != 2:
-                errors.append("marker contract must be [48,2]")
-            if params.get("marker_normalization") != "image_size_xy":
-                errors.append("marker_normalization must be image_size_xy")
-            if list(params.get("marker_normalization_size_xy", [])) != [640, 480]:
-                errors.append("marker_normalization_size_xy must be [640,480]")
-        if errors:
-            report.fail("Tactile architecture config", "; ".join(errors))
-            return
-        report.ok(
-            "Tactile architecture config",
-            f"mode={tactile_mode}, history={params['history_steps']} at "
-            f"{params['history_frequency_hz']}Hz",
-        )
-
-        if "rgb" not in modalities:
-            report.ok("Tactile RGB backbone", "not required by marker-only architecture")
-            return
-        if params.get("rgb_backbone") != "dinov2_vits14":
-            report.fail(
-                "Tactile RGB backbone",
-                f"unsupported rgb_backbone={params.get('rgb_backbone')!r}",
-            )
-            return
-        if int(params.get("rgb_input_size", 224)) != 224:
-            report.fail("Tactile RGB backbone", "rgb_input_size must be 224")
-            return
-        backbone_value = params.get("rgb_backbone_path")
-        if not backbone_value:
-            report.fail("Tactile RGB backbone", "rgb_backbone_path is empty")
-            return
-        root = Path(__file__).resolve().parents[1]
-        backbone_path = Path(backbone_value).expanduser()
-        if not backbone_path.is_absolute():
-            backbone_path = root / backbone_path
-        if not backbone_path.is_file() or backbone_path.stat().st_size <= 0:
-            report.fail("Tactile RGB backbone", f"missing or empty {backbone_path}")
-            return
-        report.ok(
-            "Tactile RGB backbone",
-            f"dinov2_vits14, input=224, bytes={backbone_path.stat().st_size:,}, "
-            f"sha256={_sha256_file(backbone_path)}",
-        )
-    except Exception as exc:
-        report.fail("Tactile architecture config", repr(exc))
-
-
 def _episode_length(episode: dict) -> int:
     return int(episode["dataset_to_index"]) - int(episode["dataset_from_index"])
 
@@ -309,60 +204,25 @@ def check_dataset(
     report: Report,
     path: Path,
     expected_source_episodes: int | None,
-    tactile_mode: str = "none",
 ) -> tuple[int | None, int | None]:
     try:
         from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 
         meta = LeRobotDatasetMetadata(repo_id=path.name, root=path)
-        tactile_rgb_enabled = tactile_mode in {"rgb", "rgb-marker"}
-        tactile_marker_enabled = tactile_mode in {"marker", "rgb-marker"}
-        required_video_keys = set(REQUIRED_VIDEO_KEYS)
-        if tactile_rgb_enabled:
-            required_video_keys.add(TACTILE_RGB_KEY)
         features = set(meta.features)
-        missing = required_video_keys - features
+        missing = REQUIRED_VIDEO_KEYS - features
         if missing:
             report.fail("LeRobot images", f"missing {sorted(missing)}")
         else:
-            report.ok(
-                "LeRobot images",
-                "wrist RGB" + (" + tactile RGB" if tactile_rgb_enabled else " only"),
-            )
-        unexpected_candidates = set(UNEXPECTED_VIDEO_KEYS)
-        if not tactile_rgb_enabled:
-            unexpected_candidates.add(TACTILE_RGB_KEY)
-        unexpected = unexpected_candidates & features
+            report.ok("LeRobot images", "wrist RGB is the only visual input")
+        unexpected = UNEXPECTED_VIDEO_KEYS & features
         if unexpected:
             report.fail(
                 "Disabled visual inputs",
                 f"unexpected converted image features: {sorted(unexpected)}",
             )
         else:
-            report.ok("Disabled visual inputs", "unrequested visual slots are absent")
-
-        tactile_shape_errors = []
-        if tactile_marker_enabled:
-            marker_shape = tuple(meta.features.get(TACTILE_MARKER_FLOW_KEY, {}).get("shape", ()))
-            valid_shape = tuple(meta.features.get(TACTILE_MARKER_VALID_KEY, {}).get("shape", ()))
-            if marker_shape != (48, 2):
-                tactile_shape_errors.append(
-                    f"{TACTILE_MARKER_FLOW_KEY}={marker_shape}, expected (48,2)"
-                )
-            if valid_shape != (48,):
-                tactile_shape_errors.append(
-                    f"{TACTILE_MARKER_VALID_KEY}={valid_shape}, expected (48,)"
-                )
-        if tactile_rgb_enabled or tactile_marker_enabled:
-            timestamp_shape = tuple(meta.features.get(TACTILE_TIMESTAMP_KEY, {}).get("shape", ()))
-            if timestamp_shape != (1,):
-                tactile_shape_errors.append(
-                    f"{TACTILE_TIMESTAMP_KEY}={timestamp_shape}, expected (1,)"
-                )
-        if tactile_shape_errors:
-            report.fail("Canonical tactile features", "; ".join(tactile_shape_errors))
-        elif tactile_rgb_enabled or tactile_marker_enabled:
-            report.ok("Canonical tactile features", f"mode={tactile_mode}, schema={TACTILE_SCHEMA_VERSION}")
+            report.ok("Disabled visual inputs", "top/right/tactile visual slots are absent")
 
         shape_errors = []
         for key in ("observation.state", "action"):
@@ -425,9 +285,7 @@ def check_dataset(
             manifest_errors = []
             expected_manifest_values = {
                 "converter": "tacthru_umi_v2_native_30hz",
-                "converter_version": (
-                    5 if (tactile_rgb_enabled or tactile_marker_enabled) else 4
-                ),
+                "converter_version": 4,
                 "source_fps": EXPECTED_SOURCE_FPS,
                 "output_fps": EXPECTED_DATASET_FPS,
                 "action_chunk_size": CHUNK_SIZE,
@@ -462,22 +320,16 @@ def check_dataset(
                 )
             if manifest.get("output_episode_lengths") != lengths:
                 manifest_errors.append("output_episode_lengths do not match metadata")
-            expected_image_features = ["observation.images.camera_wrist_left"]
-            if tactile_rgb_enabled:
-                expected_image_features.append(TACTILE_RGB_KEY)
-            if manifest.get("image_features") != expected_image_features:
+            if manifest.get("image_features") != sorted(REQUIRED_VIDEO_KEYS):
                 manifest_errors.append(
                     f"image_features={manifest.get('image_features')!r}, "
-                    f"expected {expected_image_features!r}"
+                    f"expected {sorted(REQUIRED_VIDEO_KEYS)!r}"
                 )
 
-            expected_visual_policy = (
-                "wrist_plus_tactile_rgb" if tactile_rgb_enabled else "wrist_rgb_only"
-            )
-            if manifest.get("visual_input_policy") != expected_visual_policy:
+            if manifest.get("visual_input_policy") != "wrist_rgb_only":
                 manifest_errors.append(
                     f"visual_input_policy={manifest.get('visual_input_policy')!r}, "
-                    f"expected {expected_visual_policy!r}"
+                    "expected 'wrist_rgb_only'"
                 )
             if manifest.get("wrist_rgb_source_key") != "camera0_rgb":
                 manifest_errors.append(
@@ -486,41 +338,9 @@ def check_dataset(
                 )
 
             tactile_info = manifest.get("tactile_inputs", {})
-            tactile_enabled = tactile_rgb_enabled or tactile_marker_enabled
-            if tactile_info.get("enabled") is not tactile_enabled:
-                manifest_errors.append(
-                    f"tactile_inputs.enabled={tactile_info.get('enabled')!r}, expected {tactile_enabled}"
-                )
-            if tactile_info.get("copied_to_lerobot") is not tactile_enabled:
-                manifest_errors.append(
-                    "tactile_inputs.copied_to_lerobot does not match requested mode"
-                )
-            if tactile_enabled:
-                if tactile_info.get("used_for_training") is not True:
-                    manifest_errors.append(
-                        "tactile_inputs.used_for_training must be true for tactile mode"
-                    )
-                if tactile_info.get("schema_version") != TACTILE_SCHEMA_VERSION:
-                    manifest_errors.append("tactile_inputs.schema_version mismatch")
-                if tactile_info.get("rgb_enabled") is not tactile_rgb_enabled:
-                    manifest_errors.append("tactile_inputs.rgb_enabled mismatch")
-                if tactile_info.get("marker_enabled") is not tactile_marker_enabled:
-                    manifest_errors.append("tactile_inputs.marker_enabled mismatch")
-                if tactile_marker_enabled:
-                    normalization = tactile_info.get("marker_normalization", {})
-                    if normalization.get("target") != "image_size_xy":
-                        manifest_errors.append(
-                            "tactile marker target normalization must be image_size_xy"
-                        )
-                    if (
-                        normalization.get("image_width"),
-                        normalization.get("image_height"),
-                    ) != (640, 480):
-                        manifest_errors.append(
-                            "tactile marker normalization size must be [640,480]"
-                        )
-            elif tactile_info.get("used_for_training") is not False:
-                manifest_errors.append("tactile_inputs.used_for_training must be false")
+            for key in ("enabled", "copied_to_lerobot", "used_for_training"):
+                if tactile_info.get(key) is not False:
+                    manifest_errors.append(f"tactile_inputs.{key} must be false")
 
             if manifest_errors:
                 report.fail("Conversion manifest", "; ".join(manifest_errors))
@@ -530,14 +350,6 @@ def check_dataset(
                     f"source episodes={source_episodes}, output episodes={converted_episodes}, "
                     "native contiguous 30 Hz",
                 )
-                if tactile_enabled and not tactile_info.get(
-                    "timestamp_is_independently_measured", False
-                ):
-                    report.warn(
-                        "Tactile timestamp provenance",
-                        "timestamps are derived from the synchronized episode frame index; "
-                        "independent wrist/tactile skew cannot be recovered from this legacy Zarr",
-                    )
             if expected_source_episodes is not None and source_episodes != expected_source_episodes:
                 report.fail(
                     "Source episode count",
@@ -549,7 +361,7 @@ def check_dataset(
         video_count = 0
         first_video_paths: dict[str, Path] = {}
         for episode_index in range(meta.total_episodes):
-            for key in sorted(required_video_keys):
+            for key in sorted(REQUIRED_VIDEO_KEYS):
                 relpath = meta.get_video_file_path(episode_index, key)
                 video_path = relpath if relpath.is_absolute() else path / relpath
                 if not video_path.is_file():
@@ -577,12 +389,7 @@ def check_dataset(
         return None, None
 
 
-def check_norm(
-    report: Report,
-    path: Path,
-    expected_count: int | None,
-    tactile_marker_enabled: bool = False,
-) -> None:
+def check_norm(report: Report, path: Path, expected_count: int | None) -> None:
     if not path.is_file():
         report.fail("Normalization stats", f"missing {path}")
         return
@@ -591,10 +398,7 @@ def check_norm(
         stats = payload["norm_stats"]
         errors = []
         scale_warnings = []
-        norm_dims = dict(NORM_DIMS)
-        if tactile_marker_enabled:
-            norm_dims[TACTILE_MARKER_FLOW_KEY] = 2
-        for key, dim in norm_dims.items():
+        for key, dim in NORM_DIMS.items():
             entry = stats.get(key)
             if entry is None:
                 errors.append(f"missing {key}")
@@ -649,13 +453,7 @@ def check_norm(
         report.fail("Normalization stats", repr(exc))
 
 
-def check_dataset_transform(
-    report: Report,
-    dataset_path: Path,
-    expected_length: int | None,
-    tactile_mode: str = "none",
-    dataset_tactile_mode: str | None = None,
-) -> None:
+def check_dataset_transform(report: Report, dataset_path: Path, expected_length: int | None) -> None:
     """Run the exact v2 robot mapping and quaternion-relative transform."""
 
     try:
@@ -666,10 +464,6 @@ def check_dataset_transform(
         from lingbotvla.data.vla_data.base_dataset import VLADataset
 
         root = Path(__file__).resolve().parents[1]
-        tactile_rgb_enabled = tactile_mode in {"rgb", "rgb-marker"}
-        tactile_marker_enabled = tactile_mode in {"marker", "rgb-marker"}
-        dataset_tactile_mode = dataset_tactile_mode or tactile_mode
-        dataset_has_tactile = bool(_tactile_modalities(dataset_tactile_mode))
         data_config = SimpleNamespace(
             joints=[
                 "{'arm.position': 14}",
@@ -686,18 +480,10 @@ def check_dataset_transform(
                 "{'effector.position': 'meanstd'}",
             ],
             norm_stats_file=None,
-            tactile_rgb_key=TACTILE_RGB_KEY,
-            tactile_marker_key=TACTILE_MARKER_FLOW_KEY,
-            tactile_marker_valid_key=TACTILE_MARKER_VALID_KEY,
-            tactile_timestamp_key=TACTILE_TIMESTAMP_KEY,
         )
         dataset = VLADataset(
             repo_id=str(dataset_path),
-            data_name=(
-                "tacthru_umi_v2_tactile"
-                if dataset_has_tactile
-                else "tacthru_umi_v2"
-            ),
+            data_name="tacthru_umi_v2",
             dataset_config=data_config,
             robot_config_root=str(root / "configs/robot_configs"),
             config=None,
@@ -707,9 +493,6 @@ def check_dataset_transform(
             return_item=True,
             disabled_image_features=True,
             use_future_image=True,
-            tactile_rgb_enabled=tactile_rgb_enabled,
-            tactile_marker_enabled=tactile_marker_enabled,
-            tactile_params={"history_steps": 4, "history_stride": 1},
         )
         if expected_length is not None and len(dataset) != expected_length:
             raise AssertionError(f"dataset length={len(dataset)}, expected valid anchors={expected_length}")
@@ -747,18 +530,6 @@ def check_dataset_transform(
                 errors.append(f"{key}={actual}, expected {shape}")
         if bool(torch.as_tensor(sample["action_is_pad"]).any()):
             errors.append("filtered sample still contains padded actions")
-        if tactile_marker_enabled:
-            marker = torch.as_tensor(sample.get(TACTILE_MARKER_FLOW_KEY))
-            marker_valid = torch.as_tensor(sample.get(TACTILE_MARKER_VALID_KEY))
-            marker_pad = torch.as_tensor(sample.get(f"{TACTILE_MARKER_FLOW_KEY}_is_pad"))
-            if tuple(marker.shape) != (4, 48, 2):
-                errors.append(f"marker history={tuple(marker.shape)}, expected (4,48,2)")
-            if tuple(marker_valid.shape) != (4, 48):
-                errors.append(
-                    f"marker valid history={tuple(marker_valid.shape)}, expected (4,48)"
-                )
-            if tuple(marker_pad.shape) != (4,):
-                errors.append(f"marker temporal pad={tuple(marker_pad.shape)}, expected (4,)")
         future_effective_fps = sample.get("future_video_effective_fps")
         if future_effective_fps is None:
             errors.append("future_video_effective_fps is missing")
@@ -791,8 +562,7 @@ def check_dataset_transform(
                 "v2 training transform",
                 f"samples={len(dataset)}, EEF=7D quaternion_local, gripper=1D, "
                 f"chunk=50 contiguous at 30 Hz, future effective fps="
-                f"{EXPECTED_FUTURE_EFFECTIVE_FPS:.9f}, dataset_mode={dataset_tactile_mode}, "
-                f"train_mode={tactile_mode}",
+                f"{EXPECTED_FUTURE_EFFECTIVE_FPS:.9f}",
             )
     except Exception as exc:
         report.fail("v2 training transform", repr(exc))
@@ -855,27 +625,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dino-checkpoint", type=Path, default=model / "dino_video/teacher_step_10000.pth")
     parser.add_argument("--dino-config", type=Path, default=model / "dino_video/config.yaml")
     parser.add_argument("--expected-source-episodes", type=int, default=100)
-    parser.add_argument(
-        "--tactile-mode",
-        choices=("none", "rgb", "marker", "rgb-marker"),
-        default="none",
-        help="Training architecture ablation (encoder branches enabled for this run)",
-    )
-    parser.add_argument(
-        "--dataset-tactile-mode",
-        choices=("none", "rgb", "marker", "rgb-marker"),
-        default=None,
-        help=(
-            "Actual converter schema to validate. Leave unset to use --tactile-mode; "
-            "for a reusable superset dataset choose rgb-marker."
-        ),
-    )
-    parser.add_argument(
-        "--tactile-config",
-        type=Path,
-        default=Path(__file__).resolve().parents[1]
-        / "configs/vla/tacthru_umi/tacthru_umi_tactile.yaml",
-    )
     parser.add_argument("--require-gpu", action="store_true")
     parser.add_argument("--require-flash", action="store_true")
     parser.add_argument("--json", action="store_true")
@@ -885,21 +634,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     report = Report()
-    dataset_tactile_mode = args.dataset_tactile_mode or args.tactile_mode
-    train_modalities = _tactile_modalities(args.tactile_mode)
-    dataset_modalities = _tactile_modalities(dataset_tactile_mode)
-    if not train_modalities.issubset(dataset_modalities):
-        report.fail(
-            "Tactile dataset/architecture contract",
-            f"train mode={args.tactile_mode} requires {sorted(train_modalities)}, "
-            f"but dataset mode={dataset_tactile_mode} provides {sorted(dataset_modalities)}",
-        )
-    else:
-        report.ok(
-            "Tactile dataset/architecture contract",
-            f"dataset={dataset_tactile_mode}, train={args.tactile_mode}",
-        )
-    check_tactile_config(report, args.tactile_config.expanduser().resolve(), args.tactile_mode)
     check_python(report)
     check_model(report, args.model.expanduser().resolve())
     check_qwen(report, args.tokenizer.expanduser().resolve())
@@ -915,22 +649,10 @@ def main() -> int:
             report,
             args.dataset.expanduser().resolve(),
             args.expected_source_episodes,
-            dataset_tactile_mode,
         )
-        check_dataset_transform(
-            report,
-            args.dataset.expanduser().resolve(),
-            valid_anchors,
-            args.tactile_mode,
-            dataset_tactile_mode,
-        )
+        check_dataset_transform(report, args.dataset.expanduser().resolve(), valid_anchors)
     if args.norm is not None:
-        check_norm(
-            report,
-            args.norm.expanduser().resolve(),
-            valid_anchors,
-            tactile_marker_enabled="marker" in dataset_modalities,
-        )
+        check_norm(report, args.norm.expanduser().resolve(), valid_anchors)
 
     check_accelerator(report, args.require_gpu, args.require_flash)
     report.display(args.json)

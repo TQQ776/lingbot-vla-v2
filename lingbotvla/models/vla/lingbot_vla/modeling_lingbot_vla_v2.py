@@ -40,7 +40,6 @@ from lingbotvla.models.vla.lingbot_vla.qwen2_action_expert import (
     Qwen2FusedExperts,
     FixQwen2RMSNorm,
 )
-from .tactile_encoder import GatedTactileFusion, TactileMarkerEncoder, TactileRGBEncoder
 
 try:
     from dinov3.hub.backbones import dinov3_vitb16
@@ -476,42 +475,6 @@ class FlowMatchingV2(FlowMatchingV1):
         self.action_time_mlp_in = nn.Linear(self.config.proj_width * 2, self.config.proj_width)
         self.action_time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
 
-        self.tactile_rgb_enabled = bool(getattr(self.config, "tactile_rgb_enabled", False))
-        self.tactile_marker_enabled = bool(getattr(self.config, "tactile_marker_enabled", False))
-        self.tactile_enabled = self.tactile_rgb_enabled or self.tactile_marker_enabled
-        self._tactile_token_count = 0
-        if self.tactile_enabled:
-            tactile_params = self.config.tactile_params
-            prefix_hidden_dim = int(
-                self.qwenvl_with_expert.qwenvl.config.text_config.hidden_size
-            )
-            if (
-                self.config.align_params
-                and not tactile_params["teacher_attention_to_tactile"]
-                and not self.config.vlm_causal
-            ):
-                raise ValueError(
-                    "Tactile fusion with Depth/DINO teacher isolation requires "
-                    "vlm_causal=True; otherwise language tokens can leak tactile "
-                    "information into teacher query tokens."
-                )
-            if self.tactile_rgb_enabled:
-                self.tactile_rgb_encoder = TactileRGBEncoder(
-                    tactile_params, prefix_hidden_dim
-                )
-                self._tactile_token_count += self.tactile_rgb_encoder.num_tokens
-            if self.tactile_marker_enabled:
-                self.tactile_marker_encoder = TactileMarkerEncoder(
-                    tactile_params, prefix_hidden_dim
-                )
-                self._tactile_token_count += self.tactile_marker_encoder.num_tokens
-            self.tactile_fusion = GatedTactileFusion(
-                prefix_hidden_dim=prefix_hidden_dim,
-                rgb_enabled=self.tactile_rgb_enabled,
-                marker_enabled=self.tactile_marker_enabled,
-                params=tactile_params,
-            )
-
         self.config.align_params = getattr(self.config, "align_params", None) or {}
         if self.config.align_params != {}:
             self.steps = 0
@@ -532,180 +495,6 @@ class FlowMatchingV2(FlowMatchingV1):
             self.block_future_depth_to_action = False
 
         self.set_requires_grad()
-        self._configure_tactile_train_stage()
-
-    def _configure_tactile_train_stage(self) -> None:
-        """Apply the explicit adapter -> expert -> full fine-tuning schedule."""
-        stage = getattr(self.config, "tactile_train_stage", "full")
-        if not self.tactile_enabled or stage == "full":
-            return
-        # Stage transitions are encoded in the model config and can therefore
-        # be changed between runs without changing the checkpoint key layout.
-        self.requires_grad_(False)
-        if self.tactile_rgb_enabled:
-            self.tactile_rgb_encoder.requires_grad_(True)
-            if self.config.tactile_params["freeze_rgb_backbone"]:
-                frozen_backbone = self.tactile_rgb_encoder.backbone
-                if frozen_backbone is None:
-                    frozen_backbone = nn.ModuleList(
-                        [
-                            self.tactile_rgb_encoder.native_patch_embed,
-                            self.tactile_rgb_encoder.native_frame_encoder,
-                        ]
-                    )
-                frozen_backbone.requires_grad_(False)
-        if self.tactile_marker_enabled:
-            self.tactile_marker_encoder.requires_grad_(True)
-        self.tactile_fusion.requires_grad_(True)
-        if stage == "expert":
-            self.qwenvl_with_expert.qwen_expert.requires_grad_(True)
-            for module in (
-                self.state_proj,
-                self.action_in_proj,
-                self.action_out_proj,
-                self.action_time_mlp_in,
-                self.action_time_mlp_out,
-            ):
-                module.requires_grad_(True)
-
-    def reset_tactile_parameters(self) -> None:
-        """Initialize only the adapters that are absent from a wrist-only checkpoint."""
-        if not self.tactile_enabled:
-            return
-        if self.tactile_rgb_enabled:
-            self.tactile_rgb_encoder.reset_parameters()
-        if self.tactile_marker_enabled:
-            self.tactile_marker_encoder.reset_parameters()
-        self.tactile_fusion.reset_parameters()
-
-    def initialize_tactile_from_external(self) -> None:
-        if self.tactile_rgb_enabled:
-            self.tactile_rgb_encoder.load_local_backbone()
-
-    @staticmethod
-    def _presence_or_default(value, inferred: Tensor) -> Tensor:
-        if value is None:
-            return inferred
-        if isinstance(value, bool):
-            return torch.full_like(inferred, value) & inferred
-        if value.numel() == 1:
-            return (
-                value.to(device=inferred.device, dtype=torch.bool).expand_as(inferred)
-                & inferred
-            )
-        if value.shape != inferred.shape:
-            raise ValueError(
-                f"Tactile presence must be scalar or {tuple(inferred.shape)}, "
-                f"got {tuple(value.shape)}."
-            )
-        return value.to(device=inferred.device, dtype=torch.bool) & inferred
-
-    def _missing_tactile_tokens(self, batch, count, hidden, device, dtype):
-        return (
-            torch.zeros(batch, count, hidden, device=device, dtype=dtype),
-            torch.zeros(batch, count, device=device, dtype=torch.bool),
-            torch.zeros(batch, device=device, dtype=torch.bool),
-        )
-
-    def _build_tactile_prefix(
-        self,
-        batch_size: int,
-        prefix_hidden_dim: int,
-        device,
-        dtype,
-        tactile_rgb_history=None,
-        tactile_rgb_history_mask=None,
-        tactile_marker_flow=None,
-        tactile_marker_valid_mask=None,
-        tactile_marker_history_mask=None,
-        tactile_history_timestamps=None,
-        tactile_rgb_present=None,
-        tactile_marker_present=None,
-        force_mask_tactile_rgb=None,
-        force_mask_tactile_marker=None,
-    ):
-        if not self.tactile_enabled:
-            return None, None, {}
-        missing_policy = self.config.tactile_params["missing_policy"]
-        rgb_tokens = rgb_mask = rgb_present = None
-        marker_tokens = marker_mask = marker_present = None
-
-        if self.tactile_rgb_enabled:
-            if tactile_rgb_history is None:
-                if missing_policy == "error":
-                    raise ValueError("tactile_rgb_history is required by this checkpoint.")
-                rgb_tokens, rgb_mask, rgb_present = self._missing_tactile_tokens(
-                    batch_size,
-                    self.tactile_rgb_encoder.num_tokens,
-                    prefix_hidden_dim,
-                    device,
-                    dtype,
-                )
-            else:
-                rgb_tokens, rgb_mask = self.tactile_rgb_encoder(
-                    tactile_rgb_history, tactile_rgb_history_mask
-                )
-                inferred = rgb_mask.any(dim=-1)
-                rgb_present = self._presence_or_default(tactile_rgb_present, inferred)
-                rgb_tokens = rgb_tokens.to(device=device, dtype=dtype)
-                rgb_mask = rgb_mask.to(device=device)
-
-        if self.tactile_marker_enabled:
-            if tactile_marker_flow is None:
-                if missing_policy == "error":
-                    raise ValueError("tactile_marker_flow is required by this checkpoint.")
-                marker_tokens, marker_mask, marker_present = self._missing_tactile_tokens(
-                    batch_size,
-                    self.tactile_marker_encoder.num_tokens,
-                    prefix_hidden_dim,
-                    device,
-                    dtype,
-                )
-            else:
-                marker_tokens, marker_mask = self.tactile_marker_encoder(
-                    tactile_marker_flow,
-                    tactile_marker_valid_mask,
-                    tactile_marker_history_mask,
-                    tactile_history_timestamps,
-                )
-                inferred = marker_mask.any(dim=-1)
-                marker_present = self._presence_or_default(
-                    tactile_marker_present, inferred
-                )
-                marker_tokens = marker_tokens.to(device=device, dtype=dtype)
-                marker_mask = marker_mask.to(device=device)
-
-        if force_mask_tactile_rgb is None:
-            force_mask_tactile_rgb = getattr(
-                self.config, "force_mask_tactile_rgb", False
-            )
-        if force_mask_tactile_marker is None:
-            force_mask_tactile_marker = getattr(
-                self.config, "force_mask_tactile_marker", False
-            )
-        tactile_tokens, tactile_mask, tactile_metrics = self.tactile_fusion(
-            rgb_tokens=rgb_tokens,
-            rgb_token_mask=rgb_mask,
-            rgb_present=rgb_present,
-            marker_tokens=marker_tokens,
-            marker_token_mask=marker_mask,
-            marker_present=marker_present,
-            force_mask_rgb=force_mask_tactile_rgb,
-            force_mask_marker=force_mask_tactile_marker,
-        )
-        if self.tactile_rgb_enabled and rgb_tokens is not None:
-            tactile_metrics["tactile/rgb_token_norm"] = rgb_tokens.detach().float().norm(
-                dim=-1
-            ).mean()
-        if self.tactile_marker_enabled and marker_tokens is not None:
-            tactile_metrics["tactile/marker_token_norm"] = marker_tokens.detach().float().norm(
-                dim=-1
-            ).mean()
-            if tactile_marker_valid_mask is not None:
-                tactile_metrics["tactile/marker_valid_fraction"] = (
-                    tactile_marker_valid_mask.detach().float().mean()
-                )
-        return tactile_tokens, tactile_mask, tactile_metrics
 
     def embed_prefix(
         self,
@@ -714,16 +503,6 @@ class FlowMatchingV2(FlowMatchingV1):
         lang_tokens,
         lang_masks,
         image_grid_thw=None,
-        tactile_rgb_history=None,
-        tactile_rgb_history_mask=None,
-        tactile_marker_flow=None,
-        tactile_marker_valid_mask=None,
-        tactile_marker_history_mask=None,
-        tactile_history_timestamps=None,
-        tactile_rgb_present=None,
-        tactile_marker_present=None,
-        force_mask_tactile_rgb=None,
-        force_mask_tactile_marker=None,
     ):
         if image_grid_thw is None:
             raise ValueError("LingbotVlaV2Policy requires image_grid_thw from the Qwen3-VL image processor.")
@@ -799,30 +578,6 @@ class FlowMatchingV2(FlowMatchingV1):
         fake_image_ids = einops.rearrange(fake_image_ids, "b n l -> b (n l)")
 
         lang_emb = self.qwenvl_with_expert.embed_language_tokens(lang_tokens).to(dtype=embed_dtype)
-        tactile_embs, tactile_pad_masks, tactile_metrics = self._build_tactile_prefix(
-            batch_size=bsize,
-            prefix_hidden_dim=img_emb.shape[-1],
-            device=device,
-            dtype=embed_dtype,
-            tactile_rgb_history=tactile_rgb_history,
-            tactile_rgb_history_mask=tactile_rgb_history_mask,
-            tactile_marker_flow=tactile_marker_flow,
-            tactile_marker_valid_mask=tactile_marker_valid_mask,
-            tactile_marker_history_mask=tactile_marker_history_mask,
-            tactile_history_timestamps=tactile_history_timestamps,
-            tactile_rgb_present=tactile_rgb_present,
-            tactile_marker_present=tactile_marker_present,
-            force_mask_tactile_rgb=force_mask_tactile_rgb,
-            force_mask_tactile_marker=force_mask_tactile_marker,
-        )
-        if tactile_embs is not None:
-            fake_tactile_ids = torch.full(
-                tactile_pad_masks.shape,
-                cfg.text_config.eos_token_id,
-                dtype=torch.long,
-                device=device,
-            )
-            tactile_visual_masks = torch.zeros_like(tactile_pad_masks)
 
         if self.use_depth_align and self.align_type == "query":
             def _get_align_tokens(tokens):
@@ -896,7 +651,6 @@ class FlowMatchingV2(FlowMatchingV1):
                     "share_future_depth_query=True requires depth.use_future_depth=True."
                 )
 
-            tactile_appended = False
             for segment_name in prefix_query_segments(
                 use_depth_align=True,
                 use_future_depth=self.use_future_depth,
@@ -915,17 +669,6 @@ class FlowMatchingV2(FlowMatchingV1):
                         lang_masks,
                         lang_tokens.to(device),
                     )
-                    if tactile_embs is not None:
-                        # Language precedes tactile. With causal prefix attention this
-                        # prevents indirect tactile leakage into teacher queries after
-                        # their direct query->tactile edge is blocked below.
-                        _append(
-                            tactile_embs,
-                            tactile_pad_masks,
-                            fake_tactile_ids,
-                            tactile_visual_masks,
-                        )
-                        tactile_appended = True
                 elif segment_name == "current_depth":
                     _append(align_embs, align_pad_masks, fake_align_ids)
                 elif segment_name == "future_video_cls":
@@ -955,27 +698,15 @@ class FlowMatchingV2(FlowMatchingV1):
                 else:
                     raise ValueError(f"Unsupported prefix query segment: {segment_name}")
 
-            if tactile_embs is not None and not tactile_appended:
-                raise RuntimeError("Failed to insert tactile tokens into the Qwen prefix.")
-
             embs = torch.cat(parts, dim=1)
             pad_masks = torch.cat(masks, dim=1)
             prefix_input_ids = torch.cat(input_ids, dim=1)
             full_visual_pos_masks = torch.cat(visual_masks, dim=1)
         else:
-            parts = [img_emb, lang_emb]
-            masks = [image_pad_masks, lang_masks]
-            ids = [fake_image_ids, lang_tokens.to(device)]
-            visual_masks = [visual_pos_masks, torch.zeros_like(lang_masks)]
-            if tactile_embs is not None:
-                parts.append(tactile_embs)
-                masks.append(tactile_pad_masks)
-                ids.append(fake_tactile_ids)
-                visual_masks.append(tactile_visual_masks)
-            embs = torch.cat(parts, dim=1)
-            pad_masks = torch.cat(masks, dim=1)
-            prefix_input_ids = torch.cat(ids, dim=1)
-            full_visual_pos_masks = torch.cat(visual_masks, dim=1)
+            embs = torch.cat([img_emb, lang_emb], dim=1)
+            pad_masks = torch.cat([image_pad_masks, lang_masks], dim=1)
+            prefix_input_ids = torch.cat([fake_image_ids, lang_tokens.to(device)], dim=1)
+            full_visual_pos_masks = torch.cat([visual_pos_masks, torch.zeros_like(lang_masks)], dim=1)
 
         if getattr(self.config, "vlm_causal", False):
             att_masks = torch.ones((bsize, embs.shape[1]), device=device, dtype=torch.bool)
@@ -1004,7 +735,6 @@ class FlowMatchingV2(FlowMatchingV1):
             prefix_position_ids,
             full_visual_pos_masks,
             filtered_deepstack,
-            tactile_metrics,
         )
         return result
 
@@ -1015,36 +745,6 @@ class FlowMatchingV2(FlowMatchingV1):
         suffix_1d = suffix_1d.masked_fill(~suffix_pad_masks, 1)
         suffix_position_ids = suffix_1d.unsqueeze(0).expand(3, -1, -1)
         return torch.cat([prefix_position_ids, suffix_position_ids], dim=-1)
-
-    def _block_teacher_queries_to_tactile_(self, att_2d_masks, prefix_len):
-        if (
-            not self.tactile_enabled
-            or not self.use_depth_align
-            or self.align_type != "query"
-            or self.config.tactile_params["teacher_attention_to_tactile"]
-        ):
-            return att_2d_masks
-        query_spans = prefix_query_token_spans(
-            prefix_len=prefix_len,
-            num_task_tokens=self.num_task_tokens,
-            use_depth_align=True,
-            use_future_depth=self.use_future_depth,
-            use_future_video=getattr(self, "use_future_video", False),
-            use_future_video_cls=getattr(self, "use_future_video_cls", False),
-            use_future_video_patch=getattr(self, "use_future_video_patch", True),
-            future_video_share_future_depth_query=getattr(
-                self, "future_video_share_future_depth_query", False
-            ),
-        )
-        if not query_spans:
-            return att_2d_masks
-        tactile_end = min(start for start, _ in query_spans.values())
-        tactile_start = tactile_end - self._tactile_token_count
-        if tactile_start < 0:
-            raise RuntimeError("Invalid tactile prefix span while isolating teacher queries.")
-        for query_start, query_end in query_spans.values():
-            att_2d_masks[:, query_start:query_end, tactile_start:tactile_end] = False
-        return att_2d_masks
 
     def _current_depth_task_tokens(self, hidden_states, num_images=3):
         query_spans = prefix_query_token_spans(
@@ -1081,16 +781,6 @@ class FlowMatchingV2(FlowMatchingV1):
         future_video_targets=None,
         future_video_cls_targets=None,
         future_video_current_patch=None,
-        tactile_rgb_history=None,
-        tactile_rgb_history_mask=None,
-        tactile_marker_flow=None,
-        tactile_marker_valid_mask=None,
-        tactile_marker_history_mask=None,
-        tactile_history_timestamps=None,
-        tactile_rgb_present=None,
-        tactile_marker_present=None,
-        force_mask_tactile_rgb=None,
-        force_mask_tactile_marker=None,
     ) -> Tensor:
         dtype = state.dtype
         device = state.device
@@ -1110,23 +800,12 @@ class FlowMatchingV2(FlowMatchingV1):
             prefix_position_ids,
             visual_pos_masks,
             deepstack_visual_embeds,
-            tactile_metrics,
         ) = self.embed_prefix(
             images,
             img_masks,
             lang_tokens,
             lang_masks,
             image_grid_thw=image_grid_thw,
-            tactile_rgb_history=tactile_rgb_history,
-            tactile_rgb_history_mask=tactile_rgb_history_mask,
-            tactile_marker_flow=tactile_marker_flow,
-            tactile_marker_valid_mask=tactile_marker_valid_mask,
-            tactile_marker_history_mask=tactile_marker_history_mask,
-            tactile_history_timestamps=tactile_history_timestamps,
-            tactile_rgb_present=tactile_rgb_present,
-            tactile_marker_present=tactile_marker_present,
-            force_mask_tactile_rgb=force_mask_tactile_rgb,
-            force_mask_tactile_marker=force_mask_tactile_marker,
         )
         time_embs, suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
             state, x_t, time
@@ -1136,9 +815,6 @@ class FlowMatchingV2(FlowMatchingV1):
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         prefix_len = prefix_pad_masks.shape[1]
-        att_2d_masks = self._block_teacher_queries_to_tactile_(
-            att_2d_masks, prefix_len
-        )
         if self.block_future_depth_to_action:
             att_2d_masks = block_suffix_to_fv_(
                 att_2d_masks,
@@ -1239,17 +915,6 @@ class FlowMatchingV2(FlowMatchingV1):
         )
         if align_metrics:
             moe_metrics.update(align_metrics)
-        if tactile_metrics:
-            moe_metrics.update(tactile_metrics)
-        if self.tactile_enabled:
-            if self.tactile_rgb_enabled:
-                moe_metrics["tactile/rgb_gate_base"] = torch.sigmoid(
-                    self.tactile_fusion.rgb_gate.detach()
-                )
-            if self.tactile_marker_enabled:
-                moe_metrics["tactile/marker_gate_base"] = torch.sigmoid(
-                    self.tactile_fusion.marker_gate.detach()
-                )
         return losses, loss_depth, loss_future_depth, loss_future_video, depth_preds, seq_wise_loss, router_z_loss, moe_metrics, future_depth_preds, future_video_preds, current_video_preds
 
     def sample_actions(
@@ -1261,16 +926,6 @@ class FlowMatchingV2(FlowMatchingV1):
         state,
         noise=None,
         image_grid_thw=None,
-        tactile_rgb_history=None,
-        tactile_rgb_history_mask=None,
-        tactile_marker_flow=None,
-        tactile_marker_valid_mask=None,
-        tactile_marker_history_mask=None,
-        tactile_history_timestamps=None,
-        tactile_rgb_present=None,
-        tactile_marker_present=None,
-        force_mask_tactile_rgb=None,
-        force_mask_tactile_marker=None,
     ) -> Tensor:
         """Do a full Qwen3-VL inference forward and compute the action."""
         bsize = state.shape[0]
@@ -1292,28 +947,14 @@ class FlowMatchingV2(FlowMatchingV1):
             prefix_position_ids,
             visual_pos_masks,
             deepstack_visual_embeds,
-            _tactile_metrics,
         ) = self.embed_prefix(
             images,
             img_masks,
             lang_tokens,
             lang_masks,
             image_grid_thw=image_grid_thw,
-            tactile_rgb_history=tactile_rgb_history,
-            tactile_rgb_history_mask=tactile_rgb_history_mask,
-            tactile_marker_flow=tactile_marker_flow,
-            tactile_marker_valid_mask=tactile_marker_valid_mask,
-            tactile_marker_history_mask=tactile_marker_history_mask,
-            tactile_history_timestamps=tactile_history_timestamps,
-            tactile_rgb_present=tactile_rgb_present,
-            tactile_marker_present=tactile_marker_present,
-            force_mask_tactile_rgb=force_mask_tactile_rgb,
-            force_mask_tactile_marker=force_mask_tactile_marker,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_att_2d_masks = self._block_teacher_queries_to_tactile_(
-            prefix_att_2d_masks, prefix_pad_masks.shape[1]
-        )
 
         _, past_key_values, _ = self.qwenvl_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
@@ -1589,12 +1230,6 @@ class LingbotVlaV2Policy(PreTrainedModel):
     def reset(self):
         return None
 
-    def reset_tactile_parameters(self) -> None:
-        self.model.reset_tactile_parameters()
-
-    def initialize_tactile_from_external(self) -> None:
-        self.model.initialize_tactile_from_external()
-
     def get_optim_params(self) -> dict:
         return self.parameters()
 
@@ -1616,16 +1251,6 @@ class LingbotVlaV2Policy(PreTrainedModel):
         future_video_targets=None,
         future_video_cls_targets=None,
         future_video_current_patch=None,
-        tactile_rgb_history=None,
-        tactile_rgb_history_mask=None,
-        tactile_marker_flow=None,
-        tactile_marker_valid_mask=None,
-        tactile_marker_history_mask=None,
-        tactile_history_timestamps=None,
-        tactile_rgb_present=None,
-        tactile_marker_present=None,
-        force_mask_tactile_rgb=None,
-        force_mask_tactile_marker=None,
         **kwargs
     ) -> tuple[Tensor, dict[str, Tensor]]:
         loss_dict = {}
@@ -1660,16 +1285,6 @@ class LingbotVlaV2Policy(PreTrainedModel):
             future_video_targets=future_video_targets,
             future_video_cls_targets=future_video_cls_targets,
             future_video_current_patch=future_video_current_patch,
-            tactile_rgb_history=tactile_rgb_history,
-            tactile_rgb_history_mask=tactile_rgb_history_mask,
-            tactile_marker_flow=tactile_marker_flow,
-            tactile_marker_valid_mask=tactile_marker_valid_mask,
-            tactile_marker_history_mask=tactile_marker_history_mask,
-            tactile_history_timestamps=tactile_history_timestamps,
-            tactile_rgb_present=tactile_rgb_present,
-            tactile_marker_present=tactile_marker_present,
-            force_mask_tactile_rgb=force_mask_tactile_rgb,
-            force_mask_tactile_marker=force_mask_tactile_marker,
         )
 
         if joint_mask is not None:

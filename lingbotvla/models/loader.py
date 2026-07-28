@@ -208,17 +208,7 @@ class VLAWeightLoader(ABC):
                 return name
         raise ValueError(f"Submodule {type(submodule).__name__} not found in model")
 
-    def get_allowed_missing_parameter_names(self, model: nn.Module) -> set[str]:
-        """Exact new-parameter whitelist when initializing from an older checkpoint."""
-        return set()
-
 class LingBotVLAWeightLoader(VLAWeightLoader):
-
-    _TACTILE_PREFIXES = (
-        "model.tactile_rgb_encoder.",
-        "model.tactile_marker_encoder.",
-        "model.tactile_fusion.",
-    )
 
     def get_vlm_submodule(self, model: nn.Module) -> nn.Module:
         return model.model.qwenvl_with_expert.qwenvl
@@ -234,14 +224,3 @@ class LingBotVLAWeightLoader(VLAWeightLoader):
             return "model.qwenvl_with_expert.qwenvl." + key
         
         return key
-
-    def get_allowed_missing_parameter_names(self, model: nn.Module) -> set[str]:
-        if not getattr(model.config, "tactile_rgb_enabled", False) and not getattr(
-            model.config, "tactile_marker_enabled", False
-        ):
-            return set()
-        return {
-            name
-            for name, _ in model.named_parameters()
-            if name.startswith(self._TACTILE_PREFIXES)
-        }
