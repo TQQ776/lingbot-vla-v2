@@ -16,8 +16,6 @@ __pycache__/
 /runs/
 /tmp/
 log.txt
-/logs/
-/.rollback/
 
 # TacThru source/converted datasets and generated statistics
 *.zarr

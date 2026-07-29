@@ -1,0 +1,44 @@
+name: TacThru
+cam_path: /dev/v4l/by-id/usb-Generic_USB_Camera_0001-video-index0
+fps: 30
+resolution:
+- 640
+- 480
+fourcc: MJPG
+# 新款 5x7 TacThru 直接在裁剪后的原始图像上跟踪，不再做旧版去畸变。
+do_undistortion: false
+get_max_k: 30
+receive_latency: 0.115
+with_marker: false
+put_downsample: false
+put_fps: 30
+tracking:
+  # 新款硬件采用 5x7=35 个 marker 点模板。
+  tracking_pts_path: cfg/sensor/br-5x7-ref_kpts.npy
+
+
+  grid_shape:
+  - 5
+  - 7
+optics:
+  CameraMatrix:
+  - - 450.0
+    - 0.0
+    - 320.0
+  - - 0.0
+    - 450.0
+    - 240.0
+  - - 0.0
+    - 0.0
+    - 1.0
+  CropCoords:
+  - 133
+  - 96
+  - 517
+  - 384
+  DistCoeffs:
+  - - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
