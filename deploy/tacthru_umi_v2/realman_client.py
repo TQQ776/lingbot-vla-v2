@@ -33,6 +33,8 @@ from .protocol import (
     PROTOCOL_VERSION,
     ROBOT_CONFIG,
     TACTILE_MARKER_COUNT,
+    TACTILE_MARKER_HISTORY_LENGTH,
+    TACTILE_MARKER_SAMPLE_HZ,
     TACTILE_SENSOR_COUNT,
     ActionResponse,
     Observation,
@@ -802,6 +804,8 @@ def _tactile_contract_from_health(health: dict) -> dict[str, Any]:
         )
     num_sensors = int(value.get("num_sensors", -1))
     num_markers = int(value.get("num_markers", -1))
+    marker_history_length = int(value.get("marker_history_length", 0))
+    marker_sample_hz = float(value.get("marker_sample_hz", 0.0))
     if enabled:
         if num_sensors != TACTILE_SENSOR_COUNT or num_markers != TACTILE_MARKER_COUNT:
             raise RuntimeError(
@@ -810,7 +814,31 @@ def _tactile_contract_from_health(health: dict) -> dict[str, Any]:
             )
         if not (use_rgb or use_markers):
             raise RuntimeError("Enabled tactile checkpoint has no active modality")
-    elif any((num_sensors != 0, num_markers != 0, use_rgb, use_markers)):
+        if use_markers:
+            if marker_history_length != TACTILE_MARKER_HISTORY_LENGTH:
+                raise RuntimeError(
+                    "Unsupported marker history length: "
+                    f"{marker_history_length}"
+                )
+            if not np.isclose(
+                marker_sample_hz,
+                TACTILE_MARKER_SAMPLE_HZ,
+                rtol=0.0,
+                atol=1e-6,
+            ):
+                raise RuntimeError(
+                    f"Unsupported marker sample rate: {marker_sample_hz}"
+                )
+    elif any(
+        (
+            num_sensors != 0,
+            num_markers != 0,
+            use_rgb,
+            use_markers,
+            marker_history_length != 0,
+            marker_sample_hz != 0.0,
+        )
+    ):
         raise RuntimeError(f"Disabled tactile checkpoint has inconsistent contract: {value}")
     return {
         "enabled": enabled,
@@ -818,6 +846,8 @@ def _tactile_contract_from_health(health: dict) -> dict[str, Any]:
         "num_markers": num_markers,
         "use_rgb": use_rgb,
         "use_markers": use_markers,
+        "marker_history_length": marker_history_length,
+        "marker_sample_hz": marker_sample_hz,
     }
 
 
@@ -832,12 +862,16 @@ def _synthetic_tactile_inputs(contract: dict[str, Any]) -> dict[str, np.ndarray]
             (TACTILE_SENSOR_COUNT, 480, 640, 3), dtype=np.uint8
         )
     if contract["use_markers"]:
-        marker_shape = (TACTILE_SENSOR_COUNT, TACTILE_MARKER_COUNT, 2)
+        marker_shape = (
+            TACTILE_SENSOR_COUNT,
+            TACTILE_MARKER_HISTORY_LENGTH,
+            TACTILE_MARKER_COUNT,
+            2,
+        )
         result.update(
-            marker_positions=np.zeros(marker_shape, dtype=np.float32),
-            marker_reference=np.zeros(marker_shape, dtype=np.float32),
-            previous_marker_positions=np.zeros(marker_shape, dtype=np.float32),
+            marker_displacement_history=np.zeros(marker_shape, dtype=np.float32),
             marker_valid_mask=np.ones(marker_shape[:-1], dtype=np.bool_),
+            marker_history_valid_mask=np.ones(marker_shape[:2], dtype=np.bool_),
         )
     return result
 
@@ -1061,7 +1095,7 @@ def run_realman(
                         f"--max-tactile-skew-s {args.max_tactile_skew_s:.4f}s"
                     )
                 if tactile_contract["use_markers"]:
-                    valid_count = int(tactile_frame.marker_valid_mask.sum())
+                    valid_count = int(tactile_frame.marker_valid_mask[0, -1].sum())
                     if valid_count < args.min_valid_markers:
                         raise SafetyViolation(
                             f"TacThru valid markers {valid_count} below "
@@ -1069,10 +1103,9 @@ def run_realman(
                         )
                 tactile_inputs = {
                     "tactile_rgb": tactile_frame.tactile_rgb,
-                    "marker_positions": tactile_frame.marker_positions,
-                    "marker_reference": tactile_frame.marker_reference,
-                    "previous_marker_positions": tactile_frame.previous_marker_positions,
+                    "marker_displacement_history": tactile_frame.marker_displacement_history,
                     "marker_valid_mask": tactile_frame.marker_valid_mask,
+                    "marker_history_valid_mask": tactile_frame.marker_history_valid_mask,
                     "tactile_sensor_mask": tactile_frame.tactile_sensor_mask,
                 }
                 tactile_inputs = {

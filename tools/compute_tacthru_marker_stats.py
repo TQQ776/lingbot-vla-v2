@@ -48,17 +48,17 @@ def compute_stats(
     episode_start: int,
     episode_end: int,
     chunk_frames: int,
+    eps: float,
 ) -> tuple[np.ndarray, np.ndarray, int, int]:
-    """Accumulate float64 statistics over valid [dx,dy,vx,vy] rows."""
+    """Accumulate float64 statistics over valid normalized [dx,dy] rows."""
 
-    total = np.zeros(4, dtype=np.float64)
-    total_sq = np.zeros(4, dtype=np.float64)
+    total = np.zeros(2, dtype=np.float64)
+    total_sq = np.zeros(2, dtype=np.float64)
     count = 0
     frame_count = 0
     for episode_index in range(episode_start, episode_end):
         start = 0 if episode_index == 0 else int(episode_ends[episode_index - 1])
         end = int(episode_ends[episode_index])
-        previous: np.ndarray | None = None
         for chunk_start in range(start, end, chunk_frames):
             chunk_end = min(end, chunk_start + chunk_frames)
             current = np.asarray(
@@ -69,28 +69,18 @@ def compute_stats(
                 raise ValueError(
                     f"Marker array must be [T,N,2], got {tuple(current.shape)}"
                 )
-            if previous is None:
-                previous_frames = np.concatenate([current[:1], current[:-1]], axis=0)
-            else:
-                previous_frames = np.concatenate(
-                    [previous[None], current[:-1]], axis=0
-                )
-            velocity = current - previous_frames
-            features = np.concatenate([current, velocity], axis=-1).reshape(-1, 4)
+            features = current.reshape(-1, 2)
             valid = np.isfinite(features).all(axis=-1)
             valid_features = features[valid].astype(np.float64, copy=False)
             total += valid_features.sum(axis=0)
             total_sq += np.square(valid_features).sum(axis=0)
             count += len(valid_features)
             frame_count += len(current)
-            previous = current[-1].copy()
     if count == 0:
         raise ValueError("No finite marker samples were found in the training split")
     mean = total / count
     variance = np.maximum(total_sq / count - np.square(mean), 0.0)
-    std = np.sqrt(variance)
-    if np.any(std <= 0):
-        raise ValueError(f"Training marker statistics contain zero std: {std.tolist()}")
+    std = np.maximum(np.sqrt(variance), float(eps))
     return mean, std, count, frame_count
 
 
@@ -105,9 +95,12 @@ def main() -> None:
     )
     parser.add_argument("--marker-key", default="tacthru_l_marker")
     parser.add_argument("--chunk-frames", type=int, default=4096)
+    parser.add_argument("--eps", type=float, default=1e-6)
     args = parser.parse_args()
     if args.chunk_frames <= 0:
         parser.error("--chunk-frames must be positive")
+    if not np.isfinite(args.eps) or args.eps <= 0:
+        parser.error("--eps must be positive and finite")
 
     source = args.source.expanduser().resolve()
     output = args.output.expanduser().resolve()
@@ -124,10 +117,11 @@ def main() -> None:
             start,
             end,
             args.chunk_frames,
+            args.eps,
         )
 
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "source": str(source),
         "marker_key": args.marker_key,
         "training_split_only": True,
@@ -136,7 +130,16 @@ def main() -> None:
         "train_episode_count": end - start,
         "train_frame_count": frame_count,
         "valid_marker_count": count,
-        "feature_order": ["dx", "dy", "vx", "vy"],
+        "marker_representation": "normalized_displacement",
+        "formula": "2 * (current_xy - reference_xy) / [image_width, image_height]",
+        "marker_order": "fixed",
+        "num_markers": 48,
+        "history_length": 8,
+        "marker_sample_hz": 30.0,
+        "history_padding": "earliest_valid_frame_replication",
+        "padding_included_in_statistics": False,
+        "feature_order": ["dx", "dy"],
+        "std_clamp_min": args.eps,
         "marker_mean": mean.tolist(),
         "marker_std": std.tolist(),
     }

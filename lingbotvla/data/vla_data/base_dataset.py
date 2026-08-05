@@ -317,6 +317,21 @@ class VLADataset(Dataset):
                 raise ValueError(
                     f"{TACTHRU_UMI_V2_DATA_NAME} must be a 30 Hz LeRobot dataset, got {fps} Hz"
                 )
+            tactile_settings = getattr(self.feature_transform, "tactile_settings", None)
+            if (
+                getattr(self.feature_transform, "tactile_enabled", False)
+                and getattr(tactile_settings, "use_markers", False)
+                and not math.isclose(
+                    float(tactile_settings.marker_sample_hz),
+                    fps,
+                    rel_tol=0.0,
+                    abs_tol=1e-6,
+                )
+            ):
+                raise ValueError(
+                    "TacThru marker_sample_hz must match the dataset frequency: "
+                    f"configured={tactile_settings.marker_sample_hz}, dataset={fps}"
+                )
             if self.chunk_size != TACTHRU_UMI_V2_CHUNK_SIZE:
                 raise ValueError(
                     f"{TACTHRU_UMI_V2_DATA_NAME} requires the official chunk_size=50, "
@@ -358,18 +373,23 @@ class VLADataset(Dataset):
             settings = self.feature_transform.tactile_settings
             available = set(self.dataset_meta.features)
             marker_keys = (
-                *settings.marker_positions_keys,
-                *settings.marker_reference_keys,
+                *settings.marker_displacement_keys,
                 *settings.marker_valid_mask_keys,
-                *settings.marker_flow_keys,
             )
-            # Query previous+current within the same episode.  LeRobot marks a
-            # repeated episode-boundary value as padded; the transform then
-            # deterministically produces zero initial velocity.
-            previous_offset = -1 if return_indices else -1.0 / float(self.dataset_meta.fps)
+            # LeRobot clamps negative same-episode queries to the episode's
+            # first row.  This yields earliest-frame replication without ever
+            # crossing an episode boundary.  Order is oldest to current.
+            history_offsets = list(
+                range(-(int(settings.marker_history_length) - 1), 1)
+            )
+            if not return_indices:
+                history_offsets = [
+                    offset / float(self.dataset_meta.fps)
+                    for offset in history_offsets
+                ]
             for key in marker_keys:
                 if key in available:
-                    delta_timestamps[key] = [previous_offset, 0]
+                    delta_timestamps[key] = history_offsets
         return delta_timestamps
 
     def get_video_delta_timestamps(self):

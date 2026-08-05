@@ -1,7 +1,10 @@
+from collections import deque
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
-from deploy.tacthru_umi_v2.tactile_source import build_tactile_frame
+from deploy.tacthru_umi_v2.tactile_source import TacThruSource, build_tactile_frame
 
 
 def sensor_history() -> dict[str, np.ndarray]:
@@ -26,7 +29,7 @@ def sensor_history() -> dict[str, np.ndarray]:
     }
 
 
-def test_build_tactile_frame_matches_training_flow_and_previous_frame() -> None:
+def test_build_tactile_frame_matches_training_displacement_history() -> None:
     frame = build_tactile_frame(
         sensor_history(),
         use_rgb=True,
@@ -36,16 +39,20 @@ def test_build_tactile_frame_matches_training_flow_and_previous_frame() -> None:
 
     assert frame.tactile_rgb.shape == (1, 480, 640, 3)
     assert frame.tactile_rgb.mean() == pytest.approx(20.0)
-    assert frame.marker_positions.shape == (1, 48, 2)
-    assert np.allclose(frame.marker_positions, 0.2)
-    assert np.allclose(frame.previous_marker_positions, 0.1)
-    assert np.count_nonzero(frame.marker_reference) == 0
+    assert frame.marker_displacement_history.shape == (1, 8, 48, 2)
+    assert np.allclose(frame.marker_displacement_history[:, :7], 0.1)
+    assert np.allclose(frame.marker_displacement_history[:, -1], 0.2)
+    assert frame.marker_valid_mask.shape == (1, 8, 48)
+    assert frame.marker_history_valid_mask.shape == (1, 8)
     assert frame.marker_valid_mask.all()
-    assert frame.debug["marker_representation"] == "normalized_flow_2x_over_frame_size"
+    assert frame.marker_history_valid_mask.all()
+    assert frame.debug["marker_representation"] == "normalized_displacement"
+    assert frame.debug["marker_history_length"] == 8
+    assert frame.debug["marker_sample_hz"] == pytest.approx(30.0)
     assert frame.debug["detected_keypoint_count"] == 48
 
 
-def test_episode_reset_sets_zero_velocity_and_invalid_markers_are_zeroed() -> None:
+def test_episode_reset_replicates_current_frame_and_zeros_invalid_markers() -> None:
     history = sensor_history()
     history["marker"][-1, 3] = np.nan
 
@@ -56,10 +63,12 @@ def test_episode_reset_sets_zero_velocity_and_invalid_markers_are_zeroed() -> No
         episode_reset=True,
     )
 
-    assert np.allclose(frame.previous_marker_positions, frame.marker_positions)
-    assert frame.marker_valid_mask[0, 3] == np.bool_(False)
-    assert np.count_nonzero(frame.marker_positions[0, 3]) == 0
-    assert np.count_nonzero(frame.previous_marker_positions[0, 3]) == 0
+    assert np.allclose(
+        frame.marker_displacement_history,
+        frame.marker_displacement_history[:, -1:],
+    )
+    assert not frame.marker_valid_mask[0, :, 3].any()
+    assert np.count_nonzero(frame.marker_displacement_history[0, :, 3]) == 0
 
 
 def test_build_tactile_frame_supports_rgb_only_checkpoint() -> None:
@@ -71,8 +80,9 @@ def test_build_tactile_frame_supports_rgb_only_checkpoint() -> None:
     )
 
     assert frame.tactile_rgb is not None
-    assert frame.marker_positions is None
+    assert frame.marker_displacement_history is None
     assert frame.marker_valid_mask is None
+    assert frame.marker_history_valid_mask is None
 
 
 def test_build_tactile_frame_rejects_reversed_history() -> None:
@@ -86,3 +96,59 @@ def test_build_tactile_frame_rejects_reversed_history() -> None:
             use_markers=True,
             episode_reset=False,
         )
+
+
+class _FakeSensor:
+    def __init__(self, data):
+        self.data = data
+        self.ring_buffer = SimpleNamespace(count=len(data["timestamp"]))
+
+    def get(self, k):
+        return {name: np.asarray(value)[-k:] for name, value in self.data.items()}
+
+
+def _source_with_data(data) -> TacThruSource:
+    source = object.__new__(TacThruSource)
+    source.use_rgb = False
+    source.use_markers = True
+    source._sensor = _FakeSensor(data)
+    source._marker_history = deque(maxlen=8)
+    source._marker_valid_history = deque(maxlen=8)
+    source._last_marker_timestamp = None
+    return source
+
+
+def test_live_source_rolls_only_new_timestamped_marker_frames() -> None:
+    data = sensor_history()
+    source = _source_with_data(data)
+    first = source.capture(timeout_s=0.1, episode_reset=True)
+    assert np.allclose(first.marker_displacement_history, 0.2)
+
+    # Re-reading the same ring buffer does not append duplicate timestamps.
+    duplicate = source.capture(timeout_s=0.1, episode_reset=False)
+    assert np.array_equal(
+        duplicate.marker_displacement_history,
+        first.marker_displacement_history,
+    )
+
+    next_data = sensor_history()
+    next_data["timestamp"] = np.asarray([data["timestamp"][-1] + 1.0 / 30.0])
+    next_data["rgb"] = next_data["rgb"][-1:]
+    next_data["marker"] = next_data["marker"][-1:] * 1.5
+    next_data["marker_ref"] = next_data["marker_ref"][-1:]
+    next_data["n_all_kpts"] = next_data["n_all_kpts"][-1:]
+    source._sensor = _FakeSensor(next_data)
+    rolled = source.capture(timeout_s=0.1, episode_reset=False)
+    assert np.allclose(rolled.marker_displacement_history[0, :-1], 0.2)
+    assert np.allclose(rolled.marker_displacement_history[0, -1], 0.3)
+
+
+def test_live_source_episode_reset_discards_previous_history() -> None:
+    source = _source_with_data(sensor_history())
+    source.capture(timeout_s=0.1, episode_reset=False)
+    reset_data = sensor_history()
+    reset_data["timestamp"] += 1.0
+    reset_data["marker"] *= 2.0
+    source._sensor = _FakeSensor(reset_data)
+    reset = source.capture(timeout_s=0.1, episode_reset=True)
+    assert np.allclose(reset.marker_displacement_history, 0.4)

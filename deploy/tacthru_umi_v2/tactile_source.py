@@ -2,27 +2,57 @@ from __future__ import annotations
 
 import sys
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, replace
 from multiprocessing.managers import SharedMemoryManager
 from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
 
-from .protocol import TACTILE_MARKER_COUNT, TACTILE_SENSOR_COUNT
+from .protocol import (
+    TACTILE_MARKER_COUNT,
+    TACTILE_MARKER_HISTORY_LENGTH,
+    TACTILE_MARKER_SAMPLE_HZ,
+    TACTILE_SENSOR_COUNT,
+)
 
 
 @dataclass(frozen=True)
 class TactileFrame:
     tactile_rgb: np.ndarray | None
-    marker_positions: np.ndarray | None
-    marker_reference: np.ndarray | None
-    previous_marker_positions: np.ndarray | None
+    marker_displacement_history: np.ndarray | None
     marker_valid_mask: np.ndarray | None
+    marker_history_valid_mask: np.ndarray | None
     tactile_sensor_mask: np.ndarray
     capture_timestamp: float
     receive_timestamp: float
     debug: dict[str, Any]
+
+
+def _normalized_marker_frames(
+    sensor_data: Mapping[str, Any],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return finite normalized displacement frames and per-marker validity."""
+
+    rgb_history = np.asarray(sensor_data.get("rgb"))
+    marker = np.asarray(sensor_data.get("marker"), dtype=np.float32)
+    reference = np.asarray(sensor_data.get("marker_ref"), dtype=np.float32)
+    expected_shape = (len(rgb_history), TACTILE_MARKER_COUNT, 2)
+    if marker.shape != expected_shape or reference.shape != expected_shape:
+        raise ValueError(
+            "TacThru marker and marker_ref must both have shape "
+            f"{expected_shape}, got {marker.shape} and {reference.shape}"
+        )
+    image_height, image_width = rgb_history.shape[1:3]
+    scale_xy = np.asarray([image_width, image_height], dtype=np.float32)
+    valid = np.isfinite(marker).all(axis=-1)
+    valid &= np.isfinite(reference).all(axis=-1)
+    displacement = (marker - reference) / scale_xy * 2.0
+    displacement = np.where(
+        valid[..., None], displacement, 0.0
+    ).astype(np.float32, copy=False)
+    return displacement, valid
 
 
 def build_tactile_frame(
@@ -31,6 +61,7 @@ def build_tactile_frame(
     use_rgb: bool,
     use_markers: bool,
     episode_reset: bool,
+    marker_history_length: int = TACTILE_MARKER_HISTORY_LENGTH,
 ) -> TactileFrame:
     if not (use_rgb or use_markers):
         raise ValueError("At least one tactile modality must be enabled")
@@ -62,39 +93,34 @@ def build_tactile_frame(
     if use_rgb:
         tactile_rgb = np.ascontiguousarray(rgb_history[-1:])
 
-    marker_positions = None
-    marker_reference = None
-    previous_marker_positions = None
+    marker_displacement_history = None
     marker_valid_mask = None
+    marker_history_valid_mask = None
     valid_count = None
     if use_markers:
-        marker = np.asarray(sensor_data.get("marker"), dtype=np.float32)
-        reference = np.asarray(sensor_data.get("marker_ref"), dtype=np.float32)
-        expected_shape = (len(timestamps), TACTILE_MARKER_COUNT, 2)
-        if marker.shape != expected_shape or reference.shape != expected_shape:
-            raise ValueError(
-                "TacThru marker and marker_ref must both have shape "
-                f"{expected_shape}, got {marker.shape} and {reference.shape}"
+        flow, valid = _normalized_marker_frames(sensor_data)
+        if episode_reset:
+            flow = flow[-1:]
+            valid = valid[-1:]
+        flow = flow[-marker_history_length:]
+        valid = valid[-marker_history_length:]
+        if len(flow) < marker_history_length:
+            pad_count = marker_history_length - len(flow)
+            flow = np.concatenate(
+                [np.repeat(flow[:1], pad_count, axis=0), flow], axis=0
+            )
+            valid = np.concatenate(
+                [np.repeat(valid[:1], pad_count, axis=0), valid], axis=0
             )
 
-        scale_xy = np.asarray([width, height], dtype=np.float32)
-        flow = (marker - reference) / scale_xy * 2.0
-        current = flow[-1]
-        previous = current if episode_reset or len(flow) == 1 else flow[-2]
-        current_valid = np.isfinite(marker[-1]).all(axis=-1)
-        current_valid &= np.isfinite(reference[-1]).all(axis=-1)
-        if not episode_reset and len(flow) > 1:
-            current_valid &= np.isfinite(marker[-2]).all(axis=-1)
-            current_valid &= np.isfinite(reference[-2]).all(axis=-1)
-        current = np.where(current_valid[:, None], current, 0.0)
-        previous = np.where(current_valid[:, None], previous, 0.0)
-
-        marker_positions = np.ascontiguousarray(current[None], dtype=np.float32)
-        # Converted training data stores normalized flow as position and zero as reference.
-        marker_reference = np.zeros_like(marker_positions)
-        previous_marker_positions = np.ascontiguousarray(previous[None], dtype=np.float32)
-        marker_valid_mask = np.ascontiguousarray(current_valid[None], dtype=np.bool_)
-        valid_count = int(current_valid.sum())
+        marker_displacement_history = np.ascontiguousarray(
+            flow[None], dtype=np.float32
+        )
+        marker_valid_mask = np.ascontiguousarray(valid[None], dtype=np.bool_)
+        marker_history_valid_mask = np.ones(
+            (TACTILE_SENSOR_COUNT, marker_history_length), dtype=np.bool_
+        )
+        valid_count = int(valid[-1].sum())
 
     detected = sensor_data.get("n_all_kpts")
     detected_count = None
@@ -105,17 +131,20 @@ def build_tactile_frame(
 
     return TactileFrame(
         tactile_rgb=tactile_rgb,
-        marker_positions=marker_positions,
-        marker_reference=marker_reference,
-        previous_marker_positions=previous_marker_positions,
+        marker_displacement_history=marker_displacement_history,
         marker_valid_mask=marker_valid_mask,
+        marker_history_valid_mask=marker_history_valid_mask,
         tactile_sensor_mask=np.ones((TACTILE_SENSOR_COUNT,), dtype=np.bool_),
         capture_timestamp=float(timestamps[-1]),
         receive_timestamp=time.time(),
         debug={
             "frame_shape_hwc": [int(height), int(width), 3],
             "history_frames": int(len(timestamps)),
-            "marker_representation": "normalized_flow_2x_over_frame_size",
+            "marker_representation": "normalized_displacement",
+            "marker_formula": "2 * (current_xy - reference_xy) / [image_width, image_height]",
+            "marker_history_length": int(marker_history_length),
+            "marker_sample_hz": float(TACTILE_MARKER_SAMPLE_HZ),
+            "marker_order": "fixed",
             "valid_marker_count": valid_count,
             "detected_keypoint_count": detected_count,
         },
@@ -137,6 +166,13 @@ class TacThruSource:
         self.use_markers = bool(use_markers)
         self._manager: SharedMemoryManager | None = None
         self._sensor = None
+        self._marker_history: deque[np.ndarray] = deque(
+            maxlen=TACTILE_MARKER_HISTORY_LENGTH
+        )
+        self._marker_valid_history: deque[np.ndarray] = deque(
+            maxlen=TACTILE_MARKER_HISTORY_LENGTH
+        )
+        self._last_marker_timestamp: float | None = None
         if not self.tacthru_repo.is_dir():
             raise NotADirectoryError(self.tacthru_repo)
         if not self.sensor_cfg_path.is_file():
@@ -147,6 +183,7 @@ class TacThruSource:
     def start(self) -> None:
         if self._sensor is not None:
             raise RuntimeError("TacThruSource is already started")
+        self._clear_marker_history()
         repo = str(self.tacthru_repo)
         if repo not in sys.path:
             sys.path.insert(0, repo)
@@ -195,14 +232,67 @@ class TacThruSource:
             if time.monotonic() >= deadline:
                 raise TimeoutError("Timed out waiting for a TacThru frame")
             time.sleep(0.01)
-        frame_count = min(2, int(sensor.ring_buffer.count))
+        frame_count = min(30, int(sensor.ring_buffer.count))
         data = sensor.get(k=frame_count)
-        return build_tactile_frame(
+        frame = build_tactile_frame(
             data,
             use_rgb=self.use_rgb,
             use_markers=self.use_markers,
             episode_reset=episode_reset,
         )
+        if not self.use_markers:
+            return frame
+
+        timestamps = np.asarray(data["timestamp"], dtype=np.float64)
+        history = np.asarray(frame.marker_displacement_history[0], dtype=np.float32)
+        valid_history = np.asarray(frame.marker_valid_mask[0], dtype=np.bool_)
+        if episode_reset:
+            self._clear_marker_history()
+            selected_history = history[-1:]
+            selected_valid = valid_history[-1:]
+            selected_timestamps = timestamps[-1:]
+        else:
+            if self._last_marker_timestamp is None:
+                selected = np.ones(len(timestamps), dtype=np.bool_)
+            else:
+                selected = timestamps > self._last_marker_timestamp + 1e-9
+            raw_history = _normalized_marker_frames(data)
+            selected_history = raw_history[0][selected]
+            selected_valid = raw_history[1][selected]
+            selected_timestamps = timestamps[selected]
+
+        for displacement, valid, timestamp in zip(
+            selected_history, selected_valid, selected_timestamps
+        ):
+            if not self._marker_history:
+                for _ in range(TACTILE_MARKER_HISTORY_LENGTH):
+                    self._marker_history.append(displacement.copy())
+                    self._marker_valid_history.append(valid.copy())
+            else:
+                self._marker_history.append(displacement.copy())
+                self._marker_valid_history.append(valid.copy())
+            self._last_marker_timestamp = float(timestamp)
+
+        if not self._marker_history:
+            raise RuntimeError("TacThru marker history is empty after capture")
+        displacement_history = np.stack(tuple(self._marker_history), axis=0)
+        valid_mask = np.stack(tuple(self._marker_valid_history), axis=0)
+        return replace(
+            frame,
+            marker_displacement_history=np.ascontiguousarray(
+                displacement_history[None], dtype=np.float32
+            ),
+            marker_valid_mask=np.ascontiguousarray(valid_mask[None], dtype=np.bool_),
+            marker_history_valid_mask=np.ones(
+                (TACTILE_SENSOR_COUNT, TACTILE_MARKER_HISTORY_LENGTH),
+                dtype=np.bool_,
+            ),
+        )
+
+    def _clear_marker_history(self) -> None:
+        self._marker_history.clear()
+        self._marker_valid_history.clear()
+        self._last_marker_timestamp = None
 
     def close(self) -> None:
         sensor, self._sensor = self._sensor, None
@@ -215,6 +305,7 @@ class TacThruSource:
                 sensor.join(timeout=1.0)
         if manager is not None:
             manager.shutdown()
+        self._clear_marker_history()
 
     def __enter__(self) -> "TacThruSource":
         self.start()

@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, MutableMapping, Sequence
 
 import torch
 from torch import Tensor, nn
@@ -37,8 +37,8 @@ def load_marker_statistics(path: str | Path) -> tuple[tuple[float, ...], tuple[f
     """Load train-split marker statistics from a JSON file.
 
     Accepted files contain either top-level ``marker_mean``/``marker_std`` or
-    a nested ``marker`` object with ``mean``/``std``.  Four values are required
-    in ``[dx, dy, vx, vy]`` order.
+    a nested ``marker`` object with ``mean``/``std``.  Two values are required
+    in ``[dx, dy]`` order.
     """
 
     stats_path = Path(path).expanduser()
@@ -53,8 +53,14 @@ def load_marker_statistics(path: str | Path) -> tuple[tuple[float, ...], tuple[f
         raise ValueError(
             f"{stats_path} must contain marker_mean/marker_std or marker.mean/marker.std"
         )
-    mean_tuple = _as_float_tuple(mean, name="marker_mean", length=4)
-    std_tuple = _as_float_tuple(std, name="marker_std", length=4)
+    if len(mean) != 2 or len(std) != 2:
+        raise ValueError(
+            "Expected marker statistics for [dx, dy], got "
+            f"mean={len(mean)} channels and std={len(std)} channels. "
+            "Please recompute tactile marker norm statistics."
+        )
+    mean_tuple = _as_float_tuple(mean, name="marker_mean", length=2)
+    std_tuple = _as_float_tuple(std, name="marker_std", length=2)
     if any(value <= 0 for value in std_tuple):
         raise ValueError("marker_std values must be positive")
     return mean_tuple, std_tuple
@@ -71,35 +77,30 @@ class TactileVTLAConfig:
     use_markers: bool = True
     share_vision_encoder: bool = True
     freeze_vision_encoder: bool = True
-    marker_input_features: int = 4
+    marker_history_length: int = 8
+    marker_sample_hz: float = 30.0
+    marker_input_features: int = 2
+    marker_feature_mode: str = "displacement_history"
+    marker_temporal_embedding: bool = True
     marker_hidden_dim: int = 512
-    marker_tokens_per_sensor: int = 1
     add_modality_embedding: bool = True
     add_sensor_side_embedding: bool = True
     marker_stats_path: str | None = None
-    marker_mean: tuple[float, ...] = (0.0, 0.0, 0.0, 0.0)
-    marker_std: tuple[float, ...] = (1.0, 1.0, 1.0, 1.0)
+    marker_mean: tuple[float, ...] = (0.0, 0.0)
+    marker_std: tuple[float, ...] = (1.0, 1.0)
     require_marker_stats: bool = False
     sensor_names: tuple[str, ...] = ("left", "right")
     rgb_keys: tuple[str, ...] = (
         "observation.images.tacthru_l_rgb",
         "observation.images.tacthru_r_rgb",
     )
-    marker_positions_keys: tuple[str, ...] = (
-        "observation.tactile.marker_positions_left",
-        "observation.tactile.marker_positions_right",
-    )
-    marker_reference_keys: tuple[str, ...] = (
-        "observation.tactile.marker_reference_left",
-        "observation.tactile.marker_reference_right",
+    marker_displacement_keys: tuple[str, ...] = (
+        "observation.tactile.marker_displacement_left",
+        "observation.tactile.marker_displacement_right",
     )
     marker_valid_mask_keys: tuple[str, ...] = (
         "observation.tactile.marker_valid_left",
         "observation.tactile.marker_valid_right",
-    )
-    marker_flow_keys: tuple[str, ...] = (
-        "observation.tactile.marker_flow_left",
-        "observation.tactile.marker_flow_right",
     )
     debug_shapes: bool = False
 
@@ -113,21 +114,42 @@ class TactileVTLAConfig:
         num_markers = int(values.get("num_markers", 48))
         use_rgb = _read_bool(values.get("use_rgb"), True)
         use_markers = _read_bool(values.get("use_markers"), True)
-        marker_input_features = int(values.get("marker_input_features", 4))
-        marker_tokens_per_sensor = int(values.get("marker_tokens_per_sensor", 1))
+        marker_history_length = int(values.get("marker_history_length", 8))
+        marker_sample_hz = float(values.get("marker_sample_hz", 30.0))
+        marker_input_features = int(values.get("marker_input_features", 2))
+        marker_feature_mode = str(
+            values.get("marker_feature_mode", "displacement_history")
+        )
 
         if num_sensors <= 0:
             raise ValueError("tactile.num_sensors must be positive")
         if num_markers <= 0:
             raise ValueError("tactile.num_markers must be positive")
+        if marker_history_length <= 0:
+            raise ValueError("tactile.marker_history_length must be positive")
+        if marker_sample_hz <= 0:
+            raise ValueError("tactile.marker_sample_hz must be positive")
         if enabled and not (use_rgb or use_markers):
             raise ValueError("tactile.enabled=true requires use_rgb or use_markers")
         if not _read_bool(values.get("share_vision_encoder"), True):
             raise ValueError("The minimal VTLA implementation requires share_vision_encoder=true")
-        if marker_input_features != 4:
-            raise ValueError("marker_input_features must be 4 ([dx, dy, vx, vy])")
-        if marker_tokens_per_sensor != 1:
-            raise ValueError("The minimal MarkerEncoder supports exactly one token per sensor")
+        if marker_feature_mode != "displacement_history":
+            raise ValueError(
+                "The VTLA marker path requires "
+                "marker_feature_mode='displacement_history'"
+            )
+        if marker_input_features != 2:
+            raise ValueError(
+                "marker_input_features must be 2 ([dx, dy]); explicit marker velocity "
+                "is not supported by displacement_history mode"
+            )
+        legacy_token_count = values.get("marker_tokens_per_sensor")
+        if legacy_token_count is not None and int(legacy_token_count) != marker_history_length:
+            raise ValueError(
+                "marker_tokens_per_sensor is deprecated; displacement_history emits exactly "
+                "marker_history_length tokens per sensor. Remove the old field and set "
+                "marker_history_length explicitly."
+            )
         if int(values.get("marker_hidden_dim", 512)) <= 0:
             raise ValueError("tactile.marker_hidden_dim must be positive")
 
@@ -159,9 +181,9 @@ class TactileVTLAConfig:
             # path and resolved values, so inference remains portable even
             # when the training workspace is not mounted.
             marker_mean = _as_float_tuple(
-                mean_value, name="marker_mean", length=4
+                mean_value, name="marker_mean", length=2
             )
-            marker_std = _as_float_tuple(std_value, name="marker_std", length=4)
+            marker_std = _as_float_tuple(std_value, name="marker_std", length=2)
         elif stats_path is not None:
             raise FileNotFoundError(
                 f"Marker statistics file does not exist: {Path(stats_path).expanduser()}"
@@ -172,14 +194,14 @@ class TactileVTLAConfig:
                     "Marker training requires tactile.marker_stats_path or explicit marker_mean/marker_std"
                 )
             marker_mean = _as_float_tuple(
-                mean_value or (0.0, 0.0, 0.0, 0.0),
+                mean_value or (0.0, 0.0),
                 name="marker_mean",
-                length=4,
+                length=2,
             )
             marker_std = _as_float_tuple(
-                std_value or (1.0, 1.0, 1.0, 1.0),
+                std_value or (1.0, 1.0),
                 name="marker_std",
-                length=4,
+                length=2,
             )
         if any(value <= 0 for value in marker_std):
             raise ValueError("marker_std values must be positive")
@@ -192,9 +214,14 @@ class TactileVTLAConfig:
             use_markers=use_markers,
             share_vision_encoder=True,
             freeze_vision_encoder=_read_bool(values.get("freeze_vision_encoder"), True),
+            marker_history_length=marker_history_length,
+            marker_sample_hz=marker_sample_hz,
             marker_input_features=marker_input_features,
+            marker_feature_mode=marker_feature_mode,
+            marker_temporal_embedding=_read_bool(
+                values.get("marker_temporal_embedding"), True
+            ),
             marker_hidden_dim=int(values.get("marker_hidden_dim", 512)),
-            marker_tokens_per_sensor=marker_tokens_per_sensor,
             add_modality_embedding=_read_bool(values.get("add_modality_embedding"), True),
             add_sensor_side_embedding=_read_bool(values.get("add_sensor_side_embedding"), True),
             marker_stats_path=str(stats_path) if stats_path is not None else None,
@@ -203,10 +230,10 @@ class TactileVTLAConfig:
             require_marker_stats=require_stats,
             sensor_names=sensor_names,
             rgb_keys=_keys("rgb_keys", cls.rgb_keys),
-            marker_positions_keys=_keys("marker_positions_keys", cls.marker_positions_keys),
-            marker_reference_keys=_keys("marker_reference_keys", cls.marker_reference_keys),
+            marker_displacement_keys=_keys(
+                "marker_displacement_keys", cls.marker_displacement_keys
+            ),
             marker_valid_mask_keys=_keys("marker_valid_mask_keys", cls.marker_valid_mask_keys),
-            marker_flow_keys=_keys("marker_flow_keys", cls.marker_flow_keys),
             debug_shapes=_read_bool(values.get("debug_shapes"), False),
         )
 
@@ -220,45 +247,28 @@ class TactileVTLAConfig:
         return result
 
 
-def marker_features_from_positions(
-    marker_positions: Tensor,
-    marker_reference: Tensor,
-    previous_marker_positions: Tensor | None,
+def validate_marker_displacement_history(
+    marker_displacement_history: Tensor,
     marker_valid_mask: Tensor | None,
 ) -> tuple[Tensor, Tensor]:
-    """Construct ``[dx, dy, vx, vy]`` features and a bool marker mask.
+    """Validate normalized ``[dx, dy]`` history and mask invalid markers."""
 
-    Inputs may be ``[B,N,2]`` or ``[B,S,N,2]``.  When a previous position is
-    unavailable (the first frame of an episode), velocity is deterministically
-    set to zero by reusing the current position.
-    """
-
-    if marker_positions.ndim not in (3, 4) or marker_positions.shape[-1] != 2:
+    if marker_displacement_history.ndim != 5 or marker_displacement_history.shape[-1] != 2:
         raise ValueError(
-            "marker_positions must have shape [B,N,2] or [B,S,N,2], "
-            f"got {tuple(marker_positions.shape)}"
+            "marker_displacement_history must have shape [B,S,H,N,2], "
+            f"got {tuple(marker_displacement_history.shape)}"
         )
-    if marker_reference.shape != marker_positions.shape:
-        raise ValueError("marker_reference must have the same shape as marker_positions")
-    if previous_marker_positions is None:
-        previous_marker_positions = marker_positions
-    if previous_marker_positions.shape != marker_positions.shape:
-        raise ValueError("previous_marker_positions must have the same shape as marker_positions")
-    if not torch.is_floating_point(marker_positions):
-        raise ValueError("marker_positions must be floating point")
-    if not (
-        torch.isfinite(marker_positions).all()
-        and torch.isfinite(marker_reference).all()
-        and torch.isfinite(previous_marker_positions).all()
-    ):
-        raise ValueError("marker positions/reference/previous must be finite")
+    if not torch.is_floating_point(marker_displacement_history):
+        raise ValueError("marker_displacement_history must be floating point")
+    if not torch.isfinite(marker_displacement_history).all():
+        raise ValueError("marker_displacement_history must be finite")
 
-    expected_mask_shape = marker_positions.shape[:-1]
+    expected_mask_shape = marker_displacement_history.shape[:-1]
     if marker_valid_mask is None:
         marker_valid_mask = torch.ones(
             expected_mask_shape,
             dtype=torch.bool,
-            device=marker_positions.device,
+            device=marker_displacement_history.device,
         )
     elif tuple(marker_valid_mask.shape) != tuple(expected_mask_shape):
         raise ValueError(
@@ -266,32 +276,33 @@ def marker_features_from_positions(
             f"got {tuple(marker_valid_mask.shape)}"
         )
     else:
-        marker_valid_mask = marker_valid_mask.to(device=marker_positions.device, dtype=torch.bool)
+        marker_valid_mask = marker_valid_mask.to(
+            device=marker_displacement_history.device, dtype=torch.bool
+        )
 
-    displacement = marker_positions - marker_reference
-    velocity = marker_positions - previous_marker_positions
-    features = torch.cat([displacement, velocity], dim=-1)
-    features = features * marker_valid_mask.unsqueeze(-1).to(dtype=features.dtype)
+    features = marker_displacement_history * marker_valid_mask.unsqueeze(-1).to(
+        dtype=marker_displacement_history.dtype
+    )
     return features, marker_valid_mask
 
 
 class MarkerEncoder(nn.Module):
-    """Shared MLP that emits one marker token per TacThru sensor."""
+    """Shared per-frame MLP that emits one token per marker history frame."""
 
     def __init__(
         self,
         num_markers: int,
         context_dim: int,
-        input_features: int = 4,
+        input_features: int = 2,
         hidden_dim: int = 512,
-        marker_mean: Sequence[float] = (0.0, 0.0, 0.0, 0.0),
-        marker_std: Sequence[float] = (1.0, 1.0, 1.0, 1.0),
+        marker_mean: Sequence[float] = (0.0, 0.0),
+        marker_std: Sequence[float] = (1.0, 1.0),
     ) -> None:
         super().__init__()
         if num_markers <= 0 or context_dim <= 0 or hidden_dim <= 0:
             raise ValueError("num_markers, context_dim, and hidden_dim must be positive")
-        if input_features != 4:
-            raise ValueError("MarkerEncoder input_features must be 4")
+        if input_features != 2:
+            raise ValueError("MarkerEncoder input_features must be 2 ([dx, dy])")
 
         mean = _as_float_tuple(marker_mean, name="marker_mean", length=input_features)
         std = _as_float_tuple(marker_std, name="marker_std", length=input_features)
@@ -319,10 +330,10 @@ class MarkerEncoder(nn.Module):
         marker_features: Tensor,
         marker_valid_mask: Tensor | None = None,
     ) -> Tensor:
-        """Encode ``[B,N,4]`` or ``[B,S,N,4]`` into marker tokens."""
+        """Encode ``[B,S,H,N,2]`` into ``[B,S,H,D]`` marker tokens."""
 
-        if marker_features.ndim not in (3, 4):
-            raise ValueError("marker_features must have shape [B,N,F] or [B,S,N,F]")
+        if marker_features.ndim != 5:
+            raise ValueError("marker_features must have shape [B,S,H,N,F]")
         if marker_features.shape[-2:] != (self.num_markers, self.input_features):
             raise ValueError(
                 f"Expected [...,{self.num_markers},{self.input_features}], "
@@ -351,8 +362,6 @@ class MarkerEncoder(nn.Module):
         tokens = self.encoder(flat).reshape(*leading_shape, self.context_dim)
         sensor_valid = marker_valid_mask.any(dim=-1)
         tokens = tokens * sensor_valid.unsqueeze(-1).to(dtype=tokens.dtype)
-        if marker_features.ndim == 3:
-            return tokens.unsqueeze(1)
         return tokens
 
 
@@ -404,6 +413,13 @@ class TactileTokenEncoder(nn.Module):
             )
         else:
             self.sensor_side_embeddings = None
+        if settings.marker_temporal_embedding:
+            self.marker_temporal_embedding: nn.Module | None = nn.Embedding(
+                settings.marker_history_length,
+                context_dim,
+            )
+        else:
+            self.marker_temporal_embedding = None
 
     def _sensor_embedding(self, dtype: torch.dtype, device: torch.device) -> Tensor:
         if self.sensor_side_embeddings is None:
@@ -448,40 +464,80 @@ class TactileTokenEncoder(nn.Module):
 
     def encode_markers(
         self,
-        marker_positions: Tensor,
-        marker_reference: Tensor,
-        previous_marker_positions: Tensor | None,
+        marker_displacement_history: Tensor,
         marker_valid_mask: Tensor | None,
+        marker_history_valid_mask: Tensor | None,
         tactile_sensor_mask: Tensor | None,
     ) -> tuple[Tensor, Tensor]:
-        """Return marker tokens/mask with shapes ``[B,S,D]`` and ``[B,S]``."""
+        """Return marker tokens/mask with shapes ``[B,S,H,D]`` and ``[B,S,H]``."""
 
         if self.marker_encoder is None:
             raise RuntimeError("Marker encoding is disabled")
-        if marker_positions.ndim != 4:
-            raise ValueError("marker_positions must have shape [B,S,N,2]")
-        batch_size, num_sensors = marker_positions.shape[:2]
+        if marker_displacement_history.ndim != 5:
+            raise ValueError(
+                "marker_displacement_history must have shape [B,S,H,N,2]"
+            )
+        batch_size, num_sensors, history_length, num_markers = (
+            marker_displacement_history.shape[:4]
+        )
         if num_sensors != self.settings.num_sensors:
             raise ValueError(
                 f"Expected {self.settings.num_sensors} tactile sensors, got {num_sensors}"
             )
-        features, marker_mask = marker_features_from_positions(
-            marker_positions,
-            marker_reference,
-            previous_marker_positions,
+        if history_length != self.settings.marker_history_length:
+            raise ValueError(
+                f"Expected marker history length {self.settings.marker_history_length}, "
+                f"got {history_length}"
+            )
+        if num_markers != self.settings.num_markers:
+            raise ValueError(
+                f"Expected {self.settings.num_markers} markers, got {num_markers}"
+            )
+        features, marker_mask = validate_marker_displacement_history(
+            marker_displacement_history,
             marker_valid_mask,
         )
         sensor_mask = self._sensor_mask(
             tactile_sensor_mask,
             batch_size=batch_size,
             num_sensors=num_sensors,
-            device=marker_positions.device,
+            device=marker_displacement_history.device,
         )
-        token_mask = sensor_mask & marker_mask.any(dim=-1)
+        if marker_history_valid_mask is None:
+            history_mask = torch.ones(
+                batch_size,
+                num_sensors,
+                history_length,
+                dtype=torch.bool,
+                device=marker_displacement_history.device,
+            )
+        else:
+            if tuple(marker_history_valid_mask.shape) != (
+                batch_size,
+                num_sensors,
+                history_length,
+            ):
+                raise ValueError(
+                    "marker_history_valid_mask must have shape "
+                    f"[{batch_size},{num_sensors},{history_length}]"
+                )
+            history_mask = marker_history_valid_mask.to(
+                device=marker_displacement_history.device,
+                dtype=torch.bool,
+            )
+        token_mask = (
+            sensor_mask.unsqueeze(-1)
+            & history_mask
+            & marker_mask.any(dim=-1)
+        )
         tokens = self.marker_encoder(features, marker_mask)
         if self.marker_modality_embedding is not None:
             tokens = tokens + self.marker_modality_embedding.to(dtype=tokens.dtype)
-        tokens = tokens + self._sensor_embedding(tokens.dtype, tokens.device).unsqueeze(0)
+        tokens = tokens + self._sensor_embedding(tokens.dtype, tokens.device)[None, :, None, :]
+        if self.marker_temporal_embedding is not None:
+            temporal_indices = torch.arange(history_length, device=tokens.device)
+            temporal = self.marker_temporal_embedding(temporal_indices).to(dtype=tokens.dtype)
+            tokens = tokens + temporal[None, None, :, :]
         tokens = tokens * token_mask.unsqueeze(-1).to(dtype=tokens.dtype)
         return tokens, token_mask
 
@@ -533,6 +589,102 @@ class TactileTokenEncoder(nn.Module):
         return tokens.flatten(1, 2), rgb_mask.flatten(1, 2)
 
 
+_LEGACY_MARKER_REINITIALIZED_SUFFIXES = (
+    "marker_encoder.encoder.0.weight",
+    "marker_encoder.encoder.0.bias",
+    "marker_encoder.marker_mean",
+    "marker_encoder.marker_std",
+    "marker_temporal_embedding.weight",
+)
+
+
+def load_vtla_checkpoint_state_dict(
+    model: nn.Module,
+    state_dict: Mapping[str, Tensor],
+    *,
+    allow_legacy_marker_reinit: bool = False,
+) -> dict[str, Any]:
+    """Load a VTLA checkpoint with a narrow, explicit legacy marker policy.
+
+    A one-token ``[dx,dy,vx,vy]`` checkpoint differs only in the first marker
+    MLP weight and its four-channel normalization buffers, and has no temporal
+    embedding.  With explicit opt-in those marker-only values are omitted so
+    the new two-channel layer, buffers, and temporal embedding keep their
+    configuration-derived initialization.  Every non-marker mismatch remains
+    a hard error.
+    """
+
+    target = model.state_dict()
+    supplied: MutableMapping[str, Tensor] = dict(state_dict)
+    shape_mismatches = {
+        name: (tuple(value.shape), tuple(target[name].shape))
+        for name, value in supplied.items()
+        if name in target and tuple(value.shape) != tuple(target[name].shape)
+    }
+    unexpected = sorted(set(supplied) - set(target))
+
+    first_weight_names = [
+        name
+        for name in shape_mismatches
+        if name.endswith("marker_encoder.encoder.0.weight")
+    ]
+    allowed_mismatch_suffixes = {
+        "marker_encoder.encoder.0.weight",
+        "marker_encoder.marker_mean",
+        "marker_encoder.marker_std",
+    }
+    only_legacy_marker_mismatches = bool(first_weight_names) and all(
+        any(name.endswith(suffix) for suffix in allowed_mismatch_suffixes)
+        for name in shape_mismatches
+    )
+    for name in first_weight_names:
+        old_shape, new_shape = shape_mismatches[name]
+        only_legacy_marker_mismatches &= (
+            len(old_shape) == 2
+            and len(new_shape) == 2
+            and old_shape[0] == new_shape[0]
+            and old_shape[1] == new_shape[1] * 2
+        )
+
+    if shape_mismatches and not only_legacy_marker_mismatches:
+        raise RuntimeError(
+            "Checkpoint contains unsupported shape mismatches: "
+            f"{shape_mismatches}"
+        )
+    if shape_mismatches and not allow_legacy_marker_reinit:
+        raise RuntimeError(
+            "Detected a legacy [dx,dy,vx,vy] marker checkpoint. The new "
+            "8-frame [dx,dy] path requires marker-only reinitialization. "
+            "Set LINGBOT_V2_ALLOW_LEGACY_MARKER_REINIT=1 to opt in; all "
+            "non-marker weights will remain loaded."
+        )
+
+    reinitialized: list[str] = []
+    if shape_mismatches:
+        for name in target:
+            if any(name.endswith(suffix) for suffix in _LEGACY_MARKER_REINITIALIZED_SUFFIXES):
+                supplied.pop(name, None)
+                reinitialized.append(name)
+
+    incompatible = model.load_state_dict(supplied, strict=False)
+    missing = sorted(incompatible.missing_keys)
+    unexpected = sorted(set(unexpected) | set(incompatible.unexpected_keys))
+    allowed_missing = set(reinitialized)
+    unsupported_missing = sorted(set(missing) - allowed_missing)
+    if unsupported_missing or unexpected:
+        raise RuntimeError(
+            "Checkpoint is incompatible after marker migration: "
+            f"missing={unsupported_missing}, unexpected={unexpected}"
+        )
+    return {
+        "legacy_marker_reinitialized": bool(reinitialized),
+        "reinitialized_keys": sorted(reinitialized),
+        "missing_keys": missing,
+        "unexpected_keys": unexpected,
+        "shape_mismatches": shape_mismatches,
+    }
+
+
 def concatenate_vtla_context(
     vision_language_context: Tensor,
     vision_language_mask: Tensor,
@@ -563,6 +715,7 @@ __all__ = [
     "TactileTokenEncoder",
     "TactileVTLAConfig",
     "concatenate_vtla_context",
+    "load_vtla_checkpoint_state_dict",
     "load_marker_statistics",
-    "marker_features_from_positions",
+    "validate_marker_displacement_history",
 ]

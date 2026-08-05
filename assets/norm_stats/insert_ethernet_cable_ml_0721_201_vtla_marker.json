@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "source": "/mnt/models/VTLA-RDT/tacthru/data/tasks/InsertEthernetCable/insert_ethernet_cable_ml_0721_201.zarr.zip",
   "marker_key": "tacthru_l_marker",
   "training_split_only": true,
@@ -8,22 +8,25 @@
   "train_episode_count": 201,
   "train_frame_count": 88363,
   "valid_marker_count": 4241424,
+  "marker_representation": "normalized_displacement",
+  "formula": "2 * (current_xy - reference_xy) / [image_width, image_height]",
+  "marker_order": "fixed",
+  "num_markers": 48,
+  "history_length": 8,
+  "marker_sample_hz": 30.0,
+  "history_padding": "earliest_valid_frame_replication",
+  "padding_included_in_statistics": false,
   "feature_order": [
     "dx",
-    "dy",
-    "vx",
-    "vy"
+    "dy"
   ],
+  "std_clamp_min": 1e-06,
   "marker_mean": [
     -0.00605073718862606,
-    0.0013775685928684302,
-    -1.0925331298195537e-05,
-    7.235680831459499e-06
+    0.0013775685928684302
   ],
   "marker_std": [
     0.009294681567495851,
-    0.00814176081027235,
-    0.0004733958917668574,
-    0.0005267826380395889
+    0.00814176081027235
   ]
 }

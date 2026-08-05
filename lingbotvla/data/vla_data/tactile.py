@@ -15,10 +15,9 @@ if TYPE_CHECKING:
 MODEL_TACTILE_KEYS = (
     "tactile_rgb",
     "tactile_rgb_grid_thw",
-    "marker_positions",
-    "marker_reference",
-    "previous_marker_positions",
+    "marker_displacement_history",
     "marker_valid_mask",
+    "marker_history_valid_mask",
     "tactile_sensor_mask",
     "tactile_rgb_mask",
 )
@@ -31,10 +30,8 @@ def tactile_dataset_keys(settings: "TactileVTLAConfig") -> set[str]:
     if settings.use_rgb:
         keys.update(settings.rgb_keys)
     if settings.use_markers:
-        keys.update(settings.marker_positions_keys)
-        keys.update(settings.marker_reference_keys)
+        keys.update(settings.marker_displacement_keys)
         keys.update(settings.marker_valid_mask_keys)
-        keys.update(settings.marker_flow_keys)
     return keys
 
 
@@ -43,35 +40,31 @@ def _as_tensor(value: Any, *, dtype: torch.dtype | None = None) -> Tensor:
     return tensor.to(dtype=dtype) if dtype is not None else tensor
 
 
-def _current_and_previous(value: Any, *, name: str) -> tuple[Tensor, Tensor]:
-    tensor = _as_tensor(value, dtype=torch.float32)
-    if tensor.ndim == 2 and tensor.shape[-1] == 2:
-        return tensor, tensor
-    if tensor.ndim == 3 and tensor.shape[-1] == 2 and tensor.shape[0] > 0:
-        return tensor[-1], tensor[-2] if tensor.shape[0] > 1 else tensor[-1]
-    raise ValueError(f"{name} must be [N,2] or [T,N,2], got {tuple(tensor.shape)}")
+def left_pad_marker_history(
+    value: Any,
+    *,
+    history_length: int,
+    trailing_shape: tuple[int, ...],
+    name: str,
+    dtype: torch.dtype,
+) -> Tensor:
+    """Return the latest history in oldest-to-newest order with earliest replication."""
 
-
-def _current_reference(value: Any, *, name: str) -> Tensor:
-    tensor = _as_tensor(value, dtype=torch.float32)
-    if tensor.ndim == 2 and tensor.shape[-1] == 2:
-        return tensor
-    if tensor.ndim == 3 and tensor.shape[-1] == 2 and tensor.shape[0] > 0:
-        return tensor[-1]
-    raise ValueError(f"{name} must be [N,2] or [T,N,2], got {tuple(tensor.shape)}")
-
-
-def _current_valid_mask(value: Any, *, num_markers: int, name: str) -> Tensor:
-    mask = _as_tensor(value).to(dtype=torch.bool)
-    if mask.ndim == 1:
-        result = mask
-    elif mask.ndim == 2 and mask.shape[0] > 0:
-        result = mask[-1]
-    else:
-        raise ValueError(f"{name} must be [N] or [T,N], got {tuple(mask.shape)}")
-    if tuple(result.shape) != (num_markers,):
-        raise ValueError(f"{name} must contain {num_markers} markers")
-    return result
+    tensor = _as_tensor(value, dtype=dtype)
+    if tuple(tensor.shape) == trailing_shape:
+        tensor = tensor.unsqueeze(0)
+    if tensor.ndim != len(trailing_shape) + 1 or tuple(tensor.shape[1:]) != trailing_shape:
+        raise ValueError(
+            f"{name} must be {trailing_shape} or [T,{','.join(map(str, trailing_shape))}], "
+            f"got {tuple(tensor.shape)}"
+        )
+    if tensor.shape[0] == 0:
+        raise ValueError(f"{name} history must not be empty")
+    tensor = tensor[-history_length:]
+    if tensor.shape[0] < history_length:
+        pad = tensor[:1].expand(history_length - tensor.shape[0], *trailing_shape)
+        tensor = torch.cat([pad, tensor], dim=0)
+    return tensor.contiguous()
 
 
 def _last_rgb_frame(value: Any, *, name: str) -> Tensor:
@@ -111,10 +104,9 @@ def prepare_tactile_sample(
 ) -> dict[str, Tensor]:
     """Create fixed-shape model tactile tensors for one sample.
 
-    Position/reference fields are preferred.  Existing TacThru datasets that
-    only store normalized marker flow are represented equivalently as
-    ``position=flow`` and ``reference=0``.  Their previous queried flow becomes
-    ``previous_marker_positions``, preserving both displacement and velocity.
+    Marker datasets store one normalized displacement frame per physical row.
+    LeRobot supplies up to ``marker_history_length`` same-episode rows, and this
+    transform left-pads short episode prefixes by replicating their first frame.
     """
 
     if not settings.enabled:
@@ -122,103 +114,100 @@ def prepare_tactile_sample(
 
     num_sensors = settings.num_sensors
     num_markers = settings.num_markers
+    history_length = settings.marker_history_length
     sensor_present = torch.zeros(num_sensors, dtype=torch.bool)
     result: dict[str, Tensor] = {}
 
     if settings.use_markers:
-        aggregate_positions = item.get("marker_positions")
-        aggregate_reference = item.get("marker_reference")
-        aggregate_previous = item.get("previous_marker_positions")
+        aggregate_history = item.get("marker_displacement_history")
         aggregate_valid = item.get("marker_valid_mask")
-        if aggregate_positions is not None:
-            aggregate_positions = _as_tensor(aggregate_positions, dtype=torch.float32)
-            if tuple(aggregate_positions.shape) != (num_sensors, num_markers, 2):
-                raise ValueError("marker_positions must have shape [S,N,2]")
-            if aggregate_reference is None:
-                raise KeyError("marker_positions requires marker_reference")
-            aggregate_reference = _as_tensor(aggregate_reference, dtype=torch.float32)
-            if tuple(aggregate_reference.shape) != tuple(aggregate_positions.shape):
-                raise ValueError("marker_reference must have shape [S,N,2]")
-            if aggregate_previous is not None:
-                aggregate_previous = _as_tensor(
-                    aggregate_previous, dtype=torch.float32
+        aggregate_history_valid = item.get("marker_history_valid_mask")
+        if aggregate_history is not None:
+            aggregate_history = _as_tensor(aggregate_history, dtype=torch.float32)
+            expected_history_shape = (
+                num_sensors,
+                history_length,
+                num_markers,
+                2,
+            )
+            if tuple(aggregate_history.shape) != expected_history_shape:
+                raise ValueError(
+                    "marker_displacement_history must have shape "
+                    f"{expected_history_shape}"
                 )
-                if tuple(aggregate_previous.shape) != tuple(aggregate_positions.shape):
-                    raise ValueError("previous_marker_positions must have shape [S,N,2]")
             if aggregate_valid is not None:
                 aggregate_valid = _as_tensor(aggregate_valid).to(dtype=torch.bool)
-                if tuple(aggregate_valid.shape) != (num_sensors, num_markers):
-                    raise ValueError("marker_valid_mask must have shape [S,N]")
-        positions: list[Tensor] = []
-        references: list[Tensor] = []
-        previous: list[Tensor] = []
+                if tuple(aggregate_valid.shape) != expected_history_shape[:-1]:
+                    raise ValueError("marker_valid_mask must have shape [S,H,N]")
+            if aggregate_history_valid is not None:
+                aggregate_history_valid = _as_tensor(aggregate_history_valid).to(
+                    dtype=torch.bool
+                )
+                if tuple(aggregate_history_valid.shape) != (
+                    num_sensors,
+                    history_length,
+                ):
+                    raise ValueError("marker_history_valid_mask must have shape [S,H]")
+        histories: list[Tensor] = []
         valid_masks: list[Tensor] = []
+        history_valid_masks: list[Tensor] = []
         for sensor_index in range(num_sensors):
-            pos_key = settings.marker_positions_keys[sensor_index]
-            ref_key = settings.marker_reference_keys[sensor_index]
+            displacement_key = settings.marker_displacement_keys[sensor_index]
             valid_key = settings.marker_valid_mask_keys[sensor_index]
-            flow_key = settings.marker_flow_keys[sensor_index]
 
-            if aggregate_positions is not None:
-                current = aggregate_positions[sensor_index]
-                reference = aggregate_reference[sensor_index]
-                previous_position = (
-                    current
-                    if aggregate_previous is None
-                    else aggregate_previous[sensor_index]
-                )
+            if aggregate_history is not None:
+                history = aggregate_history[sensor_index]
                 sensor_present[sensor_index] = True
-            elif pos_key in item:
-                if ref_key not in item:
-                    raise KeyError(f"{pos_key!r} requires {ref_key!r}")
-                current, previous_position = _current_and_previous(
-                    item[pos_key], name=pos_key
+            elif displacement_key in item:
+                history = left_pad_marker_history(
+                    item[displacement_key],
+                    history_length=history_length,
+                    trailing_shape=(num_markers, 2),
+                    name=displacement_key,
+                    dtype=torch.float32,
                 )
-                reference = _current_reference(item[ref_key], name=ref_key)
-                sensor_present[sensor_index] = True
-            elif flow_key in item:
-                current, previous_position = _current_and_previous(
-                    item[flow_key], name=flow_key
-                )
-                reference = torch.zeros_like(current)
                 sensor_present[sensor_index] = True
             else:
-                current = torch.zeros(num_markers, 2, dtype=torch.float32)
-                reference = torch.zeros_like(current)
-                previous_position = torch.zeros_like(current)
+                history = torch.zeros(
+                    history_length, num_markers, 2, dtype=torch.float32
+                )
 
-            if tuple(current.shape) != (num_markers, 2):
+            if tuple(history.shape) != (history_length, num_markers, 2):
                 raise ValueError(
-                    f"Sensor {sensor_index} marker shape must be [{num_markers},2], "
-                    f"got {tuple(current.shape)}"
+                    f"Sensor {sensor_index} marker history must be "
+                    f"[{history_length},{num_markers},2], got {tuple(history.shape)}"
                 )
             if aggregate_valid is not None:
                 valid = aggregate_valid[sensor_index]
             elif valid_key in item:
-                valid = _current_valid_mask(
+                valid = left_pad_marker_history(
                     item[valid_key],
-                    num_markers=num_markers,
+                    history_length=history_length,
+                    trailing_shape=(num_markers,),
                     name=valid_key,
+                    dtype=torch.bool,
                 )
             else:
-                valid = torch.isfinite(current).all(dim=-1)
+                valid = torch.isfinite(history).all(dim=-1)
                 valid &= bool(sensor_present[sensor_index])
-            if not (
-                torch.isfinite(current).all()
-                and torch.isfinite(reference).all()
-                and torch.isfinite(previous_position).all()
-            ):
+            if aggregate_history_valid is not None:
+                history_valid = aggregate_history_valid[sensor_index]
+            else:
+                history_valid = torch.full(
+                    (history_length,),
+                    bool(sensor_present[sensor_index]),
+                    dtype=torch.bool,
+                )
+            if not torch.isfinite(history).all():
                 raise ValueError(f"Sensor {sensor_index} marker values must be finite")
-            positions.append(current)
-            references.append(reference)
-            previous.append(previous_position)
+            histories.append(history)
             valid_masks.append(valid)
+            history_valid_masks.append(history_valid)
 
         result.update(
-            marker_positions=torch.stack(positions, dim=0),
-            marker_reference=torch.stack(references, dim=0),
-            previous_marker_positions=torch.stack(previous, dim=0),
+            marker_displacement_history=torch.stack(histories, dim=0),
             marker_valid_mask=torch.stack(valid_masks, dim=0),
+            marker_history_valid_mask=torch.stack(history_valid_masks, dim=0),
         )
 
     if settings.use_rgb:
@@ -292,7 +281,8 @@ def prepare_tactile_sample(
             raise ValueError("tactile_sensor_mask must have shape [S]")
         sensor_present &= explicit_sensor_mask
         if "marker_valid_mask" in result:
-            result["marker_valid_mask"] &= explicit_sensor_mask[:, None]
+            result["marker_valid_mask"] &= explicit_sensor_mask[:, None, None]
+            result["marker_history_valid_mask"] &= explicit_sensor_mask[:, None]
         if "tactile_rgb_mask" in result:
             result["tactile_rgb_mask"] &= explicit_sensor_mask
     result["tactile_sensor_mask"] = sensor_present
@@ -301,6 +291,7 @@ def prepare_tactile_sample(
 
 __all__ = [
     "MODEL_TACTILE_KEYS",
+    "left_pad_marker_history",
     "prepare_tactile_sample",
     "tactile_dataset_keys",
 ]

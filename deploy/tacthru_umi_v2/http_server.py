@@ -20,8 +20,7 @@ import yaml
 from .protocol import (
     CAMERA_KEY,
     CONTROL_FREQUENCY_HZ,
-    MARKER_POSITIONS_KEY,
-    MARKER_REFERENCE_KEY,
+    MARKER_DISPLACEMENT_KEY,
     MARKER_VALID_KEY,
     POSE_FRAME,
     POSE_SEMANTICS,
@@ -29,6 +28,8 @@ from .protocol import (
     PROTOCOL_VERSION,
     ROBOT_CONFIG,
     TACTILE_MARKER_COUNT,
+    TACTILE_MARKER_HISTORY_LENGTH,
+    TACTILE_MARKER_SAMPLE_HZ,
     TACTILE_RGB_KEY,
     TACTILE_SENSOR_COUNT,
     Observation,
@@ -828,6 +829,8 @@ def _tactile_contract_from_mapping(value: Any) -> dict[str, Any]:
             "num_markers": 0,
             "use_rgb": False,
             "use_markers": False,
+            "marker_history_length": 0,
+            "marker_sample_hz": 0.0,
         }
     contract = {
         "enabled": enabled,
@@ -835,6 +838,8 @@ def _tactile_contract_from_mapping(value: Any) -> dict[str, Any]:
         "num_markers": int(tactile.get("num_markers", TACTILE_MARKER_COUNT)),
         "use_rgb": bool(tactile.get("use_rgb", False)) if enabled else False,
         "use_markers": bool(tactile.get("use_markers", False)) if enabled else False,
+        "marker_history_length": int(tactile.get("marker_history_length", 0)),
+        "marker_sample_hz": float(tactile.get("marker_sample_hz", 0.0)),
     }
     _require_equal(contract["num_sensors"], TACTILE_SENSOR_COUNT, "tactile num_sensors")
     _require_equal(contract["num_markers"], TACTILE_MARKER_COUNT, "tactile num_markers")
@@ -844,14 +849,24 @@ def _tactile_contract_from_mapping(value: Any) -> dict[str, Any]:
         _require_equal(tactile.get("rgb_keys"), [TACTILE_RGB_KEY], "tactile rgb_keys")
     if contract["use_markers"]:
         _require_equal(
-            tactile.get("marker_positions_keys"),
-            [MARKER_POSITIONS_KEY],
-            "tactile marker_positions_keys",
+            contract["marker_history_length"],
+            TACTILE_MARKER_HISTORY_LENGTH,
+            "tactile marker_history_length",
         )
         _require_equal(
-            tactile.get("marker_reference_keys"),
-            [MARKER_REFERENCE_KEY],
-            "tactile marker_reference_keys",
+            contract["marker_sample_hz"],
+            TACTILE_MARKER_SAMPLE_HZ,
+            "tactile marker_sample_hz",
+        )
+        _require_equal(
+            tactile.get("marker_feature_mode"),
+            "displacement_history",
+            "tactile marker_feature_mode",
+        )
+        _require_equal(
+            tactile.get("marker_displacement_keys"),
+            [MARKER_DISPLACEMENT_KEY],
+            "tactile marker_displacement_keys",
         )
         _require_equal(
             tactile.get("marker_valid_mask_keys"),
@@ -867,10 +882,9 @@ def _model_tactile_observation(
 ) -> dict[str, np.ndarray]:
     values = {
         "tactile_rgb": observation.tactile_rgb,
-        "marker_positions": observation.marker_positions,
-        "marker_reference": observation.marker_reference,
-        "previous_marker_positions": observation.previous_marker_positions,
+        "marker_displacement_history": observation.marker_displacement_history,
         "marker_valid_mask": observation.marker_valid_mask,
+        "marker_history_valid_mask": observation.marker_history_valid_mask,
         "tactile_sensor_mask": observation.tactile_sensor_mask,
     }
     supplied = {name for name, value in values.items() if value is not None}
@@ -885,10 +899,9 @@ def _model_tactile_observation(
     if contract["use_markers"]:
         required.update(
             {
-                "marker_positions",
-                "marker_reference",
-                "previous_marker_positions",
+                "marker_displacement_history",
                 "marker_valid_mask",
+                "marker_history_valid_mask",
             }
         )
     missing = sorted(required - supplied)
@@ -917,12 +930,16 @@ def _synthetic_tactile_observation(
             (TACTILE_SENSOR_COUNT, 480, 640, 3), dtype=np.uint8
         )
     if contract["use_markers"]:
-        marker_shape = (TACTILE_SENSOR_COUNT, TACTILE_MARKER_COUNT, 2)
+        marker_shape = (
+            TACTILE_SENSOR_COUNT,
+            TACTILE_MARKER_HISTORY_LENGTH,
+            TACTILE_MARKER_COUNT,
+            2,
+        )
         result.update(
-            marker_positions=np.zeros(marker_shape, dtype=np.float32),
-            marker_reference=np.zeros(marker_shape, dtype=np.float32),
-            previous_marker_positions=np.zeros(marker_shape, dtype=np.float32),
+            marker_displacement_history=np.zeros(marker_shape, dtype=np.float32),
             marker_valid_mask=np.ones(marker_shape[:-1], dtype=np.bool_),
+            marker_history_valid_mask=np.ones(marker_shape[:2], dtype=np.bool_),
         )
     return result
 

@@ -28,6 +28,9 @@ import torch.nn.functional as F
 from lingbotvla.models.vla.lingbot_vla.configuration_lingbot_vla import LingbotVLAV2Config
 from lingbotvla.models.vla.lingbot_vla.modeling_lingbot_vla_v2 import LingbotVlaV2Policy
 from lingbotvla.models.vla.lingbot_vla.qwen3vl_in_vla import apply_lingbot_qwen3_vl_patch
+from lingbotvla.models.vla.lingbot_vla.tactile_vtla import (
+    load_vtla_checkpoint_state_dict,
+)
 
 from lingbotvla.data.vla_data.utils import FeatureTransform
 from lingbotvla.models import build_processor
@@ -67,18 +70,15 @@ class PolicyPreprocessMixin:
         expected_ranks = {
             "tactile_rgb": 4,
             "tactile_rgb_grid_thw": 3,
-            "marker_positions": 4,
-            "marker_reference": 4,
-            "previous_marker_positions": 4,
-            "marker_valid_mask": 3,
+            "marker_displacement_history": 5,
+            "marker_valid_mask": 4,
+            "marker_history_valid_mask": 3,
             "tactile_sensor_mask": 2,
             "tactile_rgb_mask": 2,
         }
         floating = {
             "tactile_rgb",
-            "marker_positions",
-            "marker_reference",
-            "previous_marker_positions",
+            "marker_displacement_history",
         }
         integer = {"tactile_rgb_grid_thw"}
         result = {}
@@ -290,7 +290,22 @@ class LingbotVLAv2Server:
             with safe_open(file_path, framework="pt", device="cpu") as f:
                 for key in f.keys():
                     merged_weights[key] = f.get_tensor(key)
-        self.vla.load_state_dict(merged_weights, strict=strict)
+        if not strict:
+            return self.vla.load_state_dict(merged_weights, strict=False)
+        report = load_vtla_checkpoint_state_dict(
+            self.vla,
+            merged_weights,
+            allow_legacy_marker_reinit=(
+                os.environ.get("LINGBOT_V2_ALLOW_LEGACY_MARKER_REINIT", "0") == "1"
+            ),
+        )
+        if report["legacy_marker_reinitialized"]:
+            print(
+                "[lingbot-v2-server] loaded legacy checkpoint with explicit "
+                "marker-only reinitialization: "
+                f"{report['reinitialized_keys']}"
+            )
+        return report
 
     def merge_qwen_config(self, qwen_config):
         if hasattr(qwen_config, 'to_dict'):

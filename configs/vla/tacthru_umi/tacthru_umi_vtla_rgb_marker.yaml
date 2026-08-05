@@ -9,7 +9,7 @@ model:
 data:
   datasets_type: vla
   data_name: tacthru_umi_v2
-  train_path: data/lerobot/insert_ethernet_cable_ml_0721_201_tacthru_umi_v2_tactile_v1
+  train_path: data/lerobot/insert_ethernet_cable_ml_0721_201_tacthru_umi_v2_tactile_history8_v2
   robot_config_root: configs/robot_configs
   joints:
     - arm.position: 14
@@ -40,7 +40,7 @@ data:
   image_augment: true
 
 train:
-  output_dir: output/insert_ethernet_vtla_rgb_marker_all201_v1
+  output_dir: output/insert_ethernet_vtla_rgb_marker_history8_all201_v1
   freeze_vlm: true
   train_action_expert: true
   new_modules_lr: 1.0e-4
@@ -54,18 +54,19 @@ train:
     use_markers: true
     share_vision_encoder: true
     freeze_vision_encoder: true
-    marker_input_features: 4
+    marker_history_length: 8
+    marker_sample_hz: 30.0
+    marker_input_features: 2
+    marker_feature_mode: displacement_history
+    marker_temporal_embedding: true
     marker_hidden_dim: 512
-    marker_tokens_per_sensor: 1
     add_modality_embedding: true
     add_sensor_side_embedding: true
     marker_stats_path: assets/norm_stats/insert_ethernet_cable_ml_0721_201_vtla_marker.json
     require_marker_stats: true
     rgb_keys: [observation.images.tactile_left]
-    marker_positions_keys: [observation.tactile.marker_positions_left]
-    marker_reference_keys: [observation.tactile.marker_reference_left]
+    marker_displacement_keys: [observation.tactile.marker_displacement_left]
     marker_valid_mask_keys: [observation.tactile.marker_valid_left]
-    marker_flow_keys: [observation.tactile.marker_flow_left]
     debug_shapes: false
   moe_monitor_interval: 1000
   enable_gradient_checkpointing: true

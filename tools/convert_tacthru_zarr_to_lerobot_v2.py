@@ -9,8 +9,9 @@ are stored as the same absolute 8D pose
 converting future absolute poses to local relative actions.
 
 The default remains wrist-RGB-only.  ``--include-tactile`` additionally writes
-TacThru RGB and canonical marker position/reference/valid fields for the
-minimal VTLA input path.
+    TacThru RGB and per-frame normalized marker displacement/valid fields for
+    the VTLA history input path.  The dataset transform constructs history
+    without duplicating frames in storage.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ from tqdm import tqdm
 SOURCE_FPS = 30
 DATASET_FPS = SOURCE_FPS
 ACTION_CHUNK_SIZE = 50
-CONVERTER_VERSION = 5
+CONVERTER_VERSION = 6
 MANIFEST_NAME = "tacthru_umi_v2_conversion.json"
 ROBOT_TYPE = "realman_tacthru_umi_v2"
 
@@ -46,8 +47,7 @@ IMAGE_FEATURES = (
     "observation.images.camera_wrist_left",
 )
 TACTILE_RGB_FEATURE = "observation.images.tactile_left"
-MARKER_POSITIONS_FEATURE = "observation.tactile.marker_positions_left"
-MARKER_REFERENCE_FEATURE = "observation.tactile.marker_reference_left"
+MARKER_DISPLACEMENT_FEATURE = "observation.tactile.marker_displacement_left"
 MARKER_VALID_FEATURE = "observation.tactile.marker_valid_left"
 EXCLUDED_TACTILE_SOURCE_KEYS = (
     "tacthru_l_rgb",
@@ -315,14 +315,13 @@ def build_features(
                     "shape": (3, tactile_height, tactile_width),
                     "names": ["channels", "height", "width"],
                 },
-                MARKER_POSITIONS_FEATURE: {
+                MARKER_DISPLACEMENT_FEATURE: {
                     "dtype": "float32",
                     "shape": (num_markers, 2),
-                    "names": None,
-                },
-                MARKER_REFERENCE_FEATURE: {
-                    "dtype": "float32",
-                    "shape": (num_markers, 2),
+                    # LeRobot's flat ``names`` list describes a one-dimensional
+                    # feature.  A rank-2 marker tensor has no unambiguous flat
+                    # axis naming in that schema, so retain the exact shape and
+                    # document marker/xy order in the conversion manifest.
                     "names": None,
                 },
                 MARKER_VALID_FEATURE: {
@@ -361,8 +360,7 @@ def validate_output(
         required_features.update(
             {
                 TACTILE_RGB_FEATURE,
-                MARKER_POSITIONS_FEATURE,
-                MARKER_REFERENCE_FEATURE,
+                MARKER_DISPLACEMENT_FEATURE,
                 MARKER_VALID_FEATURE,
             }
         )
@@ -468,16 +466,21 @@ def _requested_manifest(
             "copied_to_lerobot": include_tactile,
             "used_for_training": include_tactile,
             "rgb_feature": TACTILE_RGB_FEATURE if include_tactile else None,
-            "marker_positions_feature": MARKER_POSITIONS_FEATURE if include_tactile else None,
-            "marker_reference_feature": MARKER_REFERENCE_FEATURE if include_tactile else None,
+            "marker_displacement_feature": MARKER_DISPLACEMENT_FEATURE if include_tactile else None,
             "marker_valid_feature": MARKER_VALID_FEATURE if include_tactile else None,
             "num_markers": None if tactile_info is None else tactile_info["num_markers"],
-            "source_marker_representation": "normalized_marker_flow",
-            "canonical_equivalence": (
-                "position=flow, reference=0; previous position queried within episode"
+            "marker_representation": "normalized_displacement" if include_tactile else None,
+            "formula": (
+                "2 * (current_xy - reference_xy) / [image_width, image_height]"
                 if include_tactile
                 else None
             ),
+            "marker_order": "fixed" if include_tactile else None,
+            "history_storage": "per_frame_displacement" if include_tactile else None,
+            "history_construction": "dataset_same_episode_offsets" if include_tactile else None,
+            "history_length": 8 if include_tactile else None,
+            "history_padding": "earliest_valid_frame_replication" if include_tactile else None,
+            "marker_sample_hz": DATASET_FPS if include_tactile else None,
         },
     }
 
@@ -600,19 +603,19 @@ def convert(args: argparse.Namespace) -> None:
             poses = build_pose8(positions, rotvecs, gripper)
             wrist_images = np.asarray(data["camera0_rgb"][source_slice], dtype=np.uint8)
             tactile_images = None
-            marker_flow = None
+            marker_displacement = None
             if args.include_tactile:
                 tactile_images = np.asarray(
                     data["tacthru_l_rgb"][source_slice], dtype=np.uint8
                 )
-                marker_flow = np.asarray(
+                marker_displacement = np.asarray(
                     data["tacthru_l_marker"][source_slice], dtype=np.float32
                 )
 
             expected_length = source_episode["length"]
             lengths = [len(poses), len(wrist_images)]
             if tactile_images is not None:
-                lengths.extend([len(tactile_images), len(marker_flow)])
+                lengths.extend([len(tactile_images), len(marker_displacement)])
             if any(length != expected_length for length in lengths):
                 raise RuntimeError(
                     "Contiguous slice length mismatch for "
@@ -630,15 +633,14 @@ def convert(args: argparse.Namespace) -> None:
                         "task": args.task,
                     }
                 if args.include_tactile:
-                    marker = marker_flow[frame_offset]
+                    marker = marker_displacement[frame_offset]
                     valid = np.isfinite(marker).all(axis=-1)
                     if not valid.all():
                         marker = np.where(valid[:, None], marker, 0.0).astype(np.float32)
                     frame.update(
                         {
                             TACTILE_RGB_FEATURE: tactile_images[frame_offset],
-                            MARKER_POSITIONS_FEATURE: marker,
-                            MARKER_REFERENCE_FEATURE: np.zeros_like(marker),
+                            MARKER_DISPLACEMENT_FEATURE: marker,
                             MARKER_VALID_FEATURE: valid.astype(np.bool_),
                         }
                     )

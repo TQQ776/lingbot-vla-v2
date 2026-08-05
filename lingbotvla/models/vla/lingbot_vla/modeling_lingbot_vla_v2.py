@@ -554,10 +554,9 @@ class FlowMatchingV2(FlowMatchingV1):
         image_grid_thw=None,
         tactile_rgb=None,
         tactile_rgb_grid_thw=None,
-        marker_positions=None,
-        marker_reference=None,
-        previous_marker_positions=None,
+        marker_displacement_history=None,
         marker_valid_mask=None,
+        marker_history_valid_mask=None,
         tactile_sensor_mask=None,
         tactile_rgb_mask=None,
     ):
@@ -570,10 +569,9 @@ class FlowMatchingV2(FlowMatchingV1):
                 image_grid_thw=image_grid_thw,
                 tactile_rgb=tactile_rgb,
                 tactile_rgb_grid_thw=tactile_rgb_grid_thw,
-                marker_positions=marker_positions,
-                marker_reference=marker_reference,
-                previous_marker_positions=previous_marker_positions,
+                marker_displacement_history=marker_displacement_history,
                 marker_valid_mask=marker_valid_mask,
+                marker_history_valid_mask=marker_history_valid_mask,
                 tactile_sensor_mask=tactile_sensor_mask,
                 tactile_rgb_mask=tactile_rgb_mask,
             )
@@ -821,10 +819,9 @@ class FlowMatchingV2(FlowMatchingV1):
         image_grid_thw,
         tactile_rgb,
         tactile_rgb_grid_thw,
-        marker_positions,
-        marker_reference,
-        previous_marker_positions,
+        marker_displacement_history,
         marker_valid_mask,
+        marker_history_valid_mask,
         tactile_sensor_mask,
         tactile_rgb_mask,
     ):
@@ -1100,47 +1097,50 @@ class FlowMatchingV2(FlowMatchingV1):
 
         marker_token_mask = None
         if self.tactile_settings.use_markers:
-            if marker_positions is None:
-                marker_positions = torch.zeros(
+            if marker_displacement_history is None:
+                marker_displacement_history = torch.zeros(
                     bsize,
                     sensor_count,
+                    self.tactile_settings.marker_history_length,
                     self.tactile_settings.num_markers,
                     2,
                     dtype=torch.float32,
                     device=device,
                 )
-                marker_reference = torch.zeros_like(marker_positions)
-                previous_marker_positions = torch.zeros_like(marker_positions)
                 marker_valid_mask = torch.zeros(
-                    marker_positions.shape[:-1],
+                    marker_displacement_history.shape[:-1],
                     dtype=torch.bool,
                     device=device,
                 )
-            elif marker_reference is None:
-                raise ValueError("marker_reference is required with marker_positions")
+                marker_history_valid_mask = torch.zeros(
+                    marker_displacement_history.shape[:3],
+                    dtype=torch.bool,
+                    device=device,
+                )
             marker_module = self.tactile_encoder.marker_encoder
             if marker_module is None:
                 raise RuntimeError("MarkerEncoder is unavailable")
             marker_dtype = next(marker_module.parameters()).dtype
-            marker_positions = marker_positions.to(device=device, dtype=marker_dtype)
-            marker_reference = marker_reference.to(device=device, dtype=marker_dtype)
-            if previous_marker_positions is not None:
-                previous_marker_positions = previous_marker_positions.to(
-                    device=device,
-                    dtype=marker_dtype,
-                )
+            marker_displacement_history = marker_displacement_history.to(
+                device=device, dtype=marker_dtype
+            )
             if marker_valid_mask is not None:
                 marker_valid_mask = marker_valid_mask.to(device=device, dtype=torch.bool)
+            if marker_history_valid_mask is not None:
+                marker_history_valid_mask = marker_history_valid_mask.to(
+                    device=device, dtype=torch.bool
+                )
             marker_tokens, marker_token_mask = self.tactile_encoder.encode_markers(
-                marker_positions,
-                marker_reference,
-                previous_marker_positions,
+                marker_displacement_history,
                 marker_valid_mask,
+                marker_history_valid_mask,
                 sensor_mask,
             )
-            marker_tokens = marker_tokens.to(dtype=embed_dtype)
+            # Sensor-major, time-minor: left[t-7:t], then right[t-7:t].
+            marker_tokens = marker_tokens.to(dtype=embed_dtype).flatten(1, 2)
+            marker_token_mask = marker_token_mask.flatten(1, 2)
             marker_ids = torch.full(
-                (bsize, sensor_count),
+                (bsize, sensor_count * self.tactile_settings.marker_history_length),
                 cfg.text_config.eos_token_id,
                 dtype=torch.long,
                 device=device,
@@ -1337,7 +1337,12 @@ class FlowMatchingV2(FlowMatchingV1):
         if self.tactile_settings.debug_shapes and not self._tactile_debug_logged:
             marker_shape = None
             if marker_token_mask is not None:
-                marker_shape = (bsize, sensor_count, embs.shape[-1])
+                marker_shape = (
+                    bsize,
+                    sensor_count,
+                    self.tactile_settings.marker_history_length,
+                    embs.shape[-1],
+                )
             logger.info(
                 "VTLA prefix shapes: scene=%s tactile_rgb=%s marker=%s "
                 "context=%s mask=%s rgb_valid=%.4f marker_valid=%.4f",
@@ -1407,10 +1412,9 @@ class FlowMatchingV2(FlowMatchingV1):
         future_video_current_patch=None,
         tactile_rgb=None,
         tactile_rgb_grid_thw=None,
-        marker_positions=None,
-        marker_reference=None,
-        previous_marker_positions=None,
+        marker_displacement_history=None,
         marker_valid_mask=None,
+        marker_history_valid_mask=None,
         tactile_sensor_mask=None,
         tactile_rgb_mask=None,
     ) -> Tensor:
@@ -1440,10 +1444,9 @@ class FlowMatchingV2(FlowMatchingV1):
             image_grid_thw=image_grid_thw,
             tactile_rgb=tactile_rgb,
             tactile_rgb_grid_thw=tactile_rgb_grid_thw,
-            marker_positions=marker_positions,
-            marker_reference=marker_reference,
-            previous_marker_positions=previous_marker_positions,
+            marker_displacement_history=marker_displacement_history,
             marker_valid_mask=marker_valid_mask,
+            marker_history_valid_mask=marker_history_valid_mask,
             tactile_sensor_mask=tactile_sensor_mask,
             tactile_rgb_mask=tactile_rgb_mask,
         )
@@ -1582,10 +1585,9 @@ class FlowMatchingV2(FlowMatchingV1):
         image_grid_thw=None,
         tactile_rgb=None,
         tactile_rgb_grid_thw=None,
-        marker_positions=None,
-        marker_reference=None,
-        previous_marker_positions=None,
+        marker_displacement_history=None,
         marker_valid_mask=None,
+        marker_history_valid_mask=None,
         tactile_sensor_mask=None,
         tactile_rgb_mask=None,
     ) -> Tensor:
@@ -1617,10 +1619,9 @@ class FlowMatchingV2(FlowMatchingV1):
             image_grid_thw=image_grid_thw,
             tactile_rgb=tactile_rgb,
             tactile_rgb_grid_thw=tactile_rgb_grid_thw,
-            marker_positions=marker_positions,
-            marker_reference=marker_reference,
-            previous_marker_positions=previous_marker_positions,
+            marker_displacement_history=marker_displacement_history,
             marker_valid_mask=marker_valid_mask,
+            marker_history_valid_mask=marker_history_valid_mask,
             tactile_sensor_mask=tactile_sensor_mask,
             tactile_rgb_mask=tactile_rgb_mask,
         )
@@ -1946,10 +1947,9 @@ class LingbotVlaV2Policy(PreTrainedModel):
         future_video_current_patch=None,
         tactile_rgb=None,
         tactile_rgb_grid_thw=None,
-        marker_positions=None,
-        marker_reference=None,
-        previous_marker_positions=None,
+        marker_displacement_history=None,
         marker_valid_mask=None,
+        marker_history_valid_mask=None,
         tactile_sensor_mask=None,
         tactile_rgb_mask=None,
         **kwargs
@@ -1988,10 +1988,9 @@ class LingbotVlaV2Policy(PreTrainedModel):
             future_video_current_patch=future_video_current_patch,
             tactile_rgb=tactile_rgb,
             tactile_rgb_grid_thw=tactile_rgb_grid_thw,
-            marker_positions=marker_positions,
-            marker_reference=marker_reference,
-            previous_marker_positions=previous_marker_positions,
+            marker_displacement_history=marker_displacement_history,
             marker_valid_mask=marker_valid_mask,
+            marker_history_valid_mask=marker_history_valid_mask,
             tactile_sensor_mask=tactile_sensor_mask,
             tactile_rgb_mask=tactile_rgb_mask,
         )
@@ -2035,10 +2034,9 @@ class LingbotVlaV2Policy(PreTrainedModel):
         image_grid_thw=None,
         tactile_rgb=None,
         tactile_rgb_grid_thw=None,
-        marker_positions=None,
-        marker_reference=None,
-        previous_marker_positions=None,
+        marker_displacement_history=None,
         marker_valid_mask=None,
+        marker_history_valid_mask=None,
         tactile_sensor_mask=None,
         tactile_rgb_mask=None,
     ) -> Tensor:
@@ -2052,10 +2050,9 @@ class LingbotVlaV2Policy(PreTrainedModel):
             image_grid_thw=image_grid_thw,
             tactile_rgb=tactile_rgb,
             tactile_rgb_grid_thw=tactile_rgb_grid_thw,
-            marker_positions=marker_positions,
-            marker_reference=marker_reference,
-            previous_marker_positions=previous_marker_positions,
+            marker_displacement_history=marker_displacement_history,
             marker_valid_mask=marker_valid_mask,
+            marker_history_valid_mask=marker_history_valid_mask,
             tactile_sensor_mask=tactile_sensor_mask,
             tactile_rgb_mask=tactile_rgb_mask,
         )

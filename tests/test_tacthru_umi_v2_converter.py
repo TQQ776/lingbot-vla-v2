@@ -9,7 +9,9 @@ from tools.convert_tacthru_zarr_to_lerobot_v2 import (  # noqa: E402
     ACTION_CHUNK_SIZE,
     CONVERTER_VERSION,
     DATASET_FPS,
+    MARKER_DISPLACEMENT_FEATURE,
     _requested_manifest,
+    build_features,
     build_pose8,
     make_episode_plan,
 )
@@ -55,7 +57,7 @@ def test_manifest_declares_v2_native_temporal_layout() -> None:
     )
 
     assert manifest["converter"] == "tacthru_umi_v2_native_30hz"
-    assert manifest["converter_version"] == CONVERTER_VERSION == 5
+    assert manifest["converter_version"] == CONVERTER_VERSION == 6
     assert manifest["source_fps"] == manifest["output_fps"] == DATASET_FPS == 30
     assert manifest["source_episodes"] == manifest["output_episodes"] == 2
     assert manifest["source_frames"] == manifest["output_frames"] == 115
@@ -97,8 +99,26 @@ def test_manifest_declares_vtla_tactile_contract_when_enabled() -> None:
     assert tactile["enabled"] is True
     assert tactile["copied_to_lerobot"] is True
     assert tactile["num_markers"] == 48
-    assert tactile["canonical_equivalence"].startswith("position=flow")
+    assert tactile["marker_representation"] == "normalized_displacement"
+    assert tactile["formula"] == (
+        "2 * (current_xy - reference_xy) / [image_width, image_height]"
+    )
+    assert tactile["history_storage"] == "per_frame_displacement"
+    assert tactile["history_construction"] == "dataset_same_episode_offsets"
+    assert tactile["history_length"] == 8
+    assert tactile["history_padding"] == "earliest_valid_frame_replication"
+    assert tactile["marker_sample_hz"] == 30
     assert "observation.images.tactile_left" in manifest["image_features"]
+
+
+def test_marker_displacement_feature_has_exact_rank_two_schema() -> None:
+    features = build_features(
+        (224, 224, 3),
+        {"tactile_rgb_shape": (480, 640, 3), "num_markers": 48},
+    )
+    marker = features[MARKER_DISPLACEMENT_FEATURE]
+    assert marker["shape"] == (48, 2)
+    assert marker["names"] is None
 
 
 def test_pose8_is_xyzw_normalized_and_canonical() -> None:

@@ -14,11 +14,10 @@ from .transforms import ACTION_DIM, validate_action_chunk, validate_state8
 
 
 PROTOCOL_NAME = "lingbot-vla-v2-tacthru-umi"
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 CAMERA_KEY = "observation.images.camera_wrist_left"
 TACTILE_RGB_KEY = "observation.images.tactile_left"
-MARKER_POSITIONS_KEY = "observation.tactile.marker_positions_left"
-MARKER_REFERENCE_KEY = "observation.tactile.marker_reference_left"
+MARKER_DISPLACEMENT_KEY = "observation.tactile.marker_displacement_left"
 MARKER_VALID_KEY = "observation.tactile.marker_valid_left"
 ROBOT_CONFIG = "tacthru_umi_v2"
 POSE_FRAME = "episode_start_new_tcp"
@@ -27,6 +26,8 @@ IMAGE_COLOR_SPACE = "rgb"
 IMAGE_ENCODING = "jpeg"
 TACTILE_SENSOR_COUNT = 1
 TACTILE_MARKER_COUNT = 48
+TACTILE_MARKER_HISTORY_LENGTH = 8
+TACTILE_MARKER_SAMPLE_HZ = 30.0
 CONTROL_FREQUENCY_HZ = 30.0
 MAX_INSTRUCTION_CHARS = 4096
 MAX_IMAGE_PIXELS = 20_000_000
@@ -40,10 +41,9 @@ class Observation:
     state: np.ndarray
     wrist_rgb: np.ndarray
     tactile_rgb: np.ndarray | None = None
-    marker_positions: np.ndarray | None = None
-    marker_reference: np.ndarray | None = None
-    previous_marker_positions: np.ndarray | None = None
+    marker_displacement_history: np.ndarray | None = None
     marker_valid_mask: np.ndarray | None = None
+    marker_history_valid_mask: np.ndarray | None = None
     tactile_sensor_mask: np.ndarray | None = None
     control_frequency_hz: float = 30.0
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
@@ -298,10 +298,9 @@ def decode_rgb_image(
 def _tactile_to_payload(obs: Observation, *, jpeg_quality: int) -> dict[str, Any] | None:
     values = {
         "rgb": obs.tactile_rgb,
-        "marker_positions": obs.marker_positions,
-        "marker_reference": obs.marker_reference,
-        "previous_marker_positions": obs.previous_marker_positions,
+        "marker_displacement_history": obs.marker_displacement_history,
         "marker_valid_mask": obs.marker_valid_mask,
+        "marker_history_valid_mask": obs.marker_history_valid_mask,
         "sensor_mask": obs.tactile_sensor_mask,
     }
     supplied = {name for name, value in values.items() if value is not None}
@@ -323,34 +322,52 @@ def _tactile_to_payload(obs: Observation, *, jpeg_quality: int) -> dict[str, Any
         payload["rgb"] = [encode_rgb_image(frame, jpeg_quality=jpeg_quality) for frame in rgb]
 
     marker_names = {
-        "marker_positions": obs.marker_positions,
-        "marker_reference": obs.marker_reference,
-        "previous_marker_positions": obs.previous_marker_positions,
+        "marker_displacement_history": obs.marker_displacement_history,
         "marker_valid_mask": obs.marker_valid_mask,
+        "marker_history_valid_mask": obs.marker_history_valid_mask,
     }
     marker_supplied = {name for name, value in marker_names.items() if value is not None}
     if marker_supplied and marker_supplied != set(marker_names):
         missing = sorted(set(marker_names) - marker_supplied)
         raise ValueError(f"Marker tactile input is incomplete; missing {missing}")
     if marker_supplied:
-        marker_shape = (TACTILE_SENSOR_COUNT, TACTILE_MARKER_COUNT, 2)
-        for name in (
-            "marker_positions",
-            "marker_reference",
-            "previous_marker_positions",
-        ):
-            value = np.asarray(marker_names[name], dtype=np.float32)
-            if value.shape != marker_shape or not np.all(np.isfinite(value)):
-                raise ValueError(f"{name} must be finite float data with shape {marker_shape}, got {value.shape}")
-            payload[name] = value.astype(float).tolist()
+        marker_shape = (
+            TACTILE_SENSOR_COUNT,
+            TACTILE_MARKER_HISTORY_LENGTH,
+            TACTILE_MARKER_COUNT,
+            2,
+        )
+        history = np.asarray(obs.marker_displacement_history, dtype=np.float32)
+        if history.shape != marker_shape or not np.all(np.isfinite(history)):
+            raise ValueError(
+                "marker_displacement_history must be finite float data with shape "
+                f"{marker_shape}, got {history.shape}"
+            )
+        payload["marker_displacement_history"] = history.astype(float).tolist()
         valid = np.asarray(obs.marker_valid_mask)
-        expected_valid_shape = (TACTILE_SENSOR_COUNT, TACTILE_MARKER_COUNT)
+        expected_valid_shape = marker_shape[:-1]
         if valid.dtype != np.bool_ or valid.shape != expected_valid_shape:
             raise ValueError(
                 f"marker_valid_mask must be bool with shape {expected_valid_shape}, "
                 f"got {valid.dtype} {valid.shape}"
             )
         payload["marker_valid_mask"] = valid.astype(bool).tolist()
+        history_valid = np.asarray(obs.marker_history_valid_mask)
+        expected_history_valid_shape = (
+            TACTILE_SENSOR_COUNT,
+            TACTILE_MARKER_HISTORY_LENGTH,
+        )
+        if (
+            history_valid.dtype != np.bool_
+            or history_valid.shape != expected_history_valid_shape
+        ):
+            raise ValueError(
+                "marker_history_valid_mask must be bool with shape "
+                f"{expected_history_valid_shape}, got "
+                f"{history_valid.dtype} {history_valid.shape}"
+            )
+        payload["marker_history_valid_mask"] = history_valid.astype(bool).tolist()
+        payload["marker_sample_hz"] = TACTILE_MARKER_SAMPLE_HZ
     if "rgb" not in payload and not marker_supplied:
         raise ValueError("Tactile input must include RGB and/or marker data")
     return payload
@@ -359,10 +376,9 @@ def _tactile_to_payload(obs: Observation, *, jpeg_quality: int) -> dict[str, Any
 def _tactile_from_payload(value: Any) -> dict[str, np.ndarray | None]:
     empty = {
         "tactile_rgb": None,
-        "marker_positions": None,
-        "marker_reference": None,
-        "previous_marker_positions": None,
+        "marker_displacement_history": None,
         "marker_valid_mask": None,
+        "marker_history_valid_mask": None,
         "tactile_sensor_mask": None,
     }
     if value is None:
@@ -371,10 +387,10 @@ def _tactile_from_payload(value: Any) -> dict[str, np.ndarray | None]:
         raise ValueError("tactile must be a JSON object")
     allowed = {
         "rgb",
-        "marker_positions",
-        "marker_reference",
-        "previous_marker_positions",
+        "marker_displacement_history",
         "marker_valid_mask",
+        "marker_history_valid_mask",
+        "marker_sample_hz",
         "sensor_mask",
     }
     unexpected = set(value) - allowed
@@ -394,30 +410,62 @@ def _tactile_from_payload(value: Any) -> dict[str, np.ndarray | None]:
         )
 
     marker_fields = (
-        "marker_positions",
-        "marker_reference",
-        "previous_marker_positions",
+        "marker_displacement_history",
         "marker_valid_mask",
+        "marker_history_valid_mask",
     )
     marker_supplied = {name for name in marker_fields if value.get(name) is not None}
     if marker_supplied and marker_supplied != set(marker_fields):
         missing = sorted(set(marker_fields) - marker_supplied)
         raise ValueError(f"Marker tactile input is incomplete; missing {missing}")
     if marker_supplied:
-        marker_shape = (TACTILE_SENSOR_COUNT, TACTILE_MARKER_COUNT, 2)
-        for name in marker_fields[:3]:
-            array = np.asarray(value[name], dtype=np.float32)
-            if array.shape != marker_shape or not np.all(np.isfinite(array)):
-                raise ValueError(f"tactile.{name} must be finite with shape {marker_shape}, got {array.shape}")
-            result[name] = np.ascontiguousarray(array)
+        marker_shape = (
+            TACTILE_SENSOR_COUNT,
+            TACTILE_MARKER_HISTORY_LENGTH,
+            TACTILE_MARKER_COUNT,
+            2,
+        )
+        history = np.asarray(value["marker_displacement_history"], dtype=np.float32)
+        if history.shape != marker_shape or not np.all(np.isfinite(history)):
+            raise ValueError(
+                "tactile.marker_displacement_history must be finite with shape "
+                f"{marker_shape}, got {history.shape}"
+            )
+        result["marker_displacement_history"] = np.ascontiguousarray(history)
         valid = np.asarray(value["marker_valid_mask"])
-        expected_valid_shape = (TACTILE_SENSOR_COUNT, TACTILE_MARKER_COUNT)
+        expected_valid_shape = marker_shape[:-1]
         if valid.dtype != np.bool_ or valid.shape != expected_valid_shape:
             raise ValueError(
                 f"tactile.marker_valid_mask must be bool with shape {expected_valid_shape}, "
                 f"got {valid.dtype} {valid.shape}"
             )
         result["marker_valid_mask"] = np.ascontiguousarray(valid)
+        history_valid = np.asarray(value["marker_history_valid_mask"])
+        expected_history_valid_shape = (
+            TACTILE_SENSOR_COUNT,
+            TACTILE_MARKER_HISTORY_LENGTH,
+        )
+        if (
+            history_valid.dtype != np.bool_
+            or history_valid.shape != expected_history_valid_shape
+        ):
+            raise ValueError(
+                "tactile.marker_history_valid_mask must be bool with shape "
+                f"{expected_history_valid_shape}, got "
+                f"{history_valid.dtype} {history_valid.shape}"
+            )
+        result["marker_history_valid_mask"] = np.ascontiguousarray(history_valid)
+        marker_sample_hz = float(value.get("marker_sample_hz", float("nan")))
+        if not np.isclose(
+            marker_sample_hz,
+            TACTILE_MARKER_SAMPLE_HZ,
+            rtol=0.0,
+            atol=1e-6,
+        ):
+            raise ValueError(
+                "tactile.marker_sample_hz must be "
+                f"{TACTILE_MARKER_SAMPLE_HZ:g}, got {marker_sample_hz}"
+            )
     if result["tactile_rgb"] is None and not marker_supplied:
         raise ValueError("tactile must include RGB and/or marker data")
     return result

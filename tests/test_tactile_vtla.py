@@ -46,7 +46,10 @@ MarkerEncoder = _tactile_model.MarkerEncoder
 TactileTokenEncoder = _tactile_model.TactileTokenEncoder
 TactileVTLAConfig = _tactile_model.TactileVTLAConfig
 concatenate_vtla_context = _tactile_model.concatenate_vtla_context
-marker_features_from_positions = _tactile_model.marker_features_from_positions
+load_marker_statistics = _tactile_model.load_marker_statistics
+load_vtla_checkpoint_state_dict = _tactile_model.load_vtla_checkpoint_state_dict
+validate_marker_displacement_history = _tactile_model.validate_marker_displacement_history
+left_pad_marker_history = _tactile_data.left_pad_marker_history
 prepare_tactile_sample = _tactile_data.prepare_tactile_sample
 
 
@@ -57,14 +60,15 @@ def _settings(**overrides) -> TactileVTLAConfig:
         "num_markers": 4,
         "use_rgb": True,
         "use_markers": True,
+        "marker_history_length": 8,
+        "marker_input_features": 2,
+        "marker_feature_mode": "displacement_history",
         "marker_hidden_dim": 16,
-        "marker_mean": [0.0, 0.0, 0.0, 0.0],
-        "marker_std": [1.0, 1.0, 1.0, 1.0],
+        "marker_mean": [0.0, 0.0],
+        "marker_std": [1.0, 1.0],
         "rgb_keys": ["rgb_l", "rgb_r"],
-        "marker_positions_keys": ["pos_l", "pos_r"],
-        "marker_reference_keys": ["ref_l", "ref_r"],
+        "marker_displacement_keys": ["disp_l", "disp_r"],
         "marker_valid_mask_keys": ["valid_l", "valid_r"],
-        "marker_flow_keys": ["flow_l", "flow_r"],
     }
     values.update(overrides)
     return TactileVTLAConfig.from_mapping(values)
@@ -89,24 +93,30 @@ def test_config_defaults_to_tactile_disabled_and_rejects_invalid_modes():
 def test_saved_marker_stats_remain_portable_without_original_path(tmp_path):
     settings = _settings(
         marker_stats_path=str(tmp_path / "server-only-stats.json"),
-        marker_mean=[1.0, 2.0, 3.0, 4.0],
-        marker_std=[0.5, 0.6, 0.7, 0.8],
+        marker_mean=[1.0, 2.0],
+        marker_std=[0.5, 0.6],
     )
-    assert settings.marker_mean == (1.0, 2.0, 3.0, 4.0)
-    assert settings.marker_std == pytest.approx((0.5, 0.6, 0.7, 0.8))
+    assert settings.marker_mean == (1.0, 2.0)
+    assert settings.marker_std == pytest.approx((0.5, 0.6))
 
 
-def test_marker_features_are_displacement_and_velocity_with_mask():
-    positions = torch.tensor([[[[3.0, 5.0], [7.0, 11.0]]]])
-    reference = torch.tensor([[[[1.0, 2.0], [3.0, 5.0]]]])
-    previous = torch.tensor([[[[2.0, 4.0], [6.0, 9.0]]]])
-    valid = torch.tensor([[[True, False]]])
-    features, output_mask = marker_features_from_positions(
-        positions, reference, previous, valid
-    )
+def test_marker_history_uses_only_displacement_and_masks_invalid_markers():
+    history = torch.tensor([[[[[2.0, 3.0], [4.0, 6.0]]]]])
+    valid = torch.tensor([[[[True, False]]]])
+    features, output_mask = validate_marker_displacement_history(history, valid)
     assert output_mask.equal(valid)
-    assert features[0, 0, 0].tolist() == [2.0, 3.0, 1.0, 1.0]
-    assert torch.count_nonzero(features[0, 0, 1]) == 0
+    assert features[0, 0, 0, 0].tolist() == [2.0, 3.0]
+    assert torch.count_nonzero(features[0, 0, 0, 1]) == 0
+
+
+def test_marker_statistics_reject_legacy_four_channel_file(tmp_path):
+    path = tmp_path / "legacy.json"
+    path.write_text(
+        '{"marker_mean":[0,0,0,0],"marker_std":[1,1,1,1]}',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match=r"Expected marker statistics for \[dx, dy\]"):
+        load_marker_statistics(path)
 
 
 def test_marker_encoder_single_and_two_sensor_shapes():
@@ -115,23 +125,71 @@ def test_marker_encoder_single_and_two_sensor_shapes():
         context_dim=8,
         hidden_dim=16,
     )
-    single = encoder(torch.randn(3, 4, 4), torch.ones(3, 4, dtype=torch.bool))
-    dual = encoder(
-        torch.randn(3, 2, 4, 4),
-        torch.ones(3, 2, 4, dtype=torch.bool),
+    single = encoder(
+        torch.randn(2, 1, 8, 4, 2),
+        torch.ones(2, 1, 8, 4, dtype=torch.bool),
     )
-    assert single.shape == (3, 1, 8)
-    assert dual.shape == (3, 2, 8)
+    dual = encoder(
+        torch.randn(2, 2, 8, 4, 2),
+        torch.ones(2, 2, 8, 4, dtype=torch.bool),
+    )
+    assert single.shape == (2, 1, 8, 8)
+    assert single.flatten(1, 2).shape == (2, 8, 8)
+    assert dual.shape == (2, 2, 8, 8)
+    assert dual.flatten(1, 2).shape == (2, 16, 8)
 
 
 def test_marker_encoder_masks_fully_missing_sensor_after_mlp_bias():
     encoder = MarkerEncoder(num_markers=4, context_dim=8, hidden_dim=16)
-    features = torch.randn(2, 2, 4, 4)
-    valid = torch.ones(2, 2, 4, dtype=torch.bool)
-    valid[:, 1] = False
+    features = torch.randn(2, 2, 8, 4, 2)
+    valid = torch.ones(2, 2, 8, 4, dtype=torch.bool)
+    valid[:, 1, 3] = False
     tokens = encoder(features, valid)
-    assert tokens.shape == (2, 2, 8)
-    assert torch.count_nonzero(tokens[:, 1]) == 0
+    assert tokens.shape == (2, 2, 8, 8)
+    assert torch.count_nonzero(tokens[:, 1, 3]) == 0
+
+
+def test_marker_temporal_and_sensor_order_is_sensor_major_time_minor():
+    tactile = TactileTokenEncoder(
+        _settings(use_rgb=False), context_dim=2, vision_output_dim=2
+    )
+    for parameter in tactile.marker_encoder.parameters():
+        nn.init.zeros_(parameter)
+    tactile.marker_modality_embedding.data.zero_()
+    tactile.sensor_side_embeddings.weight.data.copy_(
+        torch.tensor([[0.0, 0.0], [100.0, 100.0]])
+    )
+    tactile.marker_temporal_embedding.weight.data.copy_(
+        torch.arange(8, dtype=torch.float32).unsqueeze(1).repeat(1, 2)
+    )
+    history = torch.zeros(1, 2, 8, 4, 2)
+    tokens, mask = tactile.encode_markers(
+        history,
+        torch.ones(1, 2, 8, 4, dtype=torch.bool),
+        torch.ones(1, 2, 8, dtype=torch.bool),
+        torch.ones(1, 2, dtype=torch.bool),
+    )
+    flattened = tokens.flatten(1, 2)
+    assert flattened[0, :, 0].tolist() == [*range(8), *range(100, 108)]
+    assert mask.flatten(1, 2).all()
+
+
+def test_marker_masks_are_applied_after_all_biased_embeddings():
+    tactile = TactileTokenEncoder(_settings(use_rgb=False), context_dim=8)
+    history = torch.randn(1, 2, 8, 4, 2)
+    marker_valid = torch.ones(1, 2, 8, 4, dtype=torch.bool)
+    marker_valid[:, 0, 2] = False
+    history_valid = torch.ones(1, 2, 8, dtype=torch.bool)
+    history_valid[:, 0, 3] = False
+    sensor_valid = torch.tensor([[True, False]])
+    tokens, mask = tactile.encode_markers(
+        history, marker_valid, history_valid, sensor_valid
+    )
+    assert not mask[0, 0, 2]
+    assert not mask[0, 0, 3]
+    assert not mask[0, 1].any()
+    assert torch.count_nonzero(tokens[0, 0, 2:4]) == 0
+    assert torch.count_nonzero(tokens[0, 1]) == 0
 
 
 def test_tactile_rgb_projection_shape_and_missing_sensor_mask():
@@ -189,15 +247,16 @@ def test_backward_reaches_new_modules_and_action_but_not_frozen_vision():
         rgb_emb,
         tactile_sensor_mask=torch.ones(2, 2, dtype=torch.bool),
     )
-    positions = torch.randn(2, 2, 4, 2)
+    history = torch.randn(2, 2, 8, 4, 2)
     marker_tokens, _ = tactile.encode_markers(
-        positions,
-        torch.zeros_like(positions),
-        positions - 0.1,
-        torch.ones(2, 2, 4, dtype=torch.bool),
+        history,
+        torch.ones(2, 2, 8, 4, dtype=torch.bool),
+        torch.ones(2, 2, 8, dtype=torch.bool),
         torch.ones(2, 2, dtype=torch.bool),
     )
-    prediction = action_expert(torch.cat([rgb_tokens, marker_tokens], dim=1).mean(1))
+    prediction = action_expert(
+        torch.cat([rgb_tokens, marker_tokens.flatten(1, 2)], dim=1).mean(1)
+    )
     prediction.square().mean().backward()
 
     assert vision.weight.grad is None
@@ -206,6 +265,7 @@ def test_backward_reaches_new_modules_and_action_but_not_frozen_vision():
     assert tactile.tactile_rgb_modality_embedding.grad is not None
     assert tactile.marker_modality_embedding.grad is not None
     assert tactile.sensor_side_embeddings.weight.grad is not None
+    assert tactile.marker_temporal_embedding.weight.grad is not None
     assert action_expert.weight.grad is not None
 
 
@@ -249,14 +309,29 @@ class _FakeImageProcessor:
         }
 
 
-def test_data_transform_uses_flow_as_equivalent_position_contract():
+@pytest.mark.parametrize("available", [1, 2, 7, 8, 10])
+def test_marker_history_left_padding_for_episode_prefixes(available):
+    raw = torch.arange(available, dtype=torch.float32).view(available, 1, 1)
+    output = left_pad_marker_history(
+        raw,
+        history_length=8,
+        trailing_shape=(1, 1),
+        name="marker",
+        dtype=torch.float32,
+    )
+    source = list(range(max(0, available - 8), available))
+    expected = [source[0]] * (8 - len(source)) + source
+    assert output[:, 0, 0].tolist() == expected
+
+
+def test_data_transform_builds_oldest_to_current_displacement_history():
     settings = _settings()
-    flow_l = torch.stack(
-        [torch.zeros(4, 2), torch.full((4, 2), 0.25)], dim=0
+    displacement_l = torch.stack(
+        [torch.full((4, 2), float(index)) for index in range(3)], dim=0
     )
     sample = {
-        "flow_l": flow_l,
-        "valid_l": torch.ones(2, 4, dtype=torch.bool),
+        "disp_l": displacement_l,
+        "valid_l": torch.ones(3, 4, dtype=torch.bool),
         "rgb_l": torch.ones(3, 8, 8, dtype=torch.uint8),
         "scene": torch.zeros(3, 8, 8, dtype=torch.uint8),
     }
@@ -266,10 +341,12 @@ def test_data_transform_uses_flow_as_equivalent_position_contract():
         settings,
         fallback_image_keys=("scene",),
     )
-    assert output["marker_positions"].shape == (2, 4, 2)
-    assert torch.equal(output["marker_positions"][0], flow_l[-1])
-    assert torch.equal(output["marker_reference"][0], torch.zeros_like(flow_l[-1]))
-    assert torch.equal(output["previous_marker_positions"][0], flow_l[-2])
+    assert output["marker_displacement_history"].shape == (2, 8, 4, 2)
+    assert output["marker_displacement_history"][0, :, 0, 0].tolist() == [
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0
+    ]
+    assert output["marker_history_valid_mask"][0].all()
+    assert not output["marker_history_valid_mask"][1].any()
     assert output["tactile_rgb"].shape == (2, 4, 6)
     assert output["tactile_rgb_mask"].tolist() == [True, False]
     assert output["tactile_sensor_mask"].tolist() == [True, False]
@@ -277,13 +354,11 @@ def test_data_transform_uses_flow_as_equivalent_position_contract():
 
 def test_inference_data_accepts_aggregate_tactile_fields_and_sensor_mask():
     settings = _settings()
-    positions = torch.randn(2, 4, 2)
-    previous = positions - 0.2
+    history = torch.randn(2, 8, 4, 2)
     sample = {
-        "marker_positions": positions,
-        "marker_reference": torch.zeros_like(positions),
-        "previous_marker_positions": previous,
-        "marker_valid_mask": torch.ones(2, 4, dtype=torch.bool),
+        "marker_displacement_history": history,
+        "marker_valid_mask": torch.ones(2, 8, 4, dtype=torch.bool),
+        "marker_history_valid_mask": torch.ones(2, 8, dtype=torch.bool),
         "tactile_rgb": torch.ones(2, 3, 8, 8, dtype=torch.uint8),
         "tactile_sensor_mask": torch.tensor([True, False]),
         "scene": torch.zeros(3, 8, 8, dtype=torch.uint8),
@@ -294,13 +369,14 @@ def test_inference_data_accepts_aggregate_tactile_fields_and_sensor_mask():
         settings,
         fallback_image_keys=("scene",),
     )
-    assert torch.equal(output["previous_marker_positions"], previous)
+    assert torch.equal(output["marker_displacement_history"], history)
     assert not output["marker_valid_mask"][1].any()
+    assert not output["marker_history_valid_mask"][1].any()
     assert output["tactile_rgb_mask"].tolist() == [True, False]
     assert output["tactile_sensor_mask"].tolist() == [True, False]
 
 
-def test_marker_stats_use_selected_episodes_and_reset_velocity_at_boundary():
+def test_marker_stats_use_selected_episodes_without_padding_or_velocity():
     marker = np.asarray(
         [
             [[-100.0, -200.0]],
@@ -316,9 +392,10 @@ def test_marker_stats_use_selected_episodes_and_reset_velocity_at_boundary():
         episode_start=1,
         episode_end=2,
         chunk_frames=1,
+        eps=1e-6,
     )
-    np.testing.assert_allclose(mean, [12.0, 24.0, 2.0, 4.0])
-    np.testing.assert_allclose(std, [2.0, 4.0, 2.0, 4.0])
+    np.testing.assert_allclose(mean, [12.0, 24.0])
+    np.testing.assert_allclose(std, [2.0, 4.0])
     assert count == 2
     assert frame_count == 2
 
@@ -341,10 +418,9 @@ def test_model_training_and_sampling_interfaces_expose_all_tactile_fields():
     required = {
         "tactile_rgb",
         "tactile_rgb_grid_thw",
-        "marker_positions",
-        "marker_reference",
-        "previous_marker_positions",
+        "marker_displacement_history",
         "marker_valid_mask",
+        "marker_history_valid_mask",
         "tactile_sensor_mask",
         "tactile_rgb_mask",
     }
@@ -502,8 +578,13 @@ def test_full_vtla_prefix_path_preserves_order_masks_rope_and_deepstack():
     sensor_mask = torch.tensor([[True, False], [True, True]])
     language = torch.tensor([[21, 22, 23, 24], [31, 32, 33, 34]])
     language_mask = torch.ones_like(language, dtype=torch.bool)
-    marker_positions = torch.ones(batch_size, tactile_sensors, 4, 2)
-    marker_valid = torch.ones(batch_size, tactile_sensors, 4, dtype=torch.bool)
+    marker_history = torch.ones(batch_size, tactile_sensors, 8, 4, 2)
+    marker_valid = torch.ones(
+        batch_size, tactile_sensors, 8, 4, dtype=torch.bool
+    )
+    marker_history_valid = torch.ones(
+        batch_size, tactile_sensors, 8, dtype=torch.bool
+    )
 
     (
         context,
@@ -520,10 +601,9 @@ def test_full_vtla_prefix_path_preserves_order_masks_rope_and_deepstack():
         image_grid_thw=scene_grid,
         tactile_rgb=tactile_rgb,
         tactile_rgb_grid_thw=tactile_grid,
-        marker_positions=marker_positions,
-        marker_reference=torch.zeros_like(marker_positions),
-        previous_marker_positions=marker_positions - 0.25,
+        marker_displacement_history=marker_history,
         marker_valid_mask=marker_valid,
+        marker_history_valid_mask=marker_history_valid,
         tactile_sensor_mask=sensor_mask,
         tactile_rgb_mask=sensor_mask,
     )
@@ -531,7 +611,7 @@ def test_full_vtla_prefix_path_preserves_order_masks_rope_and_deepstack():
     scene_length = scene_views * (3 + 2)
     language_length = language.shape[1]
     rgb_length = tactile_sensors * (3 + 2)
-    marker_length = tactile_sensors
+    marker_length = tactile_sensors * 8
     expected_length = scene_length + language_length + rgb_length + marker_length
     assert context.shape == (batch_size, expected_length, 8)
     assert pad_mask.shape == (batch_size, expected_length)
@@ -546,13 +626,13 @@ def test_full_vtla_prefix_path_preserves_order_masks_rope_and_deepstack():
     assert not pad_mask[0, missing_rgb].any()
     assert torch.count_nonzero(context[0, missing_rgb]) == 0
     marker_start = rgb_start + rgb_length
-    assert not pad_mask[0, marker_start + 1]
-    assert torch.count_nonzero(context[0, marker_start + 1]) == 0
+    assert not pad_mask[0, marker_start + 8 : marker_start + 16].any()
+    assert torch.count_nonzero(context[0, marker_start + 8 : marker_start + 16]) == 0
 
     position_call = harness.qwenvl_with_expert.position_call
     assert position_call is not None
     assert position_call["input_ids"][0, scene_length:rgb_start].equal(language[0])
-    assert position_call["input_ids"][0, marker_start:].tolist() == [13, 13]
+    assert position_call["input_ids"][0, marker_start:].tolist() == [13] * 16
     expected_valid_views = int(image_mask.sum() + sensor_mask.sum())
     assert position_call["image_grid_thw"].shape == (expected_valid_views, 3)
     expected_visual_tokens = expected_valid_views * 3
@@ -604,6 +684,33 @@ def test_checkpoint_compatibility_is_limited_to_tactile_namespace():
     ).read_text(encoding="utf-8")
     assert 'tactile_prefix = "model.tactile_encoder."' in model_source
     assert "loaded_parameter_names" in model_source
+
+
+def test_legacy_marker_checkpoint_requires_opt_in_and_reinitializes_only_marker_input():
+    settings = _settings(use_rgb=False)
+    target = TactileTokenEncoder(settings, context_dim=8)
+    old_state = {name: value.clone() for name, value in target.state_dict().items()}
+    weight_key = "marker_encoder.encoder.0.weight"
+    old_state[weight_key] = torch.randn(
+        old_state[weight_key].shape[0], old_state[weight_key].shape[1] * 2
+    )
+    old_state["marker_encoder.marker_mean"] = torch.zeros(4)
+    old_state["marker_encoder.marker_std"] = torch.ones(4)
+    old_state.pop("marker_temporal_embedding.weight")
+    old_state["marker_modality_embedding"].fill_(3.0)
+
+    with pytest.raises(RuntimeError, match="ALLOW_LEGACY_MARKER_REINIT"):
+        load_vtla_checkpoint_state_dict(target, old_state)
+
+    report = load_vtla_checkpoint_state_dict(
+        target, old_state, allow_legacy_marker_reinit=True
+    )
+    assert report["legacy_marker_reinitialized"] is True
+    assert report["unexpected_keys"] == []
+    assert torch.all(target.marker_modality_embedding == 3.0)
+    assert target.marker_encoder.encoder[0].weight.shape[1] == 4 * 2
+    assert target.marker_encoder.marker_mean.shape == (2,)
+    assert target.marker_temporal_embedding.weight.shape == (8, 8)
 
 
 def test_missing_direct_tactile_parameter_uses_leaf_initializer():
@@ -660,9 +767,17 @@ def test_ablation_configs_validate(name, enabled, use_rgb, use_markers):
     assert settings.enabled is enabled
     assert settings.use_rgb is use_rgb
     assert settings.use_markers is use_markers
-    assert payload["data"]["train_path"].endswith(
-        "insert_ethernet_cable_ml_0721_201_tacthru_umi_v2_tactile_v1"
+    expected_dataset = (
+        "insert_ethernet_cable_ml_0721_201_tacthru_umi_v2_tactile_history8_v2"
+        if enabled and use_markers
+        else "insert_ethernet_cable_ml_0721_201_tacthru_umi_v2_tactile_v1"
     )
+    assert payload["data"]["train_path"].endswith(expected_dataset)
     if enabled:
         assert payload["train"]["optimizer"] == "adamw"
         assert payload["train"]["freeze_vlm"] is True
+    if enabled and use_markers:
+        assert settings.marker_history_length == 8
+        assert settings.marker_input_features == 2
+        assert settings.marker_feature_mode == "displacement_history"
+        assert settings.marker_temporal_embedding is True

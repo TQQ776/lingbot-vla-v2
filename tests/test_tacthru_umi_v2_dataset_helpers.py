@@ -1,3 +1,4 @@
+import importlib.util
 import sys
 import types
 from pathlib import Path
@@ -20,7 +21,8 @@ helper_module.create_logger = lambda _name: SimpleNamespace(info=lambda *_args, 
 sys.modules.setdefault("lingbotvla.data", data_package)
 sys.modules.setdefault("lingbotvla.data.vla_data", vla_data_package)
 sys.modules.setdefault("lingbotvla.utils.helper", helper_module)
-sys.modules.setdefault("einops", types.ModuleType("einops"))
+if importlib.util.find_spec("einops") is None:
+    sys.modules.setdefault("einops", types.ModuleType("einops"))
 
 from lingbotvla.data.vla_data import base_dataset as base_dataset_module  # noqa: E402
 from lingbotvla.data.vla_data import utils as utils_module  # noqa: E402
@@ -132,6 +134,7 @@ def test_future_video_effective_fps_reaches_final_model_batch(monkeypatch):
     transform.disabled_image_features = True
     transform.use_depth_align = False
     transform.use_future_image = True
+    transform.tactile_enabled = False
     transform.convert_features = lambda item, w_action: item
     transform.pad_and_concat = lambda item, w_action: {
         "image": {},
@@ -238,6 +241,32 @@ def test_tacthru_v2_actions_use_contiguous_30_hz_frames():
     )
 
     assert dataset.get_delta_timestamps()["action"] == [step / 30 for step in range(50)]
+
+
+def test_tacthru_marker_history_queries_oldest_to_current_same_episode_offsets():
+    displacement = "observation.tactile.marker_displacement_left"
+    valid = "observation.tactile.marker_valid_left"
+    dataset = VLADataset.__new__(VLADataset)
+    dataset.chunk_size = 50
+    dataset.dataset_meta = SimpleNamespace(
+        fps=30,
+        features={displacement: {}, valid: {}},
+    )
+    dataset.feature_transform = SimpleNamespace(
+        actions_convert_from_state={},
+        org_features={"actions": [], "states": []},
+        tactile_enabled=True,
+        tactile_settings=SimpleNamespace(
+            marker_history_length=8,
+            marker_displacement_keys=(displacement,),
+            marker_valid_mask_keys=(valid,),
+        ),
+    )
+
+    expected = [offset / 30.0 for offset in range(-7, 1)]
+    delta = dataset.get_delta_timestamps()
+    assert delta[displacement] == expected
+    assert delta[valid] == expected
 
 
 class _FakeVLADataset:

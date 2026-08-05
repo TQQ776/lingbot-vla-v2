@@ -23,7 +23,7 @@ TACTILE_VIDEO_KEYS = {
     "observation.images.tactile_left",
 }
 TACTILE_DATA_KEYS = {
-    "observation.tactile.marker_flow_left",
+    "observation.tactile.marker_displacement_left",
     "observation.tactile.marker_valid_left",
 }
 UNEXPECTED_VIDEO_KEYS = {
@@ -231,7 +231,10 @@ def check_dataset(
         if missing_tactile:
             report.fail("LeRobot tactile fields", f"missing {sorted(missing_tactile)}")
         elif expect_tactile:
-            report.ok("LeRobot tactile fields", "marker flow and validity mask are present")
+            report.ok(
+                "LeRobot tactile fields",
+                "per-frame marker displacement and validity mask are present",
+            )
         unexpected = UNEXPECTED_VIDEO_KEYS & features
         if unexpected:
             report.fail(
@@ -302,7 +305,7 @@ def check_dataset(
             manifest_errors = []
             expected_manifest_values = {
                 "converter": "tacthru_umi_v2_native_30hz",
-                "converter_version": 5 if expect_tactile else 4,
+                "converter_version": 6 if expect_tactile else 4,
                 "source_fps": EXPECTED_SOURCE_FPS,
                 "output_fps": EXPECTED_DATASET_FPS,
                 "action_chunk_size": CHUNK_SIZE,
@@ -365,9 +368,17 @@ def check_dataset(
                     )
             if expect_tactile:
                 expected_tactile_fields = {
-                    "rgb_key": "observation.images.tactile_left",
-                    "marker_flow_key": "observation.tactile.marker_flow_left",
-                    "marker_valid_key": "observation.tactile.marker_valid_left",
+                    "rgb_feature": "observation.images.tactile_left",
+                    "marker_displacement_feature": "observation.tactile.marker_displacement_left",
+                    "marker_valid_feature": "observation.tactile.marker_valid_left",
+                    "marker_representation": "normalized_displacement",
+                    "formula": "2 * (current_xy - reference_xy) / [image_width, image_height]",
+                    "marker_order": "fixed",
+                    "history_storage": "per_frame_displacement",
+                    "history_construction": "dataset_same_episode_offsets",
+                    "history_length": 8,
+                    "history_padding": "earliest_valid_frame_replication",
+                    "marker_sample_hz": EXPECTED_DATASET_FPS,
                 }
                 for key, expected in expected_tactile_fields.items():
                     if tactile_info.get(key) != expected:

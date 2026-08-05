@@ -25,7 +25,9 @@ def identity_actions(steps: int = 50, gripper_width_m: float = 0.03) -> np.ndarr
 
 
 def tactile_observation() -> Observation:
-    marker = np.linspace(-0.2, 0.2, 48 * 2, dtype=np.float32).reshape(1, 48, 2)
+    marker = np.linspace(
+        -0.2, 0.2, 8 * 48 * 2, dtype=np.float32
+    ).reshape(1, 8, 48, 2)
     tactile_rgb = np.zeros((1, 480, 640, 3), dtype=np.uint8)
     tactile_rgb[..., 1] = 180
     return Observation(
@@ -33,10 +35,9 @@ def tactile_observation() -> Observation:
         state=identity_state(),
         wrist_rgb=np.zeros((224, 224, 3), dtype=np.uint8),
         tactile_rgb=tactile_rgb,
-        marker_positions=marker,
-        marker_reference=np.zeros_like(marker),
-        previous_marker_positions=marker - 0.01,
-        marker_valid_mask=np.ones((1, 48), dtype=np.bool_),
+        marker_displacement_history=marker,
+        marker_valid_mask=np.ones((1, 8, 48), dtype=np.bool_),
+        marker_history_valid_mask=np.ones((1, 8), dtype=np.bool_),
         tactile_sensor_mask=np.ones((1,), dtype=np.bool_),
     )
 
@@ -115,7 +116,7 @@ def test_wire_image_must_be_exactly_224_square() -> None:
         )
 
 
-def test_v2_tactile_roundtrip_preserves_rgb_and_marker_contract() -> None:
+def test_v3_tactile_roundtrip_preserves_rgb_and_marker_history_contract() -> None:
     observation = tactile_observation()
 
     decoded = observation_from_payload(
@@ -124,13 +125,13 @@ def test_v2_tactile_roundtrip_preserves_rgb_and_marker_contract() -> None:
 
     assert decoded.tactile_rgb.shape == (1, 480, 640, 3)
     assert decoded.tactile_rgb[..., 1].mean() > 160
-    assert np.allclose(decoded.marker_positions, observation.marker_positions)
     assert np.allclose(
-        decoded.previous_marker_positions,
-        observation.previous_marker_positions,
+        decoded.marker_displacement_history,
+        observation.marker_displacement_history,
     )
     assert decoded.marker_valid_mask.dtype == np.bool_
     assert decoded.marker_valid_mask.all()
+    assert decoded.marker_history_valid_mask.all()
     assert decoded.tactile_sensor_mask.tolist() == [True]
 
 
@@ -140,11 +141,51 @@ def test_tactile_marker_payload_rejects_partial_contract() -> None:
         instruction=observation.instruction,
         state=observation.state,
         wrist_rgb=observation.wrist_rgb,
-        marker_positions=observation.marker_positions,
+        marker_displacement_history=observation.marker_displacement_history,
         tactile_sensor_mask=observation.tactile_sensor_mask,
     )
     with pytest.raises(ValueError, match="incomplete"):
         observation_to_payload(observation)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        (
+            "marker_displacement_history",
+            np.zeros((1, 7, 48, 2), dtype=np.float32),
+            "shape",
+        ),
+        (
+            "marker_valid_mask",
+            np.ones((1, 8, 47), dtype=np.bool_),
+            "shape",
+        ),
+        (
+            "marker_history_valid_mask",
+            np.ones((1, 7), dtype=np.bool_),
+            "shape",
+        ),
+    ],
+)
+def test_tactile_protocol_rejects_wrong_history_shapes(field, value, match):
+    observation = tactile_observation()
+    values = dict(observation.__dict__)
+    values[field] = value
+    with pytest.raises(ValueError, match=match):
+        observation_to_payload(Observation(**values))
+
+
+def test_tactile_protocol_rejects_nonfinite_history_and_wrong_sample_rate():
+    payload = observation_to_payload(tactile_observation())
+    payload["tactile"]["marker_displacement_history"][0][0][0][0] = float("nan")
+    with pytest.raises(ValueError, match="finite"):
+        observation_from_payload(payload)
+
+    payload = observation_to_payload(tactile_observation())
+    payload["tactile"]["marker_sample_hz"] = 60.0
+    with pytest.raises(ValueError, match="marker_sample_hz"):
+        observation_from_payload(payload)
 
 
 def test_response_spec_cannot_claim_more_steps_than_payload() -> None:
