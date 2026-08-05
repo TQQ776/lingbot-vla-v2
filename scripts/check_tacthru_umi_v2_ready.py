@@ -673,7 +673,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--expect-tactile",
         action="store_true",
-        help="Require the converter-v5 TacThru RGB/marker dataset contract",
+        help="Require the converter-v6 TacThru RGB/marker history8 dataset contract",
     )
     parser.add_argument("--require-gpu", action="store_true")
     parser.add_argument("--require-flash", action="store_true")

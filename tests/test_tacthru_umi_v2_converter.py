@@ -1,3 +1,7 @@
+import json
+import os
+import shutil
+
 import numpy as np
 import pytest
 
@@ -10,8 +14,10 @@ from tools.convert_tacthru_zarr_to_lerobot_v2 import (  # noqa: E402
     CONVERTER_VERSION,
     DATASET_FPS,
     MARKER_DISPLACEMENT_FEATURE,
+    LEGACY_MARKER_FLOW_FEATURE,
     _requested_manifest,
     build_features,
+    migrate_cloned_marker_feature,
     build_pose8,
     make_episode_plan,
 )
@@ -119,6 +125,49 @@ def test_marker_displacement_feature_has_exact_rank_two_schema() -> None:
     marker = features[MARKER_DISPLACEMENT_FEATURE]
     assert marker["shape"] == (48, 2)
     assert marker["names"] is None
+
+
+def test_hardlinked_legacy_marker_migration_does_not_modify_source(tmp_path) -> None:
+    pyarrow = pytest.importorskip("pyarrow")
+    parquet = pytest.importorskip("pyarrow.parquet")
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    (source / "meta").mkdir(parents=True)
+    (source / "data/chunk-000").mkdir(parents=True)
+    info = {
+        "features": {
+            LEGACY_MARKER_FLOW_FEATURE: {
+                "dtype": "float32",
+                "shape": [48, 2],
+                "names": ["marker", "xy"],
+            }
+        }
+    }
+    stats = {LEGACY_MARKER_FLOW_FEATURE: {"mean": [0.0, 0.0]}}
+    (source / "meta/info.json").write_text(json.dumps(info), encoding="utf-8")
+    (source / "meta/stats.json").write_text(json.dumps(stats), encoding="utf-8")
+    table = pyarrow.table(
+        {
+            LEGACY_MARKER_FLOW_FEATURE: [
+                [[float(index), float(-index)] for index in range(48)]
+            ]
+        }
+    )
+    parquet.write_table(table, source / "data/chunk-000/file-000.parquet")
+    shutil.copytree(source, output, copy_function=os.link)
+
+    migrate_cloned_marker_feature(output)
+
+    source_info = json.loads((source / "meta/info.json").read_text(encoding="utf-8"))
+    output_info = json.loads((output / "meta/info.json").read_text(encoding="utf-8"))
+    assert LEGACY_MARKER_FLOW_FEATURE in source_info["features"]
+    assert MARKER_DISPLACEMENT_FEATURE not in source_info["features"]
+    assert LEGACY_MARKER_FLOW_FEATURE not in output_info["features"]
+    assert output_info["features"][MARKER_DISPLACEMENT_FEATURE]["names"] is None
+    source_table = parquet.read_table(source / "data/chunk-000/file-000.parquet")
+    output_table = parquet.read_table(output / "data/chunk-000/file-000.parquet")
+    assert source_table.column_names == [LEGACY_MARKER_FLOW_FEATURE]
+    assert output_table.column_names == [MARKER_DISPLACEMENT_FEATURE]
 
 
 def test_pose8_is_xyzw_normalized_and_canonical() -> None:

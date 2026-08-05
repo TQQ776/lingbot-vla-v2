@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 from contextlib import contextmanager
 from pathlib import Path
@@ -49,6 +50,7 @@ IMAGE_FEATURES = (
 TACTILE_RGB_FEATURE = "observation.images.tactile_left"
 MARKER_DISPLACEMENT_FEATURE = "observation.tactile.marker_displacement_left"
 MARKER_VALID_FEATURE = "observation.tactile.marker_valid_left"
+LEGACY_MARKER_FLOW_FEATURE = "observation.tactile.marker_flow_left"
 EXCLUDED_TACTILE_SOURCE_KEYS = (
     "tacthru_l_rgb",
     "tacthru_r_rgb",
@@ -334,6 +336,133 @@ def build_features(
     return features
 
 
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    """Replace JSON without mutating a hard-linked source file."""
+
+    temporary = path.with_name(f".{path.name}.history8.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def migrate_cloned_marker_feature(root: Path) -> None:
+    """Rename the legacy normalized-flow column in an already cloned dataset."""
+
+    info_path = root / "meta/info.json"
+    stats_path = root / "meta/stats.json"
+    if not info_path.is_file() or not stats_path.is_file():
+        raise FileNotFoundError("Reusable LeRobot dataset is missing meta/info.json or meta/stats.json")
+
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    features = info.get("features")
+    if not isinstance(features, dict) or LEGACY_MARKER_FLOW_FEATURE not in features:
+        raise ValueError(
+            f"Reusable dataset must contain {LEGACY_MARKER_FLOW_FEATURE!r}"
+        )
+    if MARKER_DISPLACEMENT_FEATURE in features:
+        raise ValueError(
+            f"Reusable dataset already contains {MARKER_DISPLACEMENT_FEATURE!r}"
+        )
+    displacement_feature = dict(features.pop(LEGACY_MARKER_FLOW_FEATURE))
+    displacement_feature["names"] = None
+    features[MARKER_DISPLACEMENT_FEATURE] = displacement_feature
+    _write_json_atomic(info_path, info)
+
+    stats = json.loads(stats_path.read_text(encoding="utf-8"))
+    if LEGACY_MARKER_FLOW_FEATURE not in stats:
+        raise ValueError(
+            f"Reusable dataset statistics must contain {LEGACY_MARKER_FLOW_FEATURE!r}"
+        )
+    stats[MARKER_DISPLACEMENT_FEATURE] = stats.pop(LEGACY_MARKER_FLOW_FEATURE)
+    _write_json_atomic(stats_path, stats)
+
+    try:
+        import pyarrow.parquet as pq
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "Reusing an existing LeRobot dataset requires pyarrow"
+        ) from exc
+
+    parquet_paths = sorted((root / "data").rglob("*.parquet"))
+    if not parquet_paths:
+        raise FileNotFoundError("Reusable dataset has no data parquet files")
+    old_bytes = LEGACY_MARKER_FLOW_FEATURE.encode("utf-8")
+    new_bytes = MARKER_DISPLACEMENT_FEATURE.encode("utf-8")
+    for parquet_path in parquet_paths:
+        table = pq.read_table(parquet_path)
+        if LEGACY_MARKER_FLOW_FEATURE not in table.column_names:
+            raise ValueError(
+                f"{parquet_path} is missing {LEGACY_MARKER_FLOW_FEATURE!r}"
+            )
+        if MARKER_DISPLACEMENT_FEATURE in table.column_names:
+            raise ValueError(
+                f"{parquet_path} already contains {MARKER_DISPLACEMENT_FEATURE!r}"
+            )
+        renamed_columns = [
+            MARKER_DISPLACEMENT_FEATURE
+            if name == LEGACY_MARKER_FLOW_FEATURE
+            else name
+            for name in table.column_names
+        ]
+        table = table.rename_columns(renamed_columns)
+        schema_metadata = dict(table.schema.metadata or {})
+        if b"huggingface" in schema_metadata:
+            schema_metadata[b"huggingface"] = schema_metadata[b"huggingface"].replace(
+                old_bytes, new_bytes
+            )
+            table = table.replace_schema_metadata(schema_metadata)
+        temporary = parquet_path.with_name(f".{parquet_path.name}.history8.tmp")
+        pq.write_table(table, temporary, compression="zstd")
+        temporary.replace(parquet_path)
+
+
+def clone_legacy_tactile_dataset(
+    source: Path,
+    output: Path,
+    *,
+    expected_episodes: int,
+    expected_frames: int,
+) -> None:
+    """Hard-link unchanged assets and migrate only marker metadata/parquet."""
+
+    source = source.expanduser().resolve()
+    if not source.is_dir():
+        raise NotADirectoryError(source)
+    if output.exists():
+        raise FileExistsError(output)
+    if source == output or output.is_relative_to(source) or source.is_relative_to(output):
+        raise ValueError(
+            f"Reusable dataset and output must not overlap: source={source}, output={output}"
+        )
+    if source.stat().st_dev != output.parent.stat().st_dev:
+        raise ValueError("Reusable dataset and output must be on the same filesystem for hard links")
+
+    _, LeRobotDatasetMetadata = _lerobot_dataset_classes()
+    metadata = LeRobotDatasetMetadata(repo_id=source.name, root=source)
+    if metadata.total_episodes != expected_episodes or metadata.total_frames != expected_frames:
+        raise ValueError(
+            "Reusable dataset does not match the selected Zarr episodes: "
+            f"episodes={metadata.total_episodes}/{expected_episodes}, "
+            f"frames={metadata.total_frames}/{expected_frames}"
+        )
+    required = {
+        *IMAGE_FEATURES,
+        TACTILE_RGB_FEATURE,
+        LEGACY_MARKER_FLOW_FEATURE,
+        MARKER_VALID_FEATURE,
+        "observation.state",
+        "action",
+    }
+    missing = required - set(metadata.features)
+    if missing:
+        raise ValueError(f"Reusable dataset is missing required features: {sorted(missing)}")
+
+    shutil.copytree(source, output, copy_function=os.link)
+    migrate_cloned_marker_feature(output)
+
+
 def validate_output(
     output: Path,
     expected_episode_lengths: list[int],
@@ -579,6 +708,38 @@ def convert(args: argparse.Namespace) -> None:
             shutil.rmtree(output)
 
         output.parent.mkdir(parents=True, exist_ok=True)
+        if args.reuse_existing_dataset is not None:
+            if not args.include_tactile:
+                raise ValueError("--reuse-existing-dataset requires --include-tactile")
+            reuse_source = args.reuse_existing_dataset.expanduser().resolve()
+            clone_legacy_tactile_dataset(
+                reuse_source,
+                output,
+                expected_episodes=len(plan),
+                expected_frames=output_frames,
+            )
+            result = validate_output(
+                output,
+                output_episode_lengths,
+                output_frames,
+                include_tactile=True,
+            )
+            manifest = {
+                **requested_manifest,
+                "output": str(output),
+                "video_reuse": {
+                    "mode": "hardlink",
+                    "source_dataset": str(reuse_source),
+                    "marker_column_migration": (
+                        f"{LEGACY_MARKER_FLOW_FEATURE} -> {MARKER_DISPLACEMENT_FEATURE}"
+                    ),
+                },
+                **result,
+            }
+            _write_json_atomic(output / MANIFEST_NAME, manifest)
+            print(json.dumps(manifest, ensure_ascii=False, indent=2))
+            return
+
         LeRobotDataset, _ = _lerobot_dataset_classes()
         dataset = LeRobotDataset.create(
             repo_id=repo_id,
@@ -660,7 +821,7 @@ def convert(args: argparse.Namespace) -> None:
         "output": str(output),
         **result,
     }
-    (output / MANIFEST_NAME).write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _write_json_atomic(output / MANIFEST_NAME, manifest)
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
 
 
@@ -679,6 +840,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-writer-threads", type=int, default=8)
     parser.add_argument("--batch-encoding-size", type=int, default=1)
     parser.add_argument("--serial-video-encoding", action="store_true")
+    parser.add_argument(
+        "--reuse-existing-dataset",
+        type=Path,
+        default=None,
+        help=(
+            "Hard-link videos and unchanged files from a compatible legacy tactile "
+            "LeRobot dataset, then migrate marker_flow_left to marker_displacement_left"
+        ),
+    )
     parser.add_argument(
         "--include-tactile",
         action="store_true",

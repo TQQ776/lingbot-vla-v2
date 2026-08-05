@@ -147,7 +147,8 @@ checkpoint structurally loadable and does not replace history8 training.
 - `lingbotvla/data/vla_data/base_dataset.py`: same-episode history queries.
 - `lingbotvla/data/vla_data/tactile.py`: padding and fixed-shape transform.
 - `tools/convert_tacthru_zarr_to_lerobot_v2.py`: explicit per-frame displacement
-  dataset and manifest.
+  dataset and manifest; it can hard-link a validated converter-v5 dataset and
+  migrate only the marker schema instead of re-encoding identical videos.
 - `deploy/tacthru_umi_v2/tactile_source.py`: timestamped live deque.
 - `deploy/tacthru_umi_v2/protocol.py`: strict protocol v3 validation.
 - `deploy/tacthru_umi_v2/http_server.py`: checkpoint contract and model mapping.

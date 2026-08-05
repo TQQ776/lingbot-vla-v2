@@ -65,6 +65,25 @@ history_padding: earliest_valid_frame_replication
 marker_sample_hz: 30
 ```
 
+If the complete converter-v5 `tactile_v1` dataset already exists, its videos,
+state/action rows and normalized marker values are identical. Reuse those video
+files without re-encoding them and migrate only the marker column/schema:
+
+```bash
+.venv/bin/python tools/convert_tacthru_zarr_to_lerobot_v2.py \
+  data/zarr/insert_ethernet_cable_ml_0721_201.zarr.zip \
+  data/lerobot/insert_ethernet_cable_ml_0721_201_tacthru_umi_v2_tactile_history8_v2 \
+  --include-tactile \
+  --max-source-episodes 201 \
+  --task 'Insert the Ethernet cable' \
+  --reuse-existing-dataset \
+  data/lerobot/insert_ethernet_cable_ml_0721_201_tacthru_umi_v2_tactile_v1
+```
+
+This mode validates episode/frame counts, hard-links unchanged files, atomically
+renames `marker_flow_left` to `marker_displacement_left` in metadata/parquet,
+and then runs the same full output validation. The legacy source is not modified.
+
 ## Train
 
 Marker only:
