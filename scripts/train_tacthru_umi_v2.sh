@@ -218,6 +218,20 @@ CHECK_ARGS=(
   --expected-source-episodes "$EXPECTED_SOURCE_EPISODES"
 )
 
+EXPECT_TACTILE="$($PYTHON - "$CONFIG" <<'PY'
+import sys
+
+import yaml
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    config = yaml.safe_load(stream)
+print("1" if config.get("train", {}).get("tactile", {}).get("enabled", False) else "0")
+PY
+)"
+if [[ "$EXPECT_TACTILE" -eq 1 ]]; then
+  CHECK_ARGS+=(--expect-tactile)
+fi
+
 # The official v2 README asks for the complete Qwen3-VL checkpoint, not only
 # its tokenizer/processor assets. Keep this stricter than the generic checker.
 if ! compgen -G "$TOKENIZER_DIR/*.safetensors" >/dev/null; then

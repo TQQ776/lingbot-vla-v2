@@ -19,6 +19,13 @@ EXPECTED_FUTURE_EFFECTIVE_FPS = EXPECTED_DATASET_FPS / (CHUNK_SIZE - 1)
 REQUIRED_VIDEO_KEYS = {
     "observation.images.camera_wrist_left",
 }
+TACTILE_VIDEO_KEYS = {
+    "observation.images.tactile_left",
+}
+TACTILE_DATA_KEYS = {
+    "observation.tactile.marker_flow_left",
+    "observation.tactile.marker_valid_left",
+}
 UNEXPECTED_VIDEO_KEYS = {
     "observation.images.camera_top",
     "observation.images.camera_wrist_right",
@@ -204,17 +211,27 @@ def check_dataset(
     report: Report,
     path: Path,
     expected_source_episodes: int | None,
+    expect_tactile: bool = False,
 ) -> tuple[int | None, int | None]:
     try:
         from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 
         meta = LeRobotDatasetMetadata(repo_id=path.name, root=path)
         features = set(meta.features)
-        missing = REQUIRED_VIDEO_KEYS - features
+        required_video_keys = set(REQUIRED_VIDEO_KEYS)
+        if expect_tactile:
+            required_video_keys.update(TACTILE_VIDEO_KEYS)
+        missing = required_video_keys - features
         if missing:
             report.fail("LeRobot images", f"missing {sorted(missing)}")
         else:
-            report.ok("LeRobot images", "wrist RGB is the only visual input")
+            detail = "wrist RGB + TacThru RGB" if expect_tactile else "wrist RGB only"
+            report.ok("LeRobot images", detail)
+        missing_tactile = TACTILE_DATA_KEYS - features if expect_tactile else set()
+        if missing_tactile:
+            report.fail("LeRobot tactile fields", f"missing {sorted(missing_tactile)}")
+        elif expect_tactile:
+            report.ok("LeRobot tactile fields", "marker flow and validity mask are present")
         unexpected = UNEXPECTED_VIDEO_KEYS & features
         if unexpected:
             report.fail(
@@ -222,7 +239,7 @@ def check_dataset(
                 f"unexpected converted image features: {sorted(unexpected)}",
             )
         else:
-            report.ok("Disabled visual inputs", "top/right/tactile visual slots are absent")
+            report.ok("Disabled visual inputs", "top/right scene-camera slots are absent")
 
         shape_errors = []
         for key in ("observation.state", "action"):
@@ -285,7 +302,7 @@ def check_dataset(
             manifest_errors = []
             expected_manifest_values = {
                 "converter": "tacthru_umi_v2_native_30hz",
-                "converter_version": 4,
+                "converter_version": 5 if expect_tactile else 4,
                 "source_fps": EXPECTED_SOURCE_FPS,
                 "output_fps": EXPECTED_DATASET_FPS,
                 "action_chunk_size": CHUNK_SIZE,
@@ -320,16 +337,19 @@ def check_dataset(
                 )
             if manifest.get("output_episode_lengths") != lengths:
                 manifest_errors.append("output_episode_lengths do not match metadata")
-            if manifest.get("image_features") != sorted(REQUIRED_VIDEO_KEYS):
+            if manifest.get("image_features") != sorted(required_video_keys):
                 manifest_errors.append(
                     f"image_features={manifest.get('image_features')!r}, "
-                    f"expected {sorted(REQUIRED_VIDEO_KEYS)!r}"
+                    f"expected {sorted(required_video_keys)!r}"
                 )
 
-            if manifest.get("visual_input_policy") != "wrist_rgb_only":
+            expected_visual_policy = (
+                "wrist_plus_tactile_rgb" if expect_tactile else "wrist_rgb_only"
+            )
+            if manifest.get("visual_input_policy") != expected_visual_policy:
                 manifest_errors.append(
                     f"visual_input_policy={manifest.get('visual_input_policy')!r}, "
-                    "expected 'wrist_rgb_only'"
+                    f"expected {expected_visual_policy!r}"
                 )
             if manifest.get("wrist_rgb_source_key") != "camera0_rgb":
                 manifest_errors.append(
@@ -339,8 +359,22 @@ def check_dataset(
 
             tactile_info = manifest.get("tactile_inputs", {})
             for key in ("enabled", "copied_to_lerobot", "used_for_training"):
-                if tactile_info.get(key) is not False:
-                    manifest_errors.append(f"tactile_inputs.{key} must be false")
+                if tactile_info.get(key) is not expect_tactile:
+                    manifest_errors.append(
+                        f"tactile_inputs.{key} must be {expect_tactile}"
+                    )
+            if expect_tactile:
+                expected_tactile_fields = {
+                    "rgb_key": "observation.images.tactile_left",
+                    "marker_flow_key": "observation.tactile.marker_flow_left",
+                    "marker_valid_key": "observation.tactile.marker_valid_left",
+                }
+                for key, expected in expected_tactile_fields.items():
+                    if tactile_info.get(key) != expected:
+                        manifest_errors.append(
+                            f"tactile_inputs.{key}={tactile_info.get(key)!r}, "
+                            f"expected {expected!r}"
+                        )
 
             if manifest_errors:
                 report.fail("Conversion manifest", "; ".join(manifest_errors))
@@ -361,7 +395,7 @@ def check_dataset(
         video_count = 0
         first_video_paths: dict[str, Path] = {}
         for episode_index in range(meta.total_episodes):
-            for key in sorted(REQUIRED_VIDEO_KEYS):
+            for key in sorted(required_video_keys):
                 relpath = meta.get_video_file_path(episode_index, key)
                 video_path = relpath if relpath.is_absolute() else path / relpath
                 if not video_path.is_file():
@@ -625,6 +659,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dino-checkpoint", type=Path, default=model / "dino_video/teacher_step_10000.pth")
     parser.add_argument("--dino-config", type=Path, default=model / "dino_video/config.yaml")
     parser.add_argument("--expected-source-episodes", type=int, default=100)
+    parser.add_argument(
+        "--expect-tactile",
+        action="store_true",
+        help="Require the converter-v5 TacThru RGB/marker dataset contract",
+    )
     parser.add_argument("--require-gpu", action="store_true")
     parser.add_argument("--require-flash", action="store_true")
     parser.add_argument("--json", action="store_true")
@@ -649,6 +688,7 @@ def main() -> int:
             report,
             args.dataset.expanduser().resolve(),
             args.expected_source_episodes,
+            expect_tactile=args.expect_tactile,
         )
         check_dataset_transform(report, args.dataset.expanduser().resolve(), valid_anchors)
     if args.norm is not None:

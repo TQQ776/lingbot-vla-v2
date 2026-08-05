@@ -2,6 +2,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -12,13 +13,15 @@ from deploy.tacthru_umi_v2.realman_client import LingBotV2HttpClient, validate_s
 
 
 class FakePolicy:
-    def __init__(self, *, sleep_s: float = 0.0):
+    def __init__(self, *, sleep_s: float = 0.0, tactile: dict | None = None):
         self.sleep_s = sleep_s
         self.inputs = []
         self.reset_calls = []
         self.active = 0
         self.max_active = 0
         self.guard = threading.Lock()
+        if tactile is not None:
+            self.config = SimpleNamespace(tactile=tactile)
 
     def reset(self, robo_name):
         self.reset_calls.append(robo_name)
@@ -66,6 +69,38 @@ def make_observation(index: int = 0) -> Observation:
     )
 
 
+def tactile_contract() -> dict:
+    return {
+        "enabled": True,
+        "num_sensors": 1,
+        "num_markers": 48,
+        "use_rgb": True,
+        "use_markers": True,
+        "rgb_keys": ["observation.images.tactile_left"],
+        "marker_positions_keys": ["observation.tactile.marker_positions_left"],
+        "marker_reference_keys": ["observation.tactile.marker_reference_left"],
+        "marker_valid_mask_keys": ["observation.tactile.marker_valid_left"],
+    }
+
+
+def make_tactile_observation() -> Observation:
+    marker = np.full((1, 48, 2), 0.2, dtype=np.float32)
+    return Observation(
+        instruction="Insert the Ethernet cable",
+        state=np.asarray([0, 0, 0, 0, 0, 0, 1, 0.04], dtype=np.float32),
+        wrist_rgb=np.zeros((224, 224, 3), dtype=np.uint8),
+        tactile_rgb=np.full((1, 480, 640, 3), 30, dtype=np.uint8),
+        marker_positions=marker,
+        marker_reference=np.zeros_like(marker),
+        previous_marker_positions=marker - 0.1,
+        marker_valid_mask=np.ones((1, 48), dtype=np.bool_),
+        tactile_sensor_mask=np.ones((1,), dtype=np.bool_),
+        request_id="request-tactile",
+        session_id="session-tactile",
+        metadata={"episode_reset": True},
+    )
+
+
 def test_http_roundtrip_maps_exact_v2_observation_and_response_contract() -> None:
     policy = FakePolicy()
     server = create_http_server(make_backend(policy), host="127.0.0.1", port=0)
@@ -96,6 +131,58 @@ def test_http_roundtrip_maps_exact_v2_observation_and_response_contract() -> Non
         server.shutdown()
         server.server_close()
         thread.join(timeout=2.0)
+
+
+def test_http_roundtrip_forwards_vtla_inputs_instead_of_dropping_them() -> None:
+    policy = FakePolicy(tactile=tactile_contract())
+    server = create_http_server(make_backend(policy), host="127.0.0.1", port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        client = LingBotV2HttpClient(
+            f"http://{host}:{port}", timeout_s=5.0, jpeg_quality=100
+        )
+        health = client.health()
+        assert health["tactile_enabled"] is True
+        assert health["tactile"] == {
+            "enabled": True,
+            "num_sensors": 1,
+            "num_markers": 48,
+            "use_rgb": True,
+            "use_markers": True,
+        }
+        chunk_size = validate_server_health(health)
+        response = client.predict(
+            make_tactile_observation(), expected_steps=chunk_size
+        )
+
+        assert response.request_id == "request-tactile"
+        model_input = policy.inputs[0]
+        assert model_input["tactile_rgb"].shape == (1, 480, 640, 3)
+        assert np.allclose(model_input["marker_positions"], 0.2)
+        assert np.allclose(model_input["previous_marker_positions"], 0.1)
+        assert model_input["marker_valid_mask"].all()
+        assert model_input["tactile_sensor_mask"].tolist() == [True]
+    finally:
+        client.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+
+
+def test_vtla_backend_rejects_request_that_omits_checkpoint_modalities() -> None:
+    backend = make_backend(FakePolicy(tactile=tactile_contract()))
+
+    with pytest.raises(ValueError, match="does not match checkpoint"):
+        backend.predict(make_observation())
+
+
+def test_vision_backend_rejects_unexpected_tactile_request() -> None:
+    backend = make_backend(FakePolicy())
+
+    with pytest.raises(ValueError, match="tactile-disabled"):
+        backend.predict(make_tactile_observation())
 
 
 def test_backend_serializes_concurrent_policy_inference() -> None:

@@ -42,11 +42,14 @@ class RealmanConfig:
     gripper_max_width_m: float | None = None
     gripper_command_torque: int | None = None
     gripper_command_speed: int | None = None
+    gripper_initialize_on_start: bool | None = None
+    gripper_episode_start_width_m: float | None = None
     gripper_action_select: str | None = None
     gripper_hold_closed_below_m: float | None = None
     gripper_hold_closed_target_m: float | None = None
     exec_start_step: int = 2
     exec_end_step: int = 8
+    fixed_exec_window: bool = False
     preserve_exec_window_length: bool = True
     robot_action_latency_s: float = 0.1
     max_pos_speed_m_s: float = 0.04
@@ -153,17 +156,85 @@ class RealmanEpisodeRuntime:
             return
 
         if self.cfg.enable_gripper:
-            gripper_cfg = self._load_gripper_cfg()
-            self.gripper = self._create_gripper(gripper_cfg)
-            print(
-                "[lingbot-v2-client] enabling Gloria gripper; its configured initialization may move the gripper",
-                flush=True,
-            )
-            self.gripper.start(wait=False)
-            self.gripper.start_wait()
+            self._start_gripper()
 
         self._actuation_enabled = True
         self.reset_episode_start()
+
+    def prepare_gripper_for_episode(
+        self,
+        target_width_m: float,
+        *,
+        tolerance_m: float,
+        timeout_s: float,
+    ) -> dict[str, float]:
+        if self.robot is None:
+            raise RuntimeError("Runtime must be started before preparing the gripper")
+        if not self.cfg.enable_gripper:
+            raise RuntimeError("Cannot prepare the gripper when gripper control is disabled")
+        if self._actuation_enabled:
+            raise RuntimeError("Gripper preparation must happen before arm actuation is enabled")
+        _require_positive(tolerance_m, "gripper startup tolerance")
+        _require_positive(timeout_s, "gripper startup timeout")
+        target_width_m = float(target_width_m)
+        if (
+            not np.isfinite(target_width_m)
+            or target_width_m < self.cfg.gripper_min_width_m
+            or target_width_m > self._gripper_max_width_m
+        ):
+            raise ValueError(
+                f"Gripper startup width must be in "
+                f"[{self.cfg.gripper_min_width_m:.4f},{self._gripper_max_width_m:.4f}]m, "
+                f"got {target_width_m!r}"
+            )
+
+        self._start_gripper()
+        self.gripper.goto_pos(target_width_m)
+        deadline = time.monotonic() + float(timeout_s)
+        last_width_m: float | None = None
+        last_error: Exception | None = None
+        while time.monotonic() < deadline:
+            try:
+                last_width_m = self._read_gripper_width(require_hardware_feedback=True)
+                error_m = abs(last_width_m - target_width_m)
+                if error_m <= tolerance_m:
+                    print(
+                        "[lingbot-v2-client] Gloria startup grip verified: "
+                        f"target={target_width_m:.4f}m actual={last_width_m:.4f}m "
+                        f"error={error_m:.4f}m; arm actuation is still disabled",
+                        flush=True,
+                    )
+                    return {
+                        "target_width_m": target_width_m,
+                        "actual_width_m": last_width_m,
+                        "error_m": error_m,
+                    }
+            except Exception as exc:
+                last_error = exc
+            time.sleep(0.02)
+        raise SafetyViolation(
+            "Gloria did not reach the startup grip before inference was enabled: "
+            f"target={target_width_m:.4f}m last_width={last_width_m!r} "
+            f"tolerance={tolerance_m:.4f}m last_error={last_error!r}"
+        )
+
+    def _start_gripper(self) -> None:
+        if self.gripper is not None:
+            return
+        gripper_cfg = self._load_gripper_cfg()
+        self.gripper = self._create_gripper(gripper_cfg)
+        initialize_on_start = (
+            self.cfg.gripper_initialize_on_start
+            if self.cfg.gripper_initialize_on_start is not None
+            else bool(gripper_cfg.get("initialize_on_start", True))
+        )
+        print(
+            "[lingbot-v2-client] enabling Gloria gripper; "
+            f"initialize_on_start={initialize_on_start}",
+            flush=True,
+        )
+        self.gripper.start(wait=False)
+        self.gripper.start_wait()
 
     def close(self) -> None:
         if self.gripper is not None:
@@ -485,11 +556,15 @@ class RealmanEpisodeRuntime:
         if configured_end < configured_start:
             raise ValueError("exec_end_step must be >= exec_start_step")
         configured_count = configured_end - configured_start
-        effective_start = min(action_horizon, max(configured_start, delay_steps))
-        if self.cfg.preserve_exec_window_length:
-            effective_end = min(action_horizon, effective_start + configured_count)
+        if self.cfg.fixed_exec_window:
+            effective_start = configured_start
+            effective_end = configured_end
         else:
-            effective_end = min(action_horizon, configured_end)
+            effective_start = min(action_horizon, max(configured_start, delay_steps))
+            if self.cfg.preserve_exec_window_length:
+                effective_end = min(action_horizon, effective_start + configured_count)
+            else:
+                effective_end = min(action_horizon, configured_end)
         effective_end = max(effective_start, effective_end)
         indices = np.arange(effective_start, effective_end, dtype=np.int64)
         return indices, {
@@ -500,6 +575,7 @@ class RealmanEpisodeRuntime:
             "delay_steps": int(delay_steps),
             "configured_exec_window": [configured_start, configured_end],
             "effective_exec_window": [effective_start, effective_end],
+            "fixed_exec_window": bool(self.cfg.fixed_exec_window),
             "preserve_exec_window_length": bool(self.cfg.preserve_exec_window_length),
         }
 
@@ -591,7 +667,7 @@ class RealmanEpisodeRuntime:
                 )
             time.sleep(0.02)
 
-    def _read_gripper_width(self) -> float:
+    def _read_gripper_width(self, *, require_hardware_feedback: bool = False) -> float:
         if self.gripper is None:
             return float(self._last_gripper_width_m)
         deadline = time.monotonic() + 1.0
@@ -619,7 +695,7 @@ class RealmanEpisodeRuntime:
             except Exception as exc:
                 last_error = exc
                 time.sleep(0.02)
-        if self._actuation_enabled:
+        if self._actuation_enabled or require_hardware_feedback:
             raise RuntimeError(f"No fresh Gloria gripper feedback: {last_error}") from last_error
         if not self._warned_gripper_read_failure:
             print(f"[lingbot-v2-client] warning: failed to read gripper feedback: {last_error}", flush=True)
@@ -779,7 +855,16 @@ class RealmanEpisodeRuntime:
                 else gripper_cfg.get("command_speed", 2000)
             ),
             initial_width_mm=float(gripper_cfg.get("initial_width_mm", 45.0)),
-            episode_start_width_mm=gripper_cfg.get("episode_start_width_mm", None),
+            initialize_on_start=(
+                self.cfg.gripper_initialize_on_start
+                if self.cfg.gripper_initialize_on_start is not None
+                else bool(gripper_cfg.get("initialize_on_start", True))
+            ),
+            episode_start_width_mm=(
+                self.cfg.gripper_episode_start_width_m * 1000.0
+                if self.cfg.gripper_episode_start_width_m is not None
+                else gripper_cfg.get("episode_start_width_mm", None)
+            ),
             episode_end_width_mm=gripper_cfg.get("episode_end_width_mm", None),
             initial_move_torque=int(gripper_cfg.get("initial_move_torque", 0)),
             initial_move_speed=int(gripper_cfg.get("initial_move_speed", 2000)),
@@ -815,6 +900,11 @@ class RealmanEpisodeRuntime:
             raise ValueError("gripper_min_width_m must be finite and non-negative")
         if not np.isfinite(self.cfg.assumed_gripper_width_m):
             raise ValueError("assumed_gripper_width_m must be finite")
+        startup_width = self.cfg.gripper_episode_start_width_m
+        if startup_width is not None and (
+            not np.isfinite(startup_width) or startup_width < self.cfg.gripper_min_width_m
+        ):
+            raise ValueError("gripper_episode_start_width_m must be finite and at least gripper_min_width_m")
         for name, value in (
             ("workspace_min_xyz_m", self.cfg.workspace_min_xyz_m),
             ("workspace_max_xyz_m", self.cfg.workspace_max_xyz_m),

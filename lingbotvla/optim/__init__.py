@@ -15,6 +15,13 @@
 
 from .lr_scheduler import build_lr_scheduler
 from .optimizer import build_muon_optimizer, build_optimizer
+from .vtla import build_vtla_param_groups, summarize_vtla_param_groups
 
 
-__all__ = ["build_lr_scheduler", "build_muon_optimizer", "build_optimizer"]
+__all__ = [
+    "build_lr_scheduler",
+    "build_muon_optimizer",
+    "build_optimizer",
+    "build_vtla_param_groups",
+    "summarize_vtla_param_groups",
+]

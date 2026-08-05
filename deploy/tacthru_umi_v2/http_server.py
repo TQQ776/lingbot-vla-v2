@@ -20,12 +20,17 @@ import yaml
 from .protocol import (
     CAMERA_KEY,
     CONTROL_FREQUENCY_HZ,
+    MARKER_POSITIONS_KEY,
+    MARKER_REFERENCE_KEY,
+    MARKER_VALID_KEY,
     POSE_FRAME,
     POSE_SEMANTICS,
     PROTOCOL_NAME,
     PROTOCOL_VERSION,
     ROBOT_CONFIG,
-    TACTILE_ENABLED,
+    TACTILE_MARKER_COUNT,
+    TACTILE_RGB_KEY,
+    TACTILE_SENSOR_COUNT,
     Observation,
     action_response_to_payload,
     action_spec,
@@ -64,6 +69,13 @@ class LingBotV2Backend:
         self.use_compile = bool(use_compile)
         self.dtype = dtype
         self.contract = dict(contract or {})
+        self.tactile_contract = _tactile_contract_from_policy(policy)
+        expected_tactile = self.contract.get("tactile")
+        if expected_tactile is not None and expected_tactile != self.tactile_contract:
+            raise RuntimeError(
+                "Loaded policy tactile contract does not match its training config: "
+                f"policy={self.tactile_contract}, training={expected_tactile}"
+            )
         self.inference_lock_timeout_s = float(inference_lock_timeout_s)
         self._lock = threading.Lock()
         self._active_session_id: str | None = None
@@ -155,7 +167,8 @@ class LingBotV2Backend:
             "pose_semantics": POSE_SEMANTICS,
             "camera_key": CAMERA_KEY,
             "image_shape_hwc": [224, 224, 3],
-            "tactile_enabled": TACTILE_ENABLED,
+            "tactile_enabled": self.tactile_contract["enabled"],
+            "tactile": self.tactile_contract,
             "action_spec": action_spec(chunk_size=self.chunk_size),
             "dtype": self.dtype,
             "use_compile": self.use_compile,
@@ -196,6 +209,9 @@ class LingBotV2Backend:
                 CAMERA_KEY: np.asarray(observation.wrist_rgb, dtype=np.uint8),
                 "task": observation.instruction,
             }
+            model_observation.update(
+                _model_tactile_observation(observation, self.tactile_contract)
+            )
             policy_started = time.perf_counter()
             result = self.policy.infer(model_observation)
             policy_infer_s = time.perf_counter() - policy_started
@@ -240,10 +256,12 @@ class LingBotV2Backend:
             self._lock.release()
 
     def warmup(self) -> dict[str, Any]:
+        tactile = _synthetic_tactile_observation(self.tactile_contract)
         observation = Observation(
             instruction="Pull the tissue",
             state=np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.045], dtype=np.float32),
             wrist_rgb=np.zeros((224, 224, 3), dtype=np.uint8),
+            **tactile,
             metadata={"synthetic": True, "episode_reset": True},
         )
         started = time.time()
@@ -715,6 +733,7 @@ def _validate_deployment_contract(
 
     data = training.get("data") or {}
     train = training.get("train") or {}
+    tactile = _tactile_contract_from_mapping(train.get("tactile"))
     _require_equal(data.get("data_name"), ROBOT_CONFIG, "training data.data_name")
     _require_equal(data.get("cameras"), ["camera_wrist_left"], "training data.cameras")
     for key, expected in (
@@ -789,7 +808,123 @@ def _validate_deployment_contract(
         "combined_sha256": combined.hexdigest(),
         "robot_default_norm_stats": str(expected_norm_from_robot),
         "robot_default_norm_overridden": robot_default_norm_overridden,
+        "tactile": tactile,
     }
+
+
+def _tactile_contract_from_policy(policy: Any) -> dict[str, Any]:
+    config = getattr(policy, "config", None)
+    tactile = getattr(config, "tactile", None) if config is not None else None
+    return _tactile_contract_from_mapping(tactile)
+
+
+def _tactile_contract_from_mapping(value: Any) -> dict[str, Any]:
+    tactile = dict(value or {})
+    enabled = bool(tactile.get("enabled", False))
+    if not enabled:
+        return {
+            "enabled": False,
+            "num_sensors": 0,
+            "num_markers": 0,
+            "use_rgb": False,
+            "use_markers": False,
+        }
+    contract = {
+        "enabled": enabled,
+        "num_sensors": int(tactile.get("num_sensors", TACTILE_SENSOR_COUNT)),
+        "num_markers": int(tactile.get("num_markers", TACTILE_MARKER_COUNT)),
+        "use_rgb": bool(tactile.get("use_rgb", False)) if enabled else False,
+        "use_markers": bool(tactile.get("use_markers", False)) if enabled else False,
+    }
+    _require_equal(contract["num_sensors"], TACTILE_SENSOR_COUNT, "tactile num_sensors")
+    _require_equal(contract["num_markers"], TACTILE_MARKER_COUNT, "tactile num_markers")
+    if not (contract["use_rgb"] or contract["use_markers"]):
+        raise RuntimeError("Enabled tactile checkpoint must use RGB and/or markers")
+    if contract["use_rgb"]:
+        _require_equal(tactile.get("rgb_keys"), [TACTILE_RGB_KEY], "tactile rgb_keys")
+    if contract["use_markers"]:
+        _require_equal(
+            tactile.get("marker_positions_keys"),
+            [MARKER_POSITIONS_KEY],
+            "tactile marker_positions_keys",
+        )
+        _require_equal(
+            tactile.get("marker_reference_keys"),
+            [MARKER_REFERENCE_KEY],
+            "tactile marker_reference_keys",
+        )
+        _require_equal(
+            tactile.get("marker_valid_mask_keys"),
+            [MARKER_VALID_KEY],
+            "tactile marker_valid_mask_keys",
+        )
+    return contract
+
+
+def _model_tactile_observation(
+    observation: Observation,
+    contract: dict[str, Any],
+) -> dict[str, np.ndarray]:
+    values = {
+        "tactile_rgb": observation.tactile_rgb,
+        "marker_positions": observation.marker_positions,
+        "marker_reference": observation.marker_reference,
+        "previous_marker_positions": observation.previous_marker_positions,
+        "marker_valid_mask": observation.marker_valid_mask,
+        "tactile_sensor_mask": observation.tactile_sensor_mask,
+    }
+    supplied = {name for name, value in values.items() if value is not None}
+    if not contract["enabled"]:
+        if supplied:
+            raise ValueError(f"Checkpoint is tactile-disabled but request supplied {sorted(supplied)}")
+        return {}
+
+    required = {"tactile_sensor_mask"}
+    if contract["use_rgb"]:
+        required.add("tactile_rgb")
+    if contract["use_markers"]:
+        required.update(
+            {
+                "marker_positions",
+                "marker_reference",
+                "previous_marker_positions",
+                "marker_valid_mask",
+            }
+        )
+    missing = sorted(required - supplied)
+    unexpected = sorted(supplied - required)
+    if missing or unexpected:
+        raise ValueError(
+            "Tactile request does not match checkpoint: "
+            f"missing={missing}, unexpected={unexpected}, contract={contract}"
+        )
+    result: dict[str, np.ndarray] = {
+        name: np.asarray(value) for name, value in values.items() if value is not None
+    }
+    return result
+
+
+def _synthetic_tactile_observation(
+    contract: dict[str, Any],
+) -> dict[str, np.ndarray]:
+    if not contract["enabled"]:
+        return {}
+    result: dict[str, np.ndarray] = {
+        "tactile_sensor_mask": np.ones((TACTILE_SENSOR_COUNT,), dtype=np.bool_),
+    }
+    if contract["use_rgb"]:
+        result["tactile_rgb"] = np.zeros(
+            (TACTILE_SENSOR_COUNT, 480, 640, 3), dtype=np.uint8
+        )
+    if contract["use_markers"]:
+        marker_shape = (TACTILE_SENSOR_COUNT, TACTILE_MARKER_COUNT, 2)
+        result.update(
+            marker_positions=np.zeros(marker_shape, dtype=np.float32),
+            marker_reference=np.zeros(marker_shape, dtype=np.float32),
+            previous_marker_positions=np.zeros(marker_shape, dtype=np.float32),
+            marker_valid_mask=np.ones(marker_shape[:-1], dtype=np.bool_),
+        )
+    return result
 
 
 def _mapping_entry(entries: Any, key: str) -> dict[str, Any]:

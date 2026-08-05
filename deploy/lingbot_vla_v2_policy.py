@@ -60,6 +60,48 @@ class PolicyPreprocessMixin:
             return None
         return image_grid_thw.to(device=device, dtype=torch.long)
 
+    @staticmethod
+    def _tactile_model_kwargs(observation, *, device, dtype, batched):
+        """Move transformed TacThru tensors without changing their contract."""
+
+        expected_ranks = {
+            "tactile_rgb": 4,
+            "tactile_rgb_grid_thw": 3,
+            "marker_positions": 4,
+            "marker_reference": 4,
+            "previous_marker_positions": 4,
+            "marker_valid_mask": 3,
+            "tactile_sensor_mask": 2,
+            "tactile_rgb_mask": 2,
+        }
+        floating = {
+            "tactile_rgb",
+            "marker_positions",
+            "marker_reference",
+            "previous_marker_positions",
+        }
+        integer = {"tactile_rgb_grid_thw"}
+        result = {}
+        for key, expected_rank in expected_ranks.items():
+            value = observation.get(key)
+            if value is None:
+                continue
+            if not batched and value.ndim == expected_rank - 1:
+                value = value.unsqueeze(0)
+            if value.ndim != expected_rank:
+                raise ValueError(
+                    f"{key} must have rank {expected_rank} at model input, "
+                    f"got shape {tuple(value.shape)}"
+                )
+            if key in floating:
+                value = value.to(device=device, dtype=dtype)
+            elif key in integer:
+                value = value.to(device=device, dtype=torch.long)
+            else:
+                value = value.to(device=device, dtype=torch.bool)
+            result[key] = value
+        return result
+
     @torch.no_grad
     def select_action(
         self, observation: dict[str, Tensor], use_bf16: bool = False
@@ -76,6 +118,12 @@ class PolicyPreprocessMixin:
             observation['images'] = observation['images'].unsqueeze(0)
             observation['img_masks'] = observation['img_masks'].unsqueeze(0)
 
+        tactile_kwargs = self._tactile_model_kwargs(
+            observation,
+            device=device,
+            dtype=dtype,
+            batched=False,
+        )
         actions = self.model.sample_actions(
             observation['images'].to(dtype=dtype, device=device),
             observation['img_masks'].to(device=device),
@@ -83,6 +131,7 @@ class PolicyPreprocessMixin:
             observation['lang_masks'].unsqueeze(0).to(device=device),
             observation['state'].unsqueeze(0).to(dtype=dtype, device=device),
             image_grid_thw=self._to_device_image_grid_thw(observation.get('image_grid_thw'), device),
+            **tactile_kwargs,
         )
         delta_time = time.time() - s1
         print(f'sample_actions cost {delta_time} s')
@@ -130,6 +179,12 @@ class PolicyPreprocessMixin:
             lang_masks = lang_masks.unsqueeze(0)
         if state.ndim == 1:
             state = state.unsqueeze(0)
+        tactile_kwargs = self._tactile_model_kwargs(
+            observation,
+            device=device,
+            dtype=dtype,
+            batched=has_batch_dim,
+        )
 
         if capture_time:
             with torch.inference_mode():
@@ -141,6 +196,7 @@ class PolicyPreprocessMixin:
                             lang_masks.to(device=device),
                             state.to(dtype=dtype, device=device),
                             image_grid_thw=self._to_device_image_grid_thw(image_grid_thw, device),
+                            **tactile_kwargs,
                     )
                 torch.cuda.synchronize()
 
@@ -156,6 +212,7 @@ class PolicyPreprocessMixin:
                                     lang_masks.to(device=device),
                                     state.to(dtype=dtype, device=device),
                                     image_grid_thw=self._to_device_image_grid_thw(image_grid_thw, device),
+                                    **tactile_kwargs,
                     )
                     ends[i].record()
                 torch.cuda.synchronize()
@@ -169,6 +226,7 @@ class PolicyPreprocessMixin:
                             lang_masks.to(device=device),
                             state.to(dtype=dtype, device=device),
                             image_grid_thw=self._to_device_image_grid_thw(image_grid_thw, device),
+                            **tactile_kwargs,
             )
 
         delta_time = time.time() - s1

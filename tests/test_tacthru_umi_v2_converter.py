@@ -3,7 +3,6 @@ import pytest
 
 
 pytest.importorskip("zarr")
-pytest.importorskip("lerobot")
 pytest.importorskip("scipy")
 
 from tools.convert_tacthru_zarr_to_lerobot_v2 import (  # noqa: E402
@@ -56,7 +55,7 @@ def test_manifest_declares_v2_native_temporal_layout() -> None:
     )
 
     assert manifest["converter"] == "tacthru_umi_v2_native_30hz"
-    assert manifest["converter_version"] == CONVERTER_VERSION == 4
+    assert manifest["converter_version"] == CONVERTER_VERSION == 5
     assert manifest["source_fps"] == manifest["output_fps"] == DATASET_FPS == 30
     assert manifest["source_episodes"] == manifest["output_episodes"] == 2
     assert manifest["source_frames"] == manifest["output_frames"] == 115
@@ -78,6 +77,28 @@ def test_manifest_declares_v2_native_temporal_layout() -> None:
     assert manifest["tactile_inputs"]["used_for_training"] is False
     assert "phase_count" not in manifest
     assert "phase_stride" not in manifest
+
+
+def test_manifest_declares_vtla_tactile_contract_when_enabled() -> None:
+    plan = make_episode_plan(np.asarray([60], dtype=np.int64), num_source_episodes=1)
+    manifest = _requested_manifest(
+        signature={"source": "/tmp/source.zarr"},
+        task="Insert the Ethernet cable",
+        repo_id="vtla-dataset",
+        source_episodes=1,
+        source_frames=60,
+        plan=plan,
+        wrist_shape=(224, 224, 3),
+        excluded_tactile_source_keys=["tacthru_l_rgb", "tacthru_l_marker"],
+        include_tactile=True,
+        tactile_info={"tactile_rgb_shape": (224, 224, 3), "num_markers": 48},
+    )
+    tactile = manifest["tactile_inputs"]
+    assert tactile["enabled"] is True
+    assert tactile["copied_to_lerobot"] is True
+    assert tactile["num_markers"] == 48
+    assert tactile["canonical_equivalence"].startswith("position=flow")
+    assert "observation.images.tactile_left" in manifest["image_features"]
 
 
 def test_pose8_is_xyzw_normalized_and_canonical() -> None:

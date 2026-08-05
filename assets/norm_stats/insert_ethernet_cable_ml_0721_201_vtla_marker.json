@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "source": "/mnt/models/VTLA-RDT/tacthru/data/tasks/InsertEthernetCable/insert_ethernet_cable_ml_0721_201.zarr.zip",
+  "marker_key": "tacthru_l_marker",
+  "training_split_only": true,
+  "train_episode_start": 0,
+  "train_episode_end_exclusive": 201,
+  "train_episode_count": 201,
+  "train_frame_count": 88363,
+  "valid_marker_count": 4241424,
+  "feature_order": [
+    "dx",
+    "dy",
+    "vx",
+    "vy"
+  ],
+  "marker_mean": [
+    -0.00605073718862606,
+    0.0013775685928684302,
+    -1.0925331298195537e-05,
+    7.235680831459499e-06
+  ],
+  "marker_std": [
+    0.009294681567495851,
+    0.00814176081027235,
+    0.0004733958917668574,
+    0.0005267826380395889
+  ]
+}

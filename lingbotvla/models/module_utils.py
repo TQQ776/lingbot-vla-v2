@@ -203,6 +203,12 @@ def _init_parameter(
         print(module)
         raise ValueError(f"Cannot retrieve `_init_weights` function in the parents of {module}.")
 
+    direct_init = getattr(module, "_init_missing_parameter", None)
+    leaf_name = pieces[-1]
+    if direct_init is not None and leaf_name in module._parameters:
+        direct_init(leaf_name)
+        return
+
     module.apply(init_func)
 
 
@@ -235,6 +241,7 @@ def load_model_weights(
 
     buffer_dict     = {name: buffer.clone() for name, buffer in model.named_buffers()}
     parameter_names = {name for name, _ in model.named_parameters()}
+    loaded_parameter_names: set[str] = set()
 
     # Get model parameter names
     vlm_param_names  = weight_loader.get_vlm_para_fullnames(model)
@@ -263,11 +270,13 @@ def load_model_weights(
                     try:
                         _dispatch_parameter(model, name, tensor, dtensor_factory)
                         parameter_names.remove(name)
+                        loaded_parameter_names.add(name)
                     except Exception as exc:
                         logger.info_rank0(f">>>The {name} weight need to be reinitialized: {exc}")
                 else:
                     parameter_names.remove(name)
                     _dispatch_parameter(model, name, tensor, dtensor_factory)
+                    loaded_parameter_names.add(name)
             else:
                 if post_training:
                     error_msg = f"Unexpected key '{name}' found in state dict during Post-Training. This is not allowed!!!"
@@ -280,6 +289,29 @@ def load_model_weights(
 
     for name, buffer in buffer_dict.items():
         _dispatch_buffer(model, name, buffer)
+
+    allowed_missing_hook = getattr(model, "checkpoint_allowed_missing_parameters", None)
+    if allowed_missing_hook is not None and parameter_names:
+        allowed_missing = set(
+            allowed_missing_hook(
+                set(parameter_names),
+                loaded_parameter_names=set(loaded_parameter_names),
+            )
+        )
+        undeclared = allowed_missing - parameter_names
+        if undeclared:
+            raise ValueError(
+                "checkpoint_allowed_missing_parameters returned unknown names: "
+                f"{undeclared}"
+            )
+        for name in sorted(allowed_missing):
+            _init_parameter(model, name)
+        parameter_names.difference_update(allowed_missing)
+        if allowed_missing:
+            logger.info_rank0(
+                f"Initialized {len(allowed_missing)} VTLA parameters missing from "
+                "the tactile-free base checkpoint."
+            )
 
     if post_training:
         assert len(parameter_names) == 0, f"Missing {parameter_names} during Post-Training. This is not allowed!!!"

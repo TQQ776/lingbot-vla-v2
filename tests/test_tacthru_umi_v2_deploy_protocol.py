@@ -24,6 +24,23 @@ def identity_actions(steps: int = 50, gripper_width_m: float = 0.03) -> np.ndarr
     return action
 
 
+def tactile_observation() -> Observation:
+    marker = np.linspace(-0.2, 0.2, 48 * 2, dtype=np.float32).reshape(1, 48, 2)
+    tactile_rgb = np.zeros((1, 480, 640, 3), dtype=np.uint8)
+    tactile_rgb[..., 1] = 180
+    return Observation(
+        instruction="Insert the Ethernet cable",
+        state=identity_state(),
+        wrist_rgb=np.zeros((224, 224, 3), dtype=np.uint8),
+        tactile_rgb=tactile_rgb,
+        marker_positions=marker,
+        marker_reference=np.zeros_like(marker),
+        previous_marker_positions=marker - 0.01,
+        marker_valid_mask=np.ones((1, 48), dtype=np.bool_),
+        tactile_sensor_mask=np.ones((1,), dtype=np.bool_),
+    )
+
+
 def test_observation_roundtrip_preserves_rgb_state_ids_and_gripper_metres() -> None:
     image = np.zeros((224, 224, 3), dtype=np.uint8)
     image[..., 0] = 240
@@ -96,6 +113,38 @@ def test_wire_image_must_be_exactly_224_square() -> None:
                 wrist_rgb=np.zeros((8, 8, 3), dtype=np.uint8),
             )
         )
+
+
+def test_v2_tactile_roundtrip_preserves_rgb_and_marker_contract() -> None:
+    observation = tactile_observation()
+
+    decoded = observation_from_payload(
+        observation_to_payload(observation, jpeg_quality=100)
+    )
+
+    assert decoded.tactile_rgb.shape == (1, 480, 640, 3)
+    assert decoded.tactile_rgb[..., 1].mean() > 160
+    assert np.allclose(decoded.marker_positions, observation.marker_positions)
+    assert np.allclose(
+        decoded.previous_marker_positions,
+        observation.previous_marker_positions,
+    )
+    assert decoded.marker_valid_mask.dtype == np.bool_
+    assert decoded.marker_valid_mask.all()
+    assert decoded.tactile_sensor_mask.tolist() == [True]
+
+
+def test_tactile_marker_payload_rejects_partial_contract() -> None:
+    observation = tactile_observation()
+    observation = Observation(
+        instruction=observation.instruction,
+        state=observation.state,
+        wrist_rgb=observation.wrist_rgb,
+        marker_positions=observation.marker_positions,
+        tactile_sensor_mask=observation.tactile_sensor_mask,
+    )
+    with pytest.raises(ValueError, match="incomplete"):
+        observation_to_payload(observation)
 
 
 def test_response_spec_cannot_claim_more_steps_than_payload() -> None:

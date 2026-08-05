@@ -18,6 +18,8 @@ from typing import Any, Dict, Literal, Optional
 
 from transformers import AutoConfig, PretrainedConfig
 
+from .tactile_vtla import TactileVTLAConfig
+
 class LingbotVLAConfig(PretrainedConfig):
     """Configuration class for Lingbot-VLA.
     This is the configuration class to store the configuration of a [`Lingbot-VLA`].
@@ -93,6 +95,12 @@ class LingbotVLAConfig(PretrainedConfig):
         train_expert_only: bool = False,
         train_state_proj: bool = True,
 
+        tactile: Optional[Dict[str, Any]] = None,
+        freeze_vlm: bool = False,
+        train_action_expert: bool = True,
+        new_modules_lr: float = 1.0e-4,
+        action_expert_lr: float = 1.0e-5,
+
         **kwargs
     ):
         super().__init__()
@@ -101,6 +109,14 @@ class LingbotVLAConfig(PretrainedConfig):
         self.architectures = ["LingbotVlaPolicy"]
         self.train_state_proj = train_state_proj
         self.train_expert_only = train_expert_only
+        self.freeze_vlm = bool(freeze_vlm)
+        self.train_action_expert = bool(train_action_expert)
+        self.new_modules_lr = float(new_modules_lr)
+        self.action_expert_lr = float(action_expert_lr)
+        if self.new_modules_lr <= 0 or self.action_expert_lr <= 0:
+            raise ValueError("new_modules_lr and action_expert_lr must be positive")
+        self.tactile = TactileVTLAConfig.from_mapping(tactile).to_dict()
+        self.tactile_enabled = bool(self.tactile["enabled"])
         self.use_cache = False
         self.attention_implementation = attention_implementation
         self.num_steps = 10
@@ -191,6 +207,8 @@ class LingbotVLAV2Config(LingbotVLAConfig):
         kwargs.setdefault("qwen3vl_use_vision_boundaries", True)
         kwargs.setdefault("use_qwen3_fixed_grid_cache", True)
         super().__init__(**kwargs)
+        if self.tactile_enabled and self.tactile["freeze_vision_encoder"]:
+            self.freeze_vision_encoder = True
         self.architectures = ["LingbotVlaV2Policy"]
         self.vlm_family = "qwen3_vl"
 

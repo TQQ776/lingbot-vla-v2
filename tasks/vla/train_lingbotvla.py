@@ -30,7 +30,13 @@ from lingbotvla.distributed.offloading import build_activation_offloading_contex
 from lingbotvla.distributed.parallel_state import get_parallel_state, init_parallel_state
 from lingbotvla.distributed.torch_parallelize import build_parallelize_model
 from lingbotvla.models import build_foundation_model, build_processor, save_model_assets, build_tokenizer
-from lingbotvla.optim import build_lr_scheduler, build_muon_optimizer, build_optimizer
+from lingbotvla.optim import (
+    build_lr_scheduler,
+    build_muon_optimizer,
+    build_optimizer,
+    build_vtla_param_groups,
+    summarize_vtla_param_groups,
+)
 from lingbotvla.utils import helper
 from lingbotvla.utils.async_hf_checkpoint import AsyncHFCheckpointSaver
 from lingbotvla.utils.arguments import EvalArguments, DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
@@ -114,6 +120,62 @@ def get_moe_param_groups(model: "torch.nn.Module", args_train) -> Optional[List[
             lr_to_params[base_lr].append(param)
 
     return [{"params": params, "lr": lr} for lr, params in lr_to_params.items() if params]
+
+
+def get_vtla_param_groups(
+    model: "torch.nn.Module",
+    args_train,
+) -> Optional[List[Dict[str, Any]]]:
+    """Build disjoint AdamW groups for tactile, action, and remaining params."""
+
+    tactile_config = getattr(args_train, "tactile", {}) or {}
+    if not bool(tactile_config.get("enabled", False)):
+        return None
+    if args_train.optimizer != "adamw":
+        raise ValueError(
+            "VTLA module-specific learning rates require train.optimizer=adamw"
+        )
+
+    return build_vtla_param_groups(
+        model,
+        new_modules_lr=args_train.new_modules_lr,
+        action_expert_lr=args_train.action_expert_lr,
+        base_lr=args_train.lr,
+        weight_decay=args_train.weight_decay,
+    )
+
+
+def log_vtla_parameter_stats(model: "torch.nn.Module", param_groups) -> None:
+    """Log trainable/frozen totals and module-specific optimizer sizes."""
+
+    summary = summarize_vtla_param_groups(model, param_groups or [])
+    tactile = sum(
+        parameter.numel()
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and ".tactile_encoder." in name
+    )
+    action = sum(
+        parameter.numel()
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and (
+            ".qwen_expert." in name
+            or any(
+                fragment in name
+                for fragment in (
+                    ".state_proj.",
+                    ".action_in_proj.",
+                    ".action_out_proj.",
+                    ".action_time_mlp_in.",
+                    ".action_time_mlp_out.",
+                )
+            )
+        )
+    )
+    logger.info_rank0(
+        f"VTLA parameters: trainable={summary['trainable']} "
+        f"frozen={summary['frozen']} tactile={tactile} "
+        f"action_expert={action} groups={summary['groups']}"
+    )
 
 @dataclass
 class MyTrainingArguments(TrainingArguments):
@@ -281,6 +343,26 @@ class MyTrainingArguments(TrainingArguments):
     vlm_fsdp: bool = field(
         default=False,
         metadata={"help": "Whether to apply FSDP2 for VLM."},
+    )
+    tactile: Dict[str, Any] = field(
+        default_factory=dict,
+        metadata={"help": "Minimal TacThru VTLA input configuration."},
+    )
+    freeze_vlm: bool = field(
+        default=False,
+        metadata={"help": "Freeze the pretrained Qwen3-VL language/vision backbone."},
+    )
+    train_action_expert: bool = field(
+        default=True,
+        metadata={"help": "Train the existing action expert and action projections."},
+    )
+    new_modules_lr: float = field(
+        default=1.0e-4,
+        metadata={"help": "Learning rate for new tactile modules."},
+    )
+    action_expert_lr: float = field(
+        default=1.0e-5,
+        metadata={"help": "Learning rate for pretrained action-expert parameters."},
     )
 
 @dataclass
@@ -505,7 +587,8 @@ def main():
     if args.train.use_compile:
         model = torch.compile(model)
 
-    moe_param_groups = get_moe_param_groups(model, args.train)
+    vtla_param_groups = get_vtla_param_groups(model, args.train)
+    moe_param_groups = None if vtla_param_groups is not None else get_moe_param_groups(model, args.train)
     if moe_param_groups is not None:
         n_expert = sum(len(g["params"]) for g in moe_param_groups if g["lr"] != args.train.lr)
         group_summary = {f"lr={g['lr']:.2e}": len(g["params"]) for g in moe_param_groups}
@@ -537,8 +620,10 @@ def main():
             fused=False,
             optimizer_type=args.train.optimizer,
             post_training=args.model.post_training,
-            param_groups=moe_param_groups,
+            param_groups=vtla_param_groups or moe_param_groups,
         )
+    if vtla_param_groups is not None:
+        log_vtla_parameter_stats(model, vtla_param_groups)
 
     # Register loss-free load balancing hook (before optimizer.step).
     # The hook also all-reduces and snapshots

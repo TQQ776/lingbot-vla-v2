@@ -14,14 +14,19 @@ from .transforms import ACTION_DIM, validate_action_chunk, validate_state8
 
 
 PROTOCOL_NAME = "lingbot-vla-v2-tacthru-umi"
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 CAMERA_KEY = "observation.images.camera_wrist_left"
+TACTILE_RGB_KEY = "observation.images.tactile_left"
+MARKER_POSITIONS_KEY = "observation.tactile.marker_positions_left"
+MARKER_REFERENCE_KEY = "observation.tactile.marker_reference_left"
+MARKER_VALID_KEY = "observation.tactile.marker_valid_left"
 ROBOT_CONFIG = "tacthru_umi_v2"
 POSE_FRAME = "episode_start_new_tcp"
 POSE_SEMANTICS = "absolute_xyz_quaternion_xyzw_gripper_width_m"
 IMAGE_COLOR_SPACE = "rgb"
 IMAGE_ENCODING = "jpeg"
-TACTILE_ENABLED = False
+TACTILE_SENSOR_COUNT = 1
+TACTILE_MARKER_COUNT = 48
 CONTROL_FREQUENCY_HZ = 30.0
 MAX_INSTRUCTION_CHARS = 4096
 MAX_IMAGE_PIXELS = 20_000_000
@@ -34,6 +39,12 @@ class Observation:
     instruction: str
     state: np.ndarray
     wrist_rgb: np.ndarray
+    tactile_rgb: np.ndarray | None = None
+    marker_positions: np.ndarray | None = None
+    marker_reference: np.ndarray | None = None
+    previous_marker_positions: np.ndarray | None = None
+    marker_valid_mask: np.ndarray | None = None
+    tactile_sensor_mask: np.ndarray | None = None
     control_frequency_hz: float = 30.0
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     request_id: str = field(default_factory=lambda: uuid.uuid4().hex)
@@ -56,7 +67,7 @@ def observation_to_payload(obs: Observation, *, jpeg_quality: int = 90) -> dict[
     frequency = _validate_frequency(obs.control_frequency_hz)
     session_id = _validate_identifier(obs.session_id, "session_id")
     request_id = _validate_identifier(obs.request_id, "request_id")
-    return {
+    payload = {
         "protocol": PROTOCOL_NAME,
         "protocol_version": PROTOCOL_VERSION,
         "request_id": request_id,
@@ -66,10 +77,18 @@ def observation_to_payload(obs: Observation, *, jpeg_quality: int = 90) -> dict[
         "control_frequency_hz": frequency,
         "state": state.astype(float).tolist(),
         "images": {
-            CAMERA_KEY: encode_rgb_image(obs.wrist_rgb, jpeg_quality=jpeg_quality),
+            CAMERA_KEY: encode_rgb_image(
+                obs.wrist_rgb,
+                jpeg_quality=jpeg_quality,
+                expected_shape=(WIRE_IMAGE_HEIGHT, WIRE_IMAGE_WIDTH, 3),
+            ),
         },
         "metadata": _validate_metadata(obs.metadata),
     }
+    tactile = _tactile_to_payload(obs, jpeg_quality=jpeg_quality)
+    if tactile is not None:
+        payload["tactile"] = tactile
+    return payload
 
 
 def observation_to_json(obs: Observation, *, jpeg_quality: int = 90) -> bytes:
@@ -85,10 +104,15 @@ def observation_from_payload(payload: dict[str, Any]) -> Observation:
     if unexpected:
         raise ValueError(f"Unexpected image slots: {sorted(unexpected)}")
     metadata = _validate_metadata(payload.get("metadata"))
+    tactile = _tactile_from_payload(payload.get("tactile"))
     return Observation(
         instruction=_validate_instruction(payload.get("instruction")),
         state=validate_state8(np.asarray(payload.get("state"), dtype=np.float32)),
-        wrist_rgb=decode_rgb_image(images[CAMERA_KEY]),
+        wrist_rgb=decode_rgb_image(
+            images[CAMERA_KEY],
+            expected_shape=(WIRE_IMAGE_HEIGHT, WIRE_IMAGE_WIDTH, 3),
+        ),
+        **tactile,
         control_frequency_hz=_validate_frequency(payload.get("control_frequency_hz")),
         session_id=_validate_identifier(payload.get("session_id"), "session_id"),
         request_id=_validate_identifier(payload.get("request_id"), "request_id"),
@@ -201,8 +225,13 @@ def validate_action_spec(spec: Any, *, expected_steps: int | None = None) -> int
     return chunk_size
 
 
-def encode_rgb_image(image: np.ndarray, *, jpeg_quality: int) -> dict[str, Any]:
-    rgb = _validate_rgb_image(image)
+def encode_rgb_image(
+    image: np.ndarray,
+    *,
+    jpeg_quality: int,
+    expected_shape: tuple[int, int, int] | None = None,
+) -> dict[str, Any]:
+    rgb = _validate_rgb_image(image, expected_shape=expected_shape)
     quality = int(jpeg_quality)
     if not 1 <= quality <= 100:
         raise ValueError(f"jpeg_quality must be in [1, 100], got {quality}")
@@ -222,7 +251,11 @@ def encode_rgb_image(image: np.ndarray, *, jpeg_quality: int) -> dict[str, Any]:
     }
 
 
-def decode_rgb_image(encoded: Any) -> np.ndarray:
+def decode_rgb_image(
+    encoded: Any,
+    *,
+    expected_shape: tuple[int, int, int] | None = None,
+) -> np.ndarray:
     if not isinstance(encoded, dict):
         raise ValueError("Encoded image must be an object")
     if encoded.get("encoding") != IMAGE_ENCODING or encoded.get("color_space") != IMAGE_COLOR_SPACE:
@@ -231,10 +264,10 @@ def decode_rgb_image(encoded: Any) -> np.ndarray:
         )
     declared_width = int(encoded.get("width", -1))
     declared_height = int(encoded.get("height", -1))
-    if (declared_height, declared_width) != (WIRE_IMAGE_HEIGHT, WIRE_IMAGE_WIDTH):
+    if expected_shape is not None and (declared_height, declared_width, 3) != expected_shape:
         raise ValueError(
-            f"Wire image must be {WIRE_IMAGE_WIDTH}x{WIRE_IMAGE_HEIGHT}, "
-            f"got {declared_width}x{declared_height}"
+            f"Wire image must have shape {expected_shape}, "
+            f"got {(declared_height, declared_width, 3)}"
         )
     try:
         raw = base64.b64decode(str(encoded["data_b64"]).encode("ascii"), validate=True)
@@ -253,7 +286,7 @@ def decode_rgb_image(encoded: Any) -> np.ndarray:
     if bgr is None:
         raise ValueError("JPEG decode failed")
     rgb = np.ascontiguousarray(bgr[..., ::-1])
-    _validate_rgb_image(rgb)
+    _validate_rgb_image(rgb, expected_shape=expected_shape)
     if (declared_height, declared_width) != rgb.shape[:2]:
         raise ValueError(
             "Decoded image size does not match declaration: "
@@ -262,15 +295,157 @@ def decode_rgb_image(encoded: Any) -> np.ndarray:
     return rgb
 
 
-def _validate_rgb_image(image: np.ndarray) -> np.ndarray:
+def _tactile_to_payload(obs: Observation, *, jpeg_quality: int) -> dict[str, Any] | None:
+    values = {
+        "rgb": obs.tactile_rgb,
+        "marker_positions": obs.marker_positions,
+        "marker_reference": obs.marker_reference,
+        "previous_marker_positions": obs.previous_marker_positions,
+        "marker_valid_mask": obs.marker_valid_mask,
+        "sensor_mask": obs.tactile_sensor_mask,
+    }
+    supplied = {name for name, value in values.items() if value is not None}
+    if not supplied:
+        return None
+    if obs.tactile_sensor_mask is None:
+        raise ValueError("Tactile input requires tactile_sensor_mask")
+
+    sensor_mask = _validate_tactile_sensor_mask(obs.tactile_sensor_mask)
+    payload: dict[str, Any] = {"sensor_mask": sensor_mask.astype(bool).tolist()}
+
+    if obs.tactile_rgb is not None:
+        rgb = np.asarray(obs.tactile_rgb)
+        if rgb.dtype != np.uint8 or rgb.ndim != 4 or rgb.shape[0] != TACTILE_SENSOR_COUNT or rgb.shape[-1] != 3:
+            raise ValueError(
+                "tactile_rgb must be uint8 with shape "
+                f"[{TACTILE_SENSOR_COUNT},H,W,3], got {rgb.dtype} {rgb.shape}"
+            )
+        payload["rgb"] = [encode_rgb_image(frame, jpeg_quality=jpeg_quality) for frame in rgb]
+
+    marker_names = {
+        "marker_positions": obs.marker_positions,
+        "marker_reference": obs.marker_reference,
+        "previous_marker_positions": obs.previous_marker_positions,
+        "marker_valid_mask": obs.marker_valid_mask,
+    }
+    marker_supplied = {name for name, value in marker_names.items() if value is not None}
+    if marker_supplied and marker_supplied != set(marker_names):
+        missing = sorted(set(marker_names) - marker_supplied)
+        raise ValueError(f"Marker tactile input is incomplete; missing {missing}")
+    if marker_supplied:
+        marker_shape = (TACTILE_SENSOR_COUNT, TACTILE_MARKER_COUNT, 2)
+        for name in (
+            "marker_positions",
+            "marker_reference",
+            "previous_marker_positions",
+        ):
+            value = np.asarray(marker_names[name], dtype=np.float32)
+            if value.shape != marker_shape or not np.all(np.isfinite(value)):
+                raise ValueError(f"{name} must be finite float data with shape {marker_shape}, got {value.shape}")
+            payload[name] = value.astype(float).tolist()
+        valid = np.asarray(obs.marker_valid_mask)
+        expected_valid_shape = (TACTILE_SENSOR_COUNT, TACTILE_MARKER_COUNT)
+        if valid.dtype != np.bool_ or valid.shape != expected_valid_shape:
+            raise ValueError(
+                f"marker_valid_mask must be bool with shape {expected_valid_shape}, "
+                f"got {valid.dtype} {valid.shape}"
+            )
+        payload["marker_valid_mask"] = valid.astype(bool).tolist()
+    if "rgb" not in payload and not marker_supplied:
+        raise ValueError("Tactile input must include RGB and/or marker data")
+    return payload
+
+
+def _tactile_from_payload(value: Any) -> dict[str, np.ndarray | None]:
+    empty = {
+        "tactile_rgb": None,
+        "marker_positions": None,
+        "marker_reference": None,
+        "previous_marker_positions": None,
+        "marker_valid_mask": None,
+        "tactile_sensor_mask": None,
+    }
+    if value is None:
+        return empty
+    if not isinstance(value, dict):
+        raise ValueError("tactile must be a JSON object")
+    allowed = {
+        "rgb",
+        "marker_positions",
+        "marker_reference",
+        "previous_marker_positions",
+        "marker_valid_mask",
+        "sensor_mask",
+    }
+    unexpected = set(value) - allowed
+    if unexpected:
+        raise ValueError(f"Unexpected tactile fields: {sorted(unexpected)}")
+
+    sensor_mask = _validate_tactile_sensor_mask(value.get("sensor_mask"))
+    result = dict(empty)
+    result["tactile_sensor_mask"] = sensor_mask
+
+    rgb_payload = value.get("rgb")
+    if rgb_payload is not None:
+        if not isinstance(rgb_payload, list) or len(rgb_payload) != TACTILE_SENSOR_COUNT:
+            raise ValueError(f"tactile.rgb must contain {TACTILE_SENSOR_COUNT} encoded image")
+        result["tactile_rgb"] = np.stack(
+            [decode_rgb_image(frame) for frame in rgb_payload], axis=0
+        )
+
+    marker_fields = (
+        "marker_positions",
+        "marker_reference",
+        "previous_marker_positions",
+        "marker_valid_mask",
+    )
+    marker_supplied = {name for name in marker_fields if value.get(name) is not None}
+    if marker_supplied and marker_supplied != set(marker_fields):
+        missing = sorted(set(marker_fields) - marker_supplied)
+        raise ValueError(f"Marker tactile input is incomplete; missing {missing}")
+    if marker_supplied:
+        marker_shape = (TACTILE_SENSOR_COUNT, TACTILE_MARKER_COUNT, 2)
+        for name in marker_fields[:3]:
+            array = np.asarray(value[name], dtype=np.float32)
+            if array.shape != marker_shape or not np.all(np.isfinite(array)):
+                raise ValueError(f"tactile.{name} must be finite with shape {marker_shape}, got {array.shape}")
+            result[name] = np.ascontiguousarray(array)
+        valid = np.asarray(value["marker_valid_mask"])
+        expected_valid_shape = (TACTILE_SENSOR_COUNT, TACTILE_MARKER_COUNT)
+        if valid.dtype != np.bool_ or valid.shape != expected_valid_shape:
+            raise ValueError(
+                f"tactile.marker_valid_mask must be bool with shape {expected_valid_shape}, "
+                f"got {valid.dtype} {valid.shape}"
+            )
+        result["marker_valid_mask"] = np.ascontiguousarray(valid)
+    if result["tactile_rgb"] is None and not marker_supplied:
+        raise ValueError("tactile must include RGB and/or marker data")
+    return result
+
+
+def _validate_tactile_sensor_mask(value: Any) -> np.ndarray:
+    mask = np.asarray(value)
+    if mask.dtype != np.bool_ or mask.shape != (TACTILE_SENSOR_COUNT,):
+        raise ValueError(
+            f"tactile_sensor_mask must be bool with shape ({TACTILE_SENSOR_COUNT},), "
+            f"got {mask.dtype} {mask.shape}"
+        )
+    return np.ascontiguousarray(mask)
+
+
+def _validate_rgb_image(
+    image: np.ndarray,
+    *,
+    expected_shape: tuple[int, int, int] | None = None,
+) -> np.ndarray:
     rgb = np.asarray(image)
     if rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[-1] != 3:
         raise ValueError(f"Expected uint8 RGB image with shape (H, W, 3), got {rgb.dtype} {rgb.shape}")
     if rgb.shape[0] <= 0 or rgb.shape[1] <= 0 or rgb.shape[0] * rgb.shape[1] > MAX_IMAGE_PIXELS:
         raise ValueError(f"Invalid image dimensions: {rgb.shape}")
-    if rgb.shape[:2] != (WIRE_IMAGE_HEIGHT, WIRE_IMAGE_WIDTH):
+    if expected_shape is not None and tuple(rgb.shape) != expected_shape:
         raise ValueError(
-            f"Wire RGB image must have shape ({WIRE_IMAGE_HEIGHT}, {WIRE_IMAGE_WIDTH}, 3), got {rgb.shape}"
+            f"Wire RGB image must have shape {expected_shape}, got {rgb.shape}"
         )
     return np.ascontiguousarray(rgb)
 

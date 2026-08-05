@@ -177,7 +177,14 @@ class LeRobotDataset(BaseLeRobotDataset):
 
     def load_hf_dataset(self, features=None):
         episodes = self.episodes if self.episodes is not None else list(range(self.meta.total_episodes))
-        files = [str(self.root / self.meta.get_data_file_path(ep_idx)) for ep_idx in episodes]
+        # LeRobot v3 may consolidate many episodes into one parquet.  Loading
+        # one path per episode would duplicate the same physical rows N times.
+        files = sorted(
+            {
+                str(self.root / self.meta.get_data_file_path(ep_idx))
+                for ep_idx in episodes
+            }
+        )
         hf_dataset = _hf_load_dataset("parquet", data_files=files, split="train")
         if features is not None:
             # available = set(hf_dataset.column_names)
@@ -347,17 +354,38 @@ class VLADataset(Dataset):
         else:
             for state_feature in self.feature_transform.org_features['states']:
                 delta_timestamps[state_feature] = [t / fps if fps else t for t in range(self.chunk_size+1)]
+        if getattr(self.feature_transform, "tactile_enabled", False):
+            settings = self.feature_transform.tactile_settings
+            available = set(self.dataset_meta.features)
+            marker_keys = (
+                *settings.marker_positions_keys,
+                *settings.marker_reference_keys,
+                *settings.marker_valid_mask_keys,
+                *settings.marker_flow_keys,
+            )
+            # Query previous+current within the same episode.  LeRobot marks a
+            # repeated episode-boundary value as padded; the transform then
+            # deterministically produces zero initial velocity.
+            previous_offset = -1 if return_indices else -1.0 / float(self.dataset_meta.fps)
+            for key in marker_keys:
+                if key in available:
+                    delta_timestamps[key] = [previous_offset, 0]
         return delta_timestamps
 
     def get_video_delta_timestamps(self):
         """Multi-frame time offsets for video keys; returns an empty dict when disabled."""
 
         fps = self.dataset_meta.fps
+        result = {}
         if self.use_future_image:
             offsets = [0, (self.chunk_size - 1) / fps]
-            return dict.fromkeys(self.feature_transform.org_features['images'], offsets)
-        else:
-            return {}
+            result.update(dict.fromkeys(self.feature_transform.org_features['images'], offsets))
+        if getattr(self.feature_transform, "tactile_enabled", False):
+            available = set(self.dataset_meta.features)
+            for key in self.feature_transform.tactile_settings.rgb_keys:
+                if key in available:
+                    result[key] = [0]
+        return result
 
     def check_lerobot_item(self, item):
         # if state or action is a 0-d tensor, convert it to 1-d tensor

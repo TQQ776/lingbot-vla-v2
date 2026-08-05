@@ -3,8 +3,8 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${LINGBOT_V2_PYTHON:-$PROJECT_ROOT/.venv/bin/python}"
-CHECKPOINT="${LINGBOT_V2_CHECKPOINT:-$PROJECT_ROOT/output/pull_tissue_v2_formal/checkpoints/global_step_40000/hf_ckpt}"
-NORM_STATS="${LINGBOT_V2_NORM_STATS:-$PROJECT_ROOT/assets/norm_stats/tacthru_umi_v2.json}"
+CHECKPOINT="${LINGBOT_V2_CHECKPOINT:-$PROJECT_ROOT/output/insert_ethernet_vtla_rgb_marker_all201_v1/checkpoints/global_step_40000/hf_ckpt}"
+NORM_STATS="${LINGBOT_V2_NORM_STATS:-$PROJECT_ROOT/assets/norm_stats/insert_ethernet_cable_ml_0721_201_vtla_all201.json}"
 QWEN_PATH="${QWEN3VL_PATH:-$PROJECT_ROOT/models/Qwen3-VL-4B-Instruct}"
 HTTP_KEEP_ALIVE="${LINGBOT_V2_HTTP_KEEP_ALIVE:-1}"
 

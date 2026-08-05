@@ -220,7 +220,7 @@ bash scripts/run_tacthru_umi_v2_client.sh run \
   --workspace-max-xyz <X_MAX> <Y_MAX> <Z_MAX>
 ```
 
-`--execute` 后还必须按一次 Space。只有按下 Space 后，client 才会启用轨迹下发并启动 Gloria gripper；夹爪初始化本身可能移动夹爪。首次运行应保持急停可触及，并只执行一个短 chunk。
+`--execute` 配合 `--gripper-startup-width-m` 时采用两阶段启动：第一次 Space 只启动 Gloria、闭合到指定宽度并等待硬件反馈进入容差，机械臂仍保持禁用；第二次 Space 才启用轨迹下发并开始推理。若未提供 `--gripper-startup-width-m`，则保留单次 Space 直接启用执行的兼容行为。首次运行应保持急停可触及，并只执行一个短 chunk。
 
 执行窗口是半开区间：`--exec-start-step 2 --exec-end-step 3` 实际只选择索引 `2`。夹爪对当前窗口的预测宽度做二值判断：最小值 `<12 mm` 时命令 `4 mm`，否则命令 Gloria 配置中的初始宽度 `45 mm`；等于阈值时打开，且不保留 episode 闭合锁存。正常退出时 client 会在关闭 Gloria、解除舵机力矩前再次等待 Space；先固定或取走夹持物，避免掉落。
 

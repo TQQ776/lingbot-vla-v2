@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert TacThru UMI Zarr data to a wrist-RGB-only LingBot-VLA v2 dataset.
+"""Convert TacThru UMI Zarr data to a LingBot-VLA v2 LeRobot dataset.
 
 The conversion preserves the source dataset's native 30 Hz timeline and
 episode boundaries: one TacThru episode becomes one LeRobot episode, and every
@@ -8,9 +8,9 @@ are stored as the same absolute 8D pose
 ``xyz + quaternion_xyzw + gripper``; the v2 robot config is responsible for
 converting future absolute poses to local relative actions.
 
-Only ``camera0_rgb`` is copied as a visual input.  TacThru tactile RGB and
-marker-flow arrays remain in the source Zarr and are intentionally excluded
-from the converted LeRobot dataset.
+The default remains wrist-RGB-only.  ``--include-tactile`` additionally writes
+TacThru RGB and canonical marker position/reference/valid fields for the
+minimal VTLA input path.
 """
 
 from __future__ import annotations
@@ -24,7 +24,6 @@ from typing import Any, Iterator
 
 import numpy as np
 import zarr
-from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from scipy.spatial.transform import Rotation
 from tqdm import tqdm
 
@@ -32,7 +31,7 @@ from tqdm import tqdm
 SOURCE_FPS = 30
 DATASET_FPS = SOURCE_FPS
 ACTION_CHUNK_SIZE = 50
-CONVERTER_VERSION = 4
+CONVERTER_VERSION = 5
 MANIFEST_NAME = "tacthru_umi_v2_conversion.json"
 ROBOT_TYPE = "realman_tacthru_umi_v2"
 
@@ -46,12 +45,32 @@ REQUIRED_KEYS = (
 IMAGE_FEATURES = (
     "observation.images.camera_wrist_left",
 )
+TACTILE_RGB_FEATURE = "observation.images.tactile_left"
+MARKER_POSITIONS_FEATURE = "observation.tactile.marker_positions_left"
+MARKER_REFERENCE_FEATURE = "observation.tactile.marker_reference_left"
+MARKER_VALID_FEATURE = "observation.tactile.marker_valid_left"
 EXCLUDED_TACTILE_SOURCE_KEYS = (
     "tacthru_l_rgb",
     "tacthru_r_rgb",
     "tacthru_l_marker",
     "tacthru_r_marker",
 )
+
+
+def _lerobot_dataset_classes():
+    """Import LeRobot only when output creation or validation needs it."""
+
+    try:
+        from lerobot.datasets.lerobot_dataset import (
+            LeRobotDataset,
+            LeRobotDatasetMetadata,
+        )
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "Full conversion requires the training environment's lerobot package; "
+            "--check-only can run without it"
+        ) from exc
+    return LeRobotDataset, LeRobotDatasetMetadata
 
 STATE_NAMES = (
     "eef_x",
@@ -174,6 +193,29 @@ def inspect_source(root: Any) -> dict[str, Any]:
     }
 
 
+def inspect_tactile_source(root: Any) -> dict[str, Any]:
+    """Validate the left TacThru RGB/marker-flow arrays used by VTLA."""
+
+    data = root["data"]
+    required = ("tacthru_l_rgb", "tacthru_l_marker")
+    missing = [key for key in required if key not in data]
+    if missing:
+        raise ValueError(f"--include-tactile requires source fields: {missing}")
+    rgb_shape = _validate_image_array(data["tacthru_l_rgb"], "tacthru_l_rgb")
+    marker_shape = tuple(int(value) for value in data["tacthru_l_marker"].shape)
+    if len(marker_shape) != 3 or marker_shape[-1] != 2:
+        raise ValueError(
+            f"tacthru_l_marker must have shape (N,M,2), got {marker_shape}"
+        )
+    total_frames = int(root["meta/episode_ends"][-1])
+    if len(data["tacthru_l_rgb"]) != total_frames or marker_shape[0] != total_frames:
+        raise ValueError("Left tactile RGB/marker timelines must match episode_ends")
+    return {
+        "tactile_rgb_shape": rgb_shape,
+        "num_markers": marker_shape[1],
+    }
+
+
 def make_episode_plan(
     episode_ends: np.ndarray,
     num_source_episodes: int,
@@ -239,11 +281,14 @@ def build_pose8(position: np.ndarray, rotvec: np.ndarray, gripper_width: np.ndar
     return pose
 
 
-def build_features(wrist_shape: tuple[int, int, int]) -> dict:
+def build_features(
+    wrist_shape: tuple[int, int, int],
+    tactile_info: dict[str, Any] | None = None,
+) -> dict:
     """Build the LeRobot v3 feature declaration."""
 
     wrist_height, wrist_width, _ = wrist_shape
-    return {
+    features = {
         "observation.state": {
             "dtype": "float32",
             "shape": (8,),
@@ -260,15 +305,45 @@ def build_features(wrist_shape: tuple[int, int, int]) -> dict:
             "names": ["channels", "height", "width"],
         },
     }
+    if tactile_info is not None:
+        tactile_height, tactile_width, _ = tactile_info["tactile_rgb_shape"]
+        num_markers = int(tactile_info["num_markers"])
+        features.update(
+            {
+                TACTILE_RGB_FEATURE: {
+                    "dtype": "video",
+                    "shape": (3, tactile_height, tactile_width),
+                    "names": ["channels", "height", "width"],
+                },
+                MARKER_POSITIONS_FEATURE: {
+                    "dtype": "float32",
+                    "shape": (num_markers, 2),
+                    "names": None,
+                },
+                MARKER_REFERENCE_FEATURE: {
+                    "dtype": "float32",
+                    "shape": (num_markers, 2),
+                    "names": None,
+                },
+                MARKER_VALID_FEATURE: {
+                    "dtype": "bool",
+                    "shape": (num_markers,),
+                    "names": [f"marker_{index:03d}" for index in range(num_markers)],
+                },
+            }
+        )
+    return features
 
 
 def validate_output(
     output: Path,
     expected_episode_lengths: list[int],
     expected_frames: int,
+    include_tactile: bool = False,
 ) -> dict[str, Any]:
     """Validate counts, feature schema, and all referenced video files."""
 
+    _, LeRobotDatasetMetadata = _lerobot_dataset_classes()
     meta = LeRobotDatasetMetadata(repo_id=output.name, root=output)
     errors: list[str] = []
     expected_episodes = len(expected_episode_lengths)
@@ -281,6 +356,17 @@ def validate_output(
         errors.append(f"fps={meta.fps}, expected {DATASET_FPS}")
 
     required_features = set(IMAGE_FEATURES + ("observation.state", "action"))
+    video_features = list(IMAGE_FEATURES)
+    if include_tactile:
+        required_features.update(
+            {
+                TACTILE_RGB_FEATURE,
+                MARKER_POSITIONS_FEATURE,
+                MARKER_REFERENCE_FEATURE,
+                MARKER_VALID_FEATURE,
+            }
+        )
+        video_features.append(TACTILE_RGB_FEATURE)
     missing_features = required_features - set(meta.features)
     if missing_features:
         errors.append(f"missing features: {sorted(missing_features)}")
@@ -311,7 +397,7 @@ def validate_output(
     missing_video_paths: list[str] = []
     if not missing_features:
         for episode_index in range(meta.total_episodes):
-            for video_key in IMAGE_FEATURES:
+            for video_key in video_features:
                 video_path = output / meta.get_video_file_path(episode_index, video_key)
                 if not video_path.is_file():
                     missing_video_paths.append(str(video_path))
@@ -341,6 +427,8 @@ def _requested_manifest(
     plan: list[dict[str, int]],
     wrist_shape: tuple[int, int, int],
     excluded_tactile_source_keys: list[str],
+    include_tactile: bool = False,
+    tactile_info: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     episode_lengths = [item["length"] for item in plan]
     output_frames = int(sum(episode_lengths))
@@ -370,16 +458,26 @@ def _requested_manifest(
         "representation": "xyz_quaternion_xyzw_gripper",
         "state_action_representation": "xyz3+quaternion_xyzw4+gripper1",
         "quaternion_canonicalization": "w_nonnegative",
-        "visual_input_policy": "wrist_rgb_only",
-        "image_features": list(IMAGE_FEATURES),
+        "visual_input_policy": "wrist_plus_tactile_rgb" if include_tactile else "wrist_rgb_only",
+        "image_features": list(IMAGE_FEATURES) + ([TACTILE_RGB_FEATURE] if include_tactile else []),
         "wrist_rgb_source_key": "camera0_rgb",
         "wrist_rgb_image_shape_hwc": list(wrist_shape),
         "tactile_inputs": {
             "source_keys_present": sorted(excluded_tactile_source_keys),
-            "enabled": False,
-            "copied_to_lerobot": False,
-            "used_for_training": False,
-            "reason": "wrist-camera-only baseline requested; tactile RGB and marker flow are excluded",
+            "enabled": include_tactile,
+            "copied_to_lerobot": include_tactile,
+            "used_for_training": include_tactile,
+            "rgb_feature": TACTILE_RGB_FEATURE if include_tactile else None,
+            "marker_positions_feature": MARKER_POSITIONS_FEATURE if include_tactile else None,
+            "marker_reference_feature": MARKER_REFERENCE_FEATURE if include_tactile else None,
+            "marker_valid_feature": MARKER_VALID_FEATURE if include_tactile else None,
+            "num_markers": None if tactile_info is None else tactile_info["num_markers"],
+            "source_marker_representation": "normalized_marker_flow",
+            "canonical_equivalence": (
+                "position=flow, reference=0; previous position queried within episode"
+                if include_tactile
+                else None
+            ),
         },
     }
 
@@ -402,6 +500,7 @@ def convert(args: argparse.Namespace) -> None:
 
     with open_zarr_group(source) as root:
         source_info = inspect_source(root)
+        tactile_info = inspect_tactile_source(root) if args.include_tactile else None
         available_source_episodes = source_info["source_episodes"]
         num_source_episodes = available_source_episodes
         if args.max_source_episodes is not None:
@@ -428,6 +527,8 @@ def convert(args: argparse.Namespace) -> None:
             plan=plan,
             wrist_shape=source_info["wrist_image_shape"],
             excluded_tactile_source_keys=source_info["excluded_tactile_source_keys"],
+            include_tactile=args.include_tactile,
+            tactile_info=tactile_info,
         )
 
         print(
@@ -455,6 +556,7 @@ def convert(args: argparse.Namespace) -> None:
                             output,
                             output_episode_lengths,
                             output_frames,
+                            include_tactile=args.include_tactile,
                         )
                         print(
                             json.dumps(
@@ -474,12 +576,13 @@ def convert(args: argparse.Namespace) -> None:
             shutil.rmtree(output)
 
         output.parent.mkdir(parents=True, exist_ok=True)
+        LeRobotDataset, _ = _lerobot_dataset_classes()
         dataset = LeRobotDataset.create(
             repo_id=repo_id,
             root=output,
             fps=DATASET_FPS,
             robot_type=ROBOT_TYPE,
-            features=build_features(source_info["wrist_image_shape"]),
+            features=build_features(source_info["wrist_image_shape"], tactile_info),
             use_videos=True,
             image_writer_threads=args.image_writer_threads,
             batch_encoding_size=args.batch_encoding_size,
@@ -496,31 +599,60 @@ def convert(args: argparse.Namespace) -> None:
             gripper = np.asarray(data["robot0_gripper_width"][source_slice], dtype=np.float32)
             poses = build_pose8(positions, rotvecs, gripper)
             wrist_images = np.asarray(data["camera0_rgb"][source_slice], dtype=np.uint8)
+            tactile_images = None
+            marker_flow = None
+            if args.include_tactile:
+                tactile_images = np.asarray(
+                    data["tacthru_l_rgb"][source_slice], dtype=np.uint8
+                )
+                marker_flow = np.asarray(
+                    data["tacthru_l_marker"][source_slice], dtype=np.float32
+                )
 
             expected_length = source_episode["length"]
-            if not (len(poses) == len(wrist_images) == expected_length):
+            lengths = [len(poses), len(wrist_images)]
+            if tactile_images is not None:
+                lengths.extend([len(tactile_images), len(marker_flow)])
+            if any(length != expected_length for length in lengths):
                 raise RuntimeError(
                     "Contiguous slice length mismatch for "
                     f"source episode {source_episode['source_episode_index']}: "
-                    f"pose={len(poses)}, wrist={len(wrist_images)}, "
+                    f"lengths={lengths}, "
                     f"expected={expected_length}"
                 )
 
             for frame_offset in range(expected_length):
                 state = poses[frame_offset]
-                dataset.add_frame(
-                    {
+                frame = {
                         "observation.state": state,
                         "action": state.copy(),
                         IMAGE_FEATURES[0]: wrist_images[frame_offset],
                         "task": args.task,
                     }
-                )
+                if args.include_tactile:
+                    marker = marker_flow[frame_offset]
+                    valid = np.isfinite(marker).all(axis=-1)
+                    if not valid.all():
+                        marker = np.where(valid[:, None], marker, 0.0).astype(np.float32)
+                    frame.update(
+                        {
+                            TACTILE_RGB_FEATURE: tactile_images[frame_offset],
+                            MARKER_POSITIONS_FEATURE: marker,
+                            MARKER_REFERENCE_FEATURE: np.zeros_like(marker),
+                            MARKER_VALID_FEATURE: valid.astype(np.bool_),
+                        }
+                    )
+                dataset.add_frame(frame)
             dataset.save_episode(parallel_encoding=not args.serial_video_encoding)
 
         dataset.finalize()
 
-    result = validate_output(output, output_episode_lengths, output_frames)
+    result = validate_output(
+        output,
+        output_episode_lengths,
+        output_frames,
+        include_tactile=args.include_tactile,
+    )
     manifest = {
         **requested_manifest,
         "output": str(output),
@@ -545,6 +677,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-writer-threads", type=int, default=8)
     parser.add_argument("--batch-encoding-size", type=int, default=1)
     parser.add_argument("--serial-video-encoding", action="store_true")
+    parser.add_argument(
+        "--include-tactile",
+        action="store_true",
+        help="Copy left TacThru RGB and canonical marker fields for VTLA",
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--check-only", action="store_true", help="Validate source and print the conversion plan")
     args = parser.parse_args()

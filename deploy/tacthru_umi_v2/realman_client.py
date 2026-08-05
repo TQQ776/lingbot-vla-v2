@@ -32,7 +32,8 @@ from .protocol import (
     PROTOCOL_NAME,
     PROTOCOL_VERSION,
     ROBOT_CONFIG,
-    TACTILE_ENABLED,
+    TACTILE_MARKER_COUNT,
+    TACTILE_SENSOR_COUNT,
     ActionResponse,
     Observation,
     action_response_from_json,
@@ -40,6 +41,7 @@ from .protocol import (
     validate_action_spec,
 )
 from .realman_runtime import RealmanConfig, RealmanEpisodeRuntime, SafetyViolation
+from .tactile_source import TacThruSource
 from .transforms import validate_state8
 
 
@@ -609,7 +611,10 @@ def build_parser() -> argparse.ArgumentParser:
     synthetic.add_argument("--state", default="0,0,0,0,0,0,1,0.045")
     synthetic.add_argument("--control-frequency", type=float, default=30.0)
 
-    run = subparsers.add_parser("run", help="Capture wrist RGB/state, infer, and optionally control Realman")
+    run = subparsers.add_parser(
+        "run",
+        help="Capture wrist RGB/state and checkpoint-required TacThru inputs, then infer/control Realman",
+    )
     _add_http_args(run, default_timeout=120.0)
     run.add_argument("--instruction", default="Pull the tissue")
     run.add_argument("--control-frequency", type=float, default=30.0)
@@ -624,6 +629,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--log-jsonl", type=Path, default=None)
     run.add_argument("--tacthru-repo", type=Path, default=Path("/mnt/models/VTLA-RDT/tacthru"))
     run.add_argument("--camera-cfg", type=Path, default=Path("cfg/camera/synria_c10.yaml"))
+    run.add_argument("--tactile-sensor-cfg", type=Path, default=Path("cfg/sensor/ml.yaml"))
     run.add_argument("--robot-cfg", type=Path, default=Path("cfg/robot/realman.yaml"))
     run.add_argument("--gripper-cfg", type=Path, default=Path("cfg/gripper/synria_gloria.yaml"))
     run.add_argument("--disable-gripper", action="store_true")
@@ -634,6 +640,14 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--gripper-max-width-m", type=float, default=None)
     run.add_argument("--gripper-command-torque", type=int, default=None)
     run.add_argument("--gripper-command-speed", type=int, default=None)
+    run.add_argument(
+        "--gripper-startup-width-m",
+        type=float,
+        default=None,
+        help="Enable two-stage execution: first Space grips to this width; second Space starts inference.",
+    )
+    run.add_argument("--gripper-startup-tolerance-m", type=float, default=0.005)
+    run.add_argument("--gripper-startup-timeout-s", type=float, default=3.0)
     run.add_argument(
         "--gripper-action-select",
         choices=["last", "first", "min", "median", "threshold"],
@@ -659,6 +673,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--exec-start-step", type=int, default=2)
     run.add_argument("--exec-end-step", type=int, default=8)
+    run.add_argument(
+        "--fixed-exec-window",
+        action="store_true",
+        help="Always select [exec-start-step, exec-end-step), without online-delay index shifting.",
+    )
     run.add_argument("--no-preserve-exec-window-length", action="store_true")
     run.add_argument("--robot-action-latency", type=float, default=0.1)
     run.add_argument("--max-pos-speed", type=float, default=0.04)
@@ -672,6 +691,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-robot-state-age-s", type=float, default=0.25)
     run.add_argument("--max-gripper-state-age-s", type=float, default=0.50)
     run.add_argument("--max-sensor-skew-s", type=float, default=0.10)
+    run.add_argument("--max-tactile-skew-s", type=float, default=0.20)
+    run.add_argument("--max-tactile-age-s", type=float, default=0.25)
+    run.add_argument("--min-valid-markers", type=int, default=40)
     run.add_argument("--max-scheduled-duration-s", type=float, default=3.0)
     run.add_argument("--verify-position-tolerance-m", type=float, default=0.03)
     run.add_argument("--verify-rotation-tolerance-rad", type=float, default=0.35)
@@ -723,7 +745,7 @@ def main(argv: list[str] | None = None) -> None:
         if args.command == "health":
             print(json.dumps(health, indent=2, ensure_ascii=False))
         elif args.command == "synthetic":
-            run_synthetic(args, client, chunk_size)
+            run_synthetic(args, client, chunk_size, health)
         elif args.command == "run":
             run_realman(args, client, health, chunk_size)
         else:
@@ -742,7 +764,6 @@ def validate_server_health(health: dict) -> int:
         "pose_frame": POSE_FRAME,
         "pose_semantics": POSE_SEMANTICS,
         "camera_key": CAMERA_KEY,
-        "tactile_enabled": TACTILE_ENABLED,
         "control_frequency_hz": CONTROL_FREQUENCY_HZ,
     }
     for key, value in expected.items():
@@ -755,10 +776,78 @@ def validate_server_health(health: dict) -> int:
     image_shape = health.get("image_shape_hwc")
     if image_shape != [DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE, 3]:
         raise RuntimeError(f"Expected server image_shape_hwc=[224,224,3], got {image_shape!r}")
+    _tactile_contract_from_health(health)
     return chunk_size
 
 
-def run_synthetic(args: argparse.Namespace, client: LingBotV2HttpClient, chunk_size: int) -> None:
+def _tactile_contract_from_health(health: dict) -> dict[str, Any]:
+    value = health.get("tactile")
+    if not isinstance(value, dict):
+        raise RuntimeError(f"Server health is missing the tactile contract: {value!r}")
+    enabled = value.get("enabled")
+    use_rgb = value.get("use_rgb")
+    use_markers = value.get("use_markers")
+    for name, setting in (
+        ("enabled", enabled),
+        ("use_rgb", use_rgb),
+        ("use_markers", use_markers),
+    ):
+        if not isinstance(setting, bool):
+            raise RuntimeError(f"Server tactile.{name} must be boolean, got {setting!r}")
+    expected_enabled = bool(health.get("tactile_enabled"))
+    if enabled != expected_enabled:
+        raise RuntimeError(
+            "Server tactile health is inconsistent: "
+            f"tactile_enabled={expected_enabled}, tactile.enabled={enabled}"
+        )
+    num_sensors = int(value.get("num_sensors", -1))
+    num_markers = int(value.get("num_markers", -1))
+    if enabled:
+        if num_sensors != TACTILE_SENSOR_COUNT or num_markers != TACTILE_MARKER_COUNT:
+            raise RuntimeError(
+                "Unsupported tactile shape: "
+                f"sensors={num_sensors}, markers={num_markers}"
+            )
+        if not (use_rgb or use_markers):
+            raise RuntimeError("Enabled tactile checkpoint has no active modality")
+    elif any((num_sensors != 0, num_markers != 0, use_rgb, use_markers)):
+        raise RuntimeError(f"Disabled tactile checkpoint has inconsistent contract: {value}")
+    return {
+        "enabled": enabled,
+        "num_sensors": num_sensors,
+        "num_markers": num_markers,
+        "use_rgb": use_rgb,
+        "use_markers": use_markers,
+    }
+
+
+def _synthetic_tactile_inputs(contract: dict[str, Any]) -> dict[str, np.ndarray]:
+    if not contract["enabled"]:
+        return {}
+    result: dict[str, np.ndarray] = {
+        "tactile_sensor_mask": np.ones((TACTILE_SENSOR_COUNT,), dtype=np.bool_),
+    }
+    if contract["use_rgb"]:
+        result["tactile_rgb"] = np.zeros(
+            (TACTILE_SENSOR_COUNT, 480, 640, 3), dtype=np.uint8
+        )
+    if contract["use_markers"]:
+        marker_shape = (TACTILE_SENSOR_COUNT, TACTILE_MARKER_COUNT, 2)
+        result.update(
+            marker_positions=np.zeros(marker_shape, dtype=np.float32),
+            marker_reference=np.zeros(marker_shape, dtype=np.float32),
+            previous_marker_positions=np.zeros(marker_shape, dtype=np.float32),
+            marker_valid_mask=np.ones(marker_shape[:-1], dtype=np.bool_),
+        )
+    return result
+
+
+def run_synthetic(
+    args: argparse.Namespace,
+    client: LingBotV2HttpClient,
+    chunk_size: int,
+    health: dict,
+) -> None:
     state = _parse_state(args.state)
     if args.image is None:
         image = np.zeros((DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE, 3), dtype=np.uint8)
@@ -767,10 +856,12 @@ def run_synthetic(args: argparse.Namespace, client: LingBotV2HttpClient, chunk_s
         if bgr is None:
             raise FileNotFoundError(args.image)
         image = center_crop_resize_rgb(bgr, output_size=DEFAULT_IMAGE_SIZE)
+    tactile = _synthetic_tactile_inputs(_tactile_contract_from_health(health))
     observation = Observation(
         instruction=args.instruction,
         state=state,
         wrist_rgb=image,
+        **tactile,
         control_frequency_hz=args.control_frequency,
         metadata={"synthetic": True, "episode_reset": True},
     )
@@ -804,12 +895,30 @@ def run_realman(
         "rate_hz",
         "max_roundtrip_s",
         "max_sensor_skew_s",
+        "max_tactile_skew_s",
+        "max_tactile_age_s",
+        "gripper_startup_tolerance_m",
+        "gripper_startup_timeout_s",
         "verify_position_tolerance_m",
         "verify_rotation_tolerance_rad",
         "verify_gripper_tolerance_m",
         "verification_timeout_s",
     ):
         _require_positive_cli(getattr(args, name), f"--{name.replace('_', '-')}")
+    tactile_contract = _tactile_contract_from_health(health)
+    if not 0 <= args.min_valid_markers <= TACTILE_MARKER_COUNT:
+        raise ValueError(
+            f"--min-valid-markers must be in [0,{TACTILE_MARKER_COUNT}], "
+            f"got {args.min_valid_markers}"
+        )
+    if args.gripper_startup_width_m is not None:
+        if args.disable_gripper:
+            raise RuntimeError("--gripper-startup-width-m cannot be used with --disable-gripper")
+        if (
+            not np.isfinite(args.gripper_startup_width_m)
+            or args.gripper_startup_width_m < args.gripper_min_width_m
+        ):
+            raise ValueError("--gripper-startup-width-m must be finite and at least --gripper-min-width-m")
     if args.execute and (args.workspace_min_xyz is None or args.workspace_max_xyz is None):
         raise RuntimeError(
             "Real execution requires explicit --workspace-min-xyz X Y Z and "
@@ -827,12 +936,14 @@ def run_realman(
         )
     tacthru_repo = args.tacthru_repo.expanduser().resolve()
     camera_cfg = _resolve_repo_path(tacthru_repo, args.camera_cfg)
+    tactile_sensor_cfg = _resolve_repo_path(tacthru_repo, args.tactile_sensor_cfg)
     robot_cfg = _resolve_repo_path(tacthru_repo, args.robot_cfg)
     gripper_cfg = _resolve_repo_path(tacthru_repo, args.gripper_cfg)
     camera = _open_wrist_camera(
         camera_cfg,
         max_frame_age_s=args.max_sensor_skew_s * CAMERA_FRESHNESS_FRACTION,
     )
+    tactile_source: TacThruSource | None = None
     runtime = RealmanEpisodeRuntime(
         RealmanConfig(
             tacthru_repo=tacthru_repo,
@@ -846,11 +957,16 @@ def run_realman(
             gripper_max_width_m=args.gripper_max_width_m,
             gripper_command_torque=args.gripper_command_torque,
             gripper_command_speed=args.gripper_command_speed,
+            gripper_initialize_on_start=(
+                False if args.gripper_startup_width_m is not None else None
+            ),
+            gripper_episode_start_width_m=args.gripper_startup_width_m,
             gripper_action_select=args.gripper_action_select,
             gripper_hold_closed_below_m=args.gripper_hold_closed_below_m,
             gripper_hold_closed_target_m=args.gripper_hold_closed_target_m,
             exec_start_step=args.exec_start_step,
             exec_end_step=args.exec_end_step,
+            fixed_exec_window=args.fixed_exec_window,
             preserve_exec_window_length=not args.no_preserve_exec_window_length,
             robot_action_latency_s=args.robot_action_latency,
             max_pos_speed_m_s=args.max_pos_speed,
@@ -873,6 +989,7 @@ def run_realman(
         resolved_paths={
             "tacthru_repo": tacthru_repo,
             "camera_cfg": camera_cfg,
+            "tactile_sensor_cfg": tactile_sensor_cfg,
             "robot_cfg": robot_cfg,
             "gripper_cfg": gripper_cfg,
         },
@@ -881,22 +998,37 @@ def run_realman(
     session_id = uuid.uuid4().hex
     error: str | None = None
     try:
-        runtime.start()
-        if args.execute:
+        if tactile_contract["enabled"]:
+            tactile_source = TacThruSource(
+                tacthru_repo=tacthru_repo,
+                sensor_cfg_path=tactile_sensor_cfg,
+                use_rgb=tactile_contract["use_rgb"],
+                use_markers=tactile_contract["use_markers"],
+            )
+            tactile_source.start()
             print(
-                "\n[SAFETY] --execute was supplied. Space confirmation will enable the arm trajectory "
-                "and may initialize/move the gripper. Keep an emergency stop within reach.\n",
+                "[lingbot-v2-client] TacThru VTLA input ready: "
+                f"rgb={tactile_contract['use_rgb']} markers={tactile_contract['use_markers']}",
                 flush=True,
             )
-            _wait_for_space(camera if args.preview else None, execute=True)
-            runtime.enable_actuation()
+        runtime.start()
+        if args.execute:
+            startup_result = _prepare_real_execution(
+                args,
+                runtime,
+                camera if args.preview else None,
+            )
+            if startup_result is not None:
+                _append_log(
+                    log_path,
+                    {"event": "gripper_startup", "timestamp": time.time(), **startup_result},
+                )
         else:
             if args.wait_for_space:
                 _wait_for_space(camera if args.preview else None, execute=False)
             runtime.reset_episode_start()
 
         period = 1.0 / args.rate_hz if args.rate_hz > 0 else 0.0
-        active_trajectory_until_s = 0.0
         for step_index in range(args.steps):
             loop_start = time.time()
             camera_frame = camera.capture()
@@ -907,11 +1039,54 @@ def run_realman(
                     f"Wrist image/robot state skew {sensor_skew_s:.4f}s exceeds "
                     f"--max-sensor-skew-s {args.max_sensor_skew_s:.4f}s"
                 )
-            observation_timestamp = min(camera_frame.capture_timestamp, snapshot.timestamp)
+            tactile_frame = None
+            tactile_inputs: dict[str, np.ndarray] = {}
+            tactile_skew_s = None
+            tactile_age_s = None
+            if tactile_source is not None:
+                tactile_frame = tactile_source.capture(episode_reset=step_index == 0)
+                tactile_age_s = time.time() - tactile_frame.capture_timestamp
+                if tactile_age_s < 0.0 or tactile_age_s > args.max_tactile_age_s:
+                    raise SafetyViolation(
+                        f"TacThru frame age {tactile_age_s:.4f}s is outside "
+                        f"[0,{args.max_tactile_age_s:.4f}]s"
+                    )
+                tactile_skew_s = max(
+                    abs(tactile_frame.capture_timestamp - camera_frame.capture_timestamp),
+                    abs(tactile_frame.capture_timestamp - snapshot.timestamp),
+                )
+                if tactile_skew_s > args.max_tactile_skew_s:
+                    raise SafetyViolation(
+                        f"TacThru/wrist/robot skew {tactile_skew_s:.4f}s exceeds "
+                        f"--max-tactile-skew-s {args.max_tactile_skew_s:.4f}s"
+                    )
+                if tactile_contract["use_markers"]:
+                    valid_count = int(tactile_frame.marker_valid_mask.sum())
+                    if valid_count < args.min_valid_markers:
+                        raise SafetyViolation(
+                            f"TacThru valid markers {valid_count} below "
+                            f"--min-valid-markers {args.min_valid_markers}"
+                        )
+                tactile_inputs = {
+                    "tactile_rgb": tactile_frame.tactile_rgb,
+                    "marker_positions": tactile_frame.marker_positions,
+                    "marker_reference": tactile_frame.marker_reference,
+                    "previous_marker_positions": tactile_frame.previous_marker_positions,
+                    "marker_valid_mask": tactile_frame.marker_valid_mask,
+                    "tactile_sensor_mask": tactile_frame.tactile_sensor_mask,
+                }
+                tactile_inputs = {
+                    key: value for key, value in tactile_inputs.items() if value is not None
+                }
+            observation_timestamps = [camera_frame.capture_timestamp, snapshot.timestamp]
+            if tactile_frame is not None:
+                observation_timestamps.append(tactile_frame.capture_timestamp)
+            observation_timestamp = min(observation_timestamps)
             observation = Observation(
                 instruction=args.instruction,
                 state=snapshot.state,
                 wrist_rgb=camera_frame.rgb,
+                **tactile_inputs,
                 control_frequency_hz=args.control_frequency,
                 session_id=session_id,
                 timestamp=observation_timestamp,
@@ -924,6 +1099,15 @@ def run_realman(
                     "camera_receive_timestamp": camera_frame.receive_timestamp,
                     "robot_state_timestamp": snapshot.timestamp,
                     "sensor_skew_s": sensor_skew_s,
+                    "tactile_capture_timestamp": (
+                        tactile_frame.capture_timestamp if tactile_frame is not None else None
+                    ),
+                    "tactile_receive_timestamp": (
+                        tactile_frame.receive_timestamp if tactile_frame is not None else None
+                    ),
+                    "tactile_age_s": tactile_age_s,
+                    "tactile_skew_s": tactile_skew_s,
+                    "tactile": tactile_frame.debug if tactile_frame is not None else None,
                 },
             )
             if args.preview:
@@ -974,27 +1158,13 @@ def run_realman(
                     f"Inference roundtrip {roundtrip_s:.3f}s exceeds "
                     f"--max-roundtrip-s {args.max_roundtrip_s:.3f}s{detail}"
                 )
-            compensate_inference_latency = bool(
-                args.execute
-                and args.stream_replan
-                and observation_timestamp < active_trajectory_until_s
-            )
             plan = runtime.plan_action_chunk(
                 response.action_chunk,
                 observation_state=snapshot.state,
                 observation_timestamp=observation_timestamp,
                 control_frequency_hz=args.control_frequency,
-                compensate_inference_latency=compensate_inference_latency,
             )
             execution = runtime.execute_plan(plan) if args.execute else None
-            if (
-                args.execute
-                and args.stream_replan
-                and execution
-                and execution.get("dispatched")
-                and len(plan.timestamps)
-            ):
-                active_trajectory_until_s = float(plan.timestamps[-1])
             verification = None
             if args.execute and not args.stream_replan and len(plan.timestamps):
                 wait_until = float(plan.timestamps[-1]) + 0.05
@@ -1029,6 +1199,7 @@ def run_realman(
                     "receive_timestamp": camera_frame.receive_timestamp,
                     "sensor_skew_s": sensor_skew_s,
                 },
+                "tactile": tactile_frame.debug if tactile_frame is not None else None,
                 "state": snapshot.state.astype(float).tolist(),
                 "state_debug": snapshot.debug,
                 "response_metadata": response.metadata,
@@ -1061,7 +1232,6 @@ def run_realman(
         _append_log(log_path, {"event": "run_end", "timestamp": time.time(), "error": error})
         if (
             args.execute
-            and runtime.actuation_enabled
             and runtime.gripper is not None
             and args.gripper_exit_policy == "prompt"
         ):
@@ -1082,6 +1252,8 @@ def run_realman(
                     f"[lingbot-v2-client] shutdown confirmation interrupted ({prompt_error!r}); closing anyway",
                     flush=True,
                 )
+        if tactile_source is not None:
+            tactile_source.close()
         camera.close()
         runtime.close()
         if args.preview:
@@ -1149,6 +1321,47 @@ def _wait_for_space(
     finally:
         if old_settings is not None and fd is not None:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def _prepare_real_execution(
+    args: argparse.Namespace,
+    runtime: RealmanEpisodeRuntime,
+    camera: WristCamera | None,
+) -> dict[str, float] | None:
+    startup_width_m = args.gripper_startup_width_m
+    if startup_width_m is None:
+        print(
+            "\n[SAFETY] --execute was supplied. Space confirmation will enable the arm trajectory "
+            "and may initialize/move the gripper. Keep an emergency stop within reach.\n",
+            flush=True,
+        )
+        _wait_for_space(camera, execute=True)
+        runtime.enable_actuation()
+        return None
+
+    print(
+        "\n[SAFETY] Two-stage start is enabled. The first Space only closes Gloria; "
+        "the arm remains disabled. The second Space enables arm execution and inference. "
+        "Keep an emergency stop within reach.\n",
+        flush=True,
+    )
+    _wait_for_space(
+        camera,
+        execute=False,
+        label=f"CLOSE GRIPPER TO {startup_width_m * 1000.0:.1f} mm (ARM DISABLED)",
+    )
+    startup_result = runtime.prepare_gripper_for_episode(
+        startup_width_m,
+        tolerance_m=args.gripper_startup_tolerance_m,
+        timeout_s=args.gripper_startup_timeout_s,
+    )
+    _wait_for_space(
+        camera,
+        execute=True,
+        label="START INFERENCE AND ENABLE ARM EXECUTION",
+    )
+    runtime.enable_actuation()
+    return startup_result
 
 
 def _show_preview(rgb: np.ndarray, status: str) -> None:

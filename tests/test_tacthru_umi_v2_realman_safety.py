@@ -45,6 +45,29 @@ class FakeGripper:
         self.commands.append(float(width))
 
 
+class FakeStartupGripper:
+    def __init__(self):
+        self.width_m = 0.045
+        self.commands = []
+        self.start_episode_calls = 0
+
+    def is_alive(self):
+        return True
+
+    def goto_pos(self, width):
+        self.width_m = float(width)
+        self.commands.append(self.width_m)
+
+    def get_all_state(self):
+        return {
+            "gripper_width": np.asarray([self.width_m], dtype=np.float64),
+            "gripper_timestamp": np.asarray([time.time()], dtype=np.float64),
+        }
+
+    def start_episode(self):
+        self.start_episode_calls += 1
+
+
 class FakeAdapterController:
     @staticmethod
     def get_eef_coll_points(poses, _gripper_width):
@@ -112,6 +135,24 @@ def test_plan_uses_episode_start_frame_and_selected_short_window() -> None:
     assert np.all(np.diff(plan.timestamps) > 0)
 
 
+def test_fixed_exec_window_ignores_online_delay_index_shift() -> None:
+    runtime = make_runtime(fixed_exec_window=True)
+    observation_state = np.asarray([0, 0, 0, 0, 0, 0, 1, 0.04], dtype=np.float32)
+    plan = runtime.plan_action_chunk(
+        make_actions(),
+        observation_state=observation_state,
+        observation_timestamp=100.0,
+        control_frequency_hz=30.0,
+        now=101.0,
+    )
+
+    assert plan.debug["delay_steps"] == 30
+    assert plan.debug["configured_exec_window"] == [2, 6]
+    assert plan.debug["effective_exec_window"] == [2, 6]
+    assert plan.debug["fixed_exec_window"] is True
+    assert plan.selected_indices.tolist() == [2, 3, 4, 5]
+
+
 def test_large_jump_is_rejected_before_any_robot_call() -> None:
     runtime = make_runtime(max_target_delta_m=0.05)
     actions = make_actions()
@@ -146,6 +187,35 @@ def test_dry_run_execute_plan_refuses_all_actuator_calls() -> None:
         runtime.execute_plan(plan)
     assert runtime.robot.executions == []
     assert runtime.gripper.commands == []
+
+
+def test_gripper_startup_is_verified_before_arm_actuation() -> None:
+    runtime = make_runtime(
+        gripper_initialize_on_start=False,
+        gripper_episode_start_width_m=0.004,
+    )
+    gripper = FakeStartupGripper()
+    runtime.gripper = gripper
+
+    result = runtime.prepare_gripper_for_episode(
+        0.004,
+        tolerance_m=0.001,
+        timeout_s=0.1,
+    )
+
+    assert result == {
+        "target_width_m": pytest.approx(0.004),
+        "actual_width_m": pytest.approx(0.004),
+        "error_m": pytest.approx(0.0),
+    }
+    assert runtime.actuation_enabled is False
+    assert runtime.robot.start_episode_calls == 0
+    assert gripper.commands == [pytest.approx(0.004)]
+
+    runtime.enable_actuation()
+    assert runtime.actuation_enabled is True
+    assert runtime.robot.start_episode_calls == 1
+    assert gripper.start_episode_calls == 1
 
 
 def test_repeated_pose_chunk_still_gets_strictly_increasing_timestamps() -> None:

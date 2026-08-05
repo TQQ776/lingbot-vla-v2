@@ -9,9 +9,11 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Literal
 
 import ast
 import torch.nn.functional as F
+from types import SimpleNamespace
 
 from ...utils import logging as logging_utils
 from .transform import Normalizer, prepare_images, prepare_state, prepare_language, prepare_action, expert_visual_transform
+from .tactile import MODEL_TACTILE_KEYS, prepare_tactile_sample, tactile_dataset_keys
 from .ee_pose_transform import *
 from typing import Dict, List, Optional
 import ast
@@ -108,6 +110,9 @@ class FeatureTransform:
         self.disabled_image_features = disabled_image_features
         self.use_depth_align = use_depth_align
         self.use_future_image = use_future_image
+        tactile_config = dict(getattr(model_config, "tactile", {}) or {})
+        self.tactile_settings = SimpleNamespace(**tactile_config)
+        self.tactile_enabled = bool(tactile_config.get("enabled", False))
 
         if not disabled_image_features:
             self.image_augment = image_augment
@@ -124,6 +129,9 @@ class FeatureTransform:
             # between the current image and the final action-horizon image.
             'future_video_effective_fps',
         }
+        if self.tactile_enabled:
+            self.feature_to_keep.update(tactile_dataset_keys(self.tactile_settings))
+            self.feature_to_keep.update(MODEL_TACTILE_KEYS)
 
         target_features  = {'states':[], 'actions':[], 'images':[]}
         org_features  = {'states':set(), 'actions':set(), 'images':set()}
@@ -407,6 +415,15 @@ class FeatureTransform:
         if self.return_item_befor_padding:
             return item
 
+        tactile_inputs = {}
+        if self.tactile_enabled:
+            tactile_inputs = prepare_tactile_sample(
+                item,
+                self.processor.image_processor if self.processor is not None else None,
+                self.tactile_settings,
+                fallback_image_keys=tuple(self.feature_config.images or ()),
+            )
+
         batch_dict = self.pad_and_concat(item, w_action)
 
         state = prepare_state(batch_dict, self.model_config.max_state_dim) 
@@ -486,6 +503,7 @@ class FeatureTransform:
             batch_dict['image_grid_thw'] = image_grid_thw
         if future_video_effective_fps is not None:
             batch_dict['future_video_effective_fps'] = future_video_effective_fps
+        batch_dict.update(tactile_inputs)
 
         if self.use_depth_align: 
             batch_dict['pil_images'] = pil_images

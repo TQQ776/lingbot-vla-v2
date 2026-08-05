@@ -32,6 +32,10 @@ GRIPPER_STARTUP_WIDTH_M="${GRIPPER_STARTUP_WIDTH_M:-0.004}"
 GRIPPER_STARTUP_TOLERANCE_M="${GRIPPER_STARTUP_TOLERANCE_M:-0.005}"
 GRIPPER_STARTUP_TIMEOUT_S="${GRIPPER_STARTUP_TIMEOUT_S:-3.0}"
 REQUEST_TIMEOUT_S="${LINGBOT_V2_REQUEST_TIMEOUT_S:-5.0}"
+TACTILE_SENSOR_CFG="${LINGBOT_V2_TACTILE_SENSOR_CFG:-/mnt/models/VTLA-RDT/tacthru/cfg/sensor/ml.yaml}"
+MAX_TACTILE_AGE_S="${LINGBOT_V2_MAX_TACTILE_AGE_S:-0.25}"
+MAX_TACTILE_SKEW_S="${LINGBOT_V2_MAX_TACTILE_SKEW_S:-0.20}"
+MIN_VALID_MARKERS="${LINGBOT_V2_MIN_VALID_MARKERS:-40}"
 # Set this to 0 to restore the previous fail-fast behavior without editing code.
 MAX_CONSECUTIVE_ROUNDTRIP_REJECTS="${LINGBOT_V2_MAX_CONSECUTIVE_ROUNDTRIP_REJECTS:-3}"
 GRIPPER_LOOKAHEAD_RELEASE="${LINGBOT_V2_GRIPPER_LOOKAHEAD_RELEASE:-1}"
@@ -48,6 +52,10 @@ if ! [[ "${EXEC_END_STEP}" =~ ^[0-9]+$ ]] || (( EXEC_END_STEP <= 2 || EXEC_END_S
 fi
 if ! [[ "${MAX_CONSECUTIVE_ROUNDTRIP_REJECTS}" =~ ^[0-9]+$ ]]; then
   echo "LINGBOT_V2_MAX_CONSECUTIVE_ROUNDTRIP_REJECTS must be a non-negative integer, got: ${MAX_CONSECUTIVE_ROUNDTRIP_REJECTS}" >&2
+  exit 2
+fi
+if ! [[ "${MIN_VALID_MARKERS}" =~ ^[0-9]+$ ]] || (( MIN_VALID_MARKERS > 48 )); then
+  echo "LINGBOT_V2_MIN_VALID_MARKERS must be an integer in [0, 48], got: ${MIN_VALID_MARKERS}" >&2
   exit 2
 fi
 EXECUTE_FLAGS=()
@@ -124,6 +132,7 @@ bash scripts/run_tacthru_umi_v2_client.sh run \
   --instruction "Insert the Ethernet cable." \
   --tacthru-repo /mnt/models/VTLA-RDT/tacthru \
   --camera-cfg /mnt/models/VTLA-RDT/tacthru/cfg/camera/synria_c10.yaml \
+  --tactile-sensor-cfg "${TACTILE_SENSOR_CFG}" \
   --robot-cfg /mnt/models/VTLA-RDT/tacthru/cfg/robot/realman.yaml \
   --gripper-cfg /mnt/models/VTLA-RDT/tacthru/cfg/gripper/synria_gloria.yaml \
   --realman-ip 192.168.1.18 \
@@ -146,6 +155,9 @@ bash scripts/run_tacthru_umi_v2_client.sh run \
   --max-roundtrip-s 2.0 \
   --max-consecutive-roundtrip-rejects "${MAX_CONSECUTIVE_ROUNDTRIP_REJECTS}" \
   --max-sensor-skew-s 0.10 \
+  --max-tactile-skew-s "${MAX_TACTILE_SKEW_S}" \
+  --max-tactile-age-s "${MAX_TACTILE_AGE_S}" \
+  --min-valid-markers "${MIN_VALID_MARKERS}" \
   --max-pos-speed "${MAX_POS_SPEED}" \
   --max-rot-speed "${MAX_ROT_SPEED}" \
   --max-target-delta-m 0.050 \
