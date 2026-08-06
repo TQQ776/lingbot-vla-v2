@@ -8,12 +8,21 @@ that can be appended to the existing vision-language prefix.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+import math
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, MutableMapping, Sequence
 
 import torch
 from torch import Tensor, nn
+
+from lingbotvla.tactile_contact import build_marker_region_mapping_numpy
+
+from .marker_contact import (
+    MarkerContactGateConfig,
+    contact_state_is_unknown,
+    contact_state_is_visible,
+)
 
 
 def _read_bool(value: Any, default: bool) -> bool:
@@ -67,8 +76,190 @@ def load_marker_statistics(path: str | Path) -> tuple[tuple[float, ...], tuple[f
 
 
 @dataclass(frozen=True)
+class MarkerTokenizationConfig:
+    mode: str = "global"
+    num_regions: int = 1
+    region_layout: str = "1x1"
+    aggregation: str = "mean_max"
+    include_reference_xy: bool = False
+    point_hidden_dim: int = 128
+    region_hidden_dim: int = 512
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any] | None,
+        *,
+        legacy_hidden_dim: int,
+    ) -> "MarkerTokenizationConfig":
+        values = dict(value or {})
+        mode = str(values.get("mode", "global"))
+        if mode not in {"global", "regional"}:
+            raise ValueError("marker_tokenization.mode must be global or regional")
+        default_regions = 1 if mode == "global" else 4
+        num_regions = int(values.get("num_regions", default_regions))
+        layout = str(values.get("region_layout", "1x1" if mode == "global" else "2x2"))
+        if mode == "global" and (num_regions != 1 or layout != "1x1"):
+            raise ValueError("Global marker tokenization requires num_regions=1 and region_layout=1x1")
+        if mode == "regional" and (num_regions != 4 or layout != "2x2"):
+            raise ValueError("Regional marker tokenization currently requires four 2x2 regions")
+        aggregation = str(values.get("aggregation", "mean_max"))
+        if aggregation not in {"mean", "max", "mean_max"}:
+            raise ValueError("marker aggregation must be mean, max, or mean_max")
+        point_hidden_dim = int(values.get("point_hidden_dim", 128))
+        region_hidden_dim = int(values.get("region_hidden_dim", legacy_hidden_dim))
+        if point_hidden_dim <= 0 or region_hidden_dim <= 0:
+            raise ValueError("Marker point/region hidden dimensions must be positive")
+        return cls(
+            mode=mode,
+            num_regions=num_regions,
+            region_layout=layout,
+            aggregation=aggregation,
+            include_reference_xy=_read_bool(
+                values.get("include_reference_xy"), mode == "regional"
+            ),
+            point_hidden_dim=point_hidden_dim,
+            region_hidden_dim=region_hidden_dim,
+        )
+
+
+@dataclass(frozen=True)
+class MarkerPositionEncodingConfig:
+    temporal_type: str = "learned"
+    spatial_type: str = "none"
+    use_real_time: bool = True
+    combination: str = "additive"
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any] | None,
+        *,
+        legacy_temporal_embedding: bool,
+    ) -> "MarkerPositionEncodingConfig":
+        values = dict(value or {})
+        temporal_type = str(
+            values.get(
+                "temporal_type",
+                "learned" if legacy_temporal_embedding else "none",
+            )
+        )
+        spatial_type = str(values.get("spatial_type", "none"))
+        for name, setting in (
+            ("temporal_type", temporal_type),
+            ("spatial_type", spatial_type),
+        ):
+            if setting not in {"none", "learned", "sincos"}:
+                raise ValueError(f"marker_position_encoding.{name}={setting!r} is invalid")
+        combination = str(values.get("combination", "additive"))
+        if combination != "additive":
+            raise ValueError("Only additive marker position encoding is supported")
+        return cls(
+            temporal_type=temporal_type,
+            spatial_type=spatial_type,
+            use_real_time=_read_bool(values.get("use_real_time"), True),
+            combination=combination,
+        )
+
+
+@dataclass(frozen=True)
+class MarkerAblationConfig:
+    zero_marker_content: bool = False
+    shuffle_temporal_order: bool = False
+    shuffle_region_order: bool = False
+    disable_spatial_content: bool = False
+    shuffle_seed: int = 0
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any] | None) -> "MarkerAblationConfig":
+        values = dict(value or {})
+        return cls(
+            zero_marker_content=_read_bool(values.get("zero_marker_content"), False),
+            shuffle_temporal_order=_read_bool(
+                values.get("shuffle_temporal_order"), False
+            ),
+            shuffle_region_order=_read_bool(values.get("shuffle_region_order"), False),
+            disable_spatial_content=_read_bool(
+                values.get("disable_spatial_content"), False
+            ),
+            shuffle_seed=int(values.get("shuffle_seed", 0)),
+        )
+
+
+def _normalize_reference_xy(reference_xy: Tensor) -> Tensor:
+    if reference_xy.ndim != 3 or reference_xy.shape[-1] != 2:
+        raise ValueError("marker reference coordinates must have shape [S,N,2]")
+    if not torch.isfinite(reference_xy).all():
+        raise ValueError("marker reference coordinates must be finite")
+    low = reference_xy.amin(dim=1, keepdim=True)
+    high = reference_xy.amax(dim=1, keepdim=True)
+    span = high - low
+    if (span <= 0).any():
+        raise ValueError("marker reference coordinates must span both x and y")
+    return (2.0 * (reference_xy - low) / span - 1.0).to(torch.float32)
+
+
+def load_marker_reference_xy(
+    path: str | Path,
+    *,
+    sensor_names: Sequence[str],
+    num_markers: int,
+) -> tuple[tuple[tuple[float, float], ...], ...]:
+    reference_path = Path(path).expanduser()
+    if not reference_path.is_file():
+        raise FileNotFoundError(f"Marker reference file does not exist: {reference_path}")
+    if reference_path.suffix.lower() == ".npy":
+        import numpy as np
+
+        raw = np.load(reference_path)
+    else:
+        with reference_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if isinstance(payload, Mapping):
+            payload_names = payload.get("sensor_names")
+            raw = payload.get("reference_xy", payload.get("marker_reference_xy"))
+            if payload_names is not None and list(payload_names) != list(sensor_names):
+                raise ValueError(
+                    f"Marker reference sensor order {payload_names} does not match {list(sensor_names)}"
+                )
+        else:
+            raw = payload
+    tensor = torch.as_tensor(raw, dtype=torch.float32)
+    if tensor.ndim == 2:
+        tensor = tensor.unsqueeze(0)
+    expected = (len(sensor_names), num_markers, 2)
+    if tuple(tensor.shape) != expected:
+        raise ValueError(f"Marker reference must have shape {expected}, got {tuple(tensor.shape)}")
+    tensor = _normalize_reference_xy(tensor)
+    return tuple(
+        tuple((float(point[0]), float(point[1])) for point in sensor)
+        for sensor in tensor
+    )
+
+
+def build_marker_region_mapping(
+    reference_xy: Tensor | Sequence[Sequence[Sequence[float]]],
+    *,
+    num_regions: int,
+    region_layout: str,
+) -> tuple[Tensor, Tensor]:
+    """Return deterministic [S,N] region ids and [S,R,2] region centers."""
+
+    reference = torch.as_tensor(reference_xy, dtype=torch.float32)
+    if reference.ndim == 2:
+        reference = reference.unsqueeze(0)
+    reference = _normalize_reference_xy(reference)
+    region_ids, centers = build_marker_region_mapping_numpy(
+        reference.detach().cpu().numpy(),
+        num_regions=num_regions,
+        region_layout=region_layout,
+    )
+    return torch.from_numpy(region_ids), torch.from_numpy(centers)
+
+
+@dataclass(frozen=True)
 class TactileVTLAConfig:
-    """Validated, serializable configuration for the minimal VTLA extension."""
+    """Validated, serializable configuration for the configurable VTLA extension."""
 
     enabled: bool = False
     num_sensors: int = 2
@@ -83,6 +274,19 @@ class TactileVTLAConfig:
     marker_feature_mode: str = "displacement_history"
     marker_temporal_embedding: bool = True
     marker_hidden_dim: int = 512
+    marker_tokenization: MarkerTokenizationConfig = field(
+        default_factory=MarkerTokenizationConfig
+    )
+    marker_position_encoding: MarkerPositionEncodingConfig = field(
+        default_factory=MarkerPositionEncodingConfig
+    )
+    marker_contact_gate: MarkerContactGateConfig = field(
+        default_factory=MarkerContactGateConfig
+    )
+    gate_tactile_rgb: bool = False
+    marker_ablation: MarkerAblationConfig = field(default_factory=MarkerAblationConfig)
+    marker_reference_xy_path: str | None = None
+    marker_reference_xy: tuple[tuple[tuple[float, float], ...], ...] = ()
     add_modality_embedding: bool = True
     add_sensor_side_embedding: bool = True
     marker_stats_path: str | None = None
@@ -120,6 +324,7 @@ class TactileVTLAConfig:
         marker_feature_mode = str(
             values.get("marker_feature_mode", "displacement_history")
         )
+        marker_hidden_dim = int(values.get("marker_hidden_dim", 512))
 
         if num_sensors <= 0:
             raise ValueError("tactile.num_sensors must be positive")
@@ -150,7 +355,7 @@ class TactileVTLAConfig:
                 "marker_history_length tokens per sensor. Remove the old field and set "
                 "marker_history_length explicitly."
             )
-        if int(values.get("marker_hidden_dim", 512)) <= 0:
+        if marker_hidden_dim <= 0:
             raise ValueError("tactile.marker_hidden_dim must be positive")
 
         def _keys(name: str, defaults: Sequence[str]) -> tuple[str, ...]:
@@ -174,16 +379,16 @@ class TactileVTLAConfig:
         require_stats = _read_bool(values.get("require_marker_stats"), False)
         mean_value = values.get("marker_mean")
         std_value = values.get("marker_std")
-        if stats_path is not None and Path(stats_path).expanduser().is_file():
-            marker_mean, marker_std = load_marker_statistics(stats_path)
-        elif stats_path is not None and mean_value is not None and std_value is not None:
+        if mean_value is not None and std_value is not None:
             # Saved Hugging Face configs carry both the original provenance
             # path and resolved values, so inference remains portable even
-            # when the training workspace is not mounted.
+            # when the training workspace is not mounted or the source changes.
             marker_mean = _as_float_tuple(
                 mean_value, name="marker_mean", length=2
             )
             marker_std = _as_float_tuple(std_value, name="marker_std", length=2)
+        elif stats_path is not None and Path(stats_path).expanduser().is_file():
+            marker_mean, marker_std = load_marker_statistics(stats_path)
         elif stats_path is not None:
             raise FileNotFoundError(
                 f"Marker statistics file does not exist: {Path(stats_path).expanduser()}"
@@ -206,6 +411,62 @@ class TactileVTLAConfig:
         if any(value <= 0 for value in marker_std):
             raise ValueError("marker_std values must be positive")
 
+        tokenization = MarkerTokenizationConfig.from_mapping(
+            values.get("marker_tokenization"),
+            legacy_hidden_dim=marker_hidden_dim,
+        )
+        legacy_temporal = _read_bool(values.get("marker_temporal_embedding"), True)
+        position_encoding = MarkerPositionEncodingConfig.from_mapping(
+            values.get("marker_position_encoding"),
+            legacy_temporal_embedding=legacy_temporal,
+        )
+        reference_path = values.get("marker_reference_xy_path")
+        reference_value = values.get("marker_reference_xy")
+        if reference_value is not None:
+            reference = _normalize_reference_xy(
+                torch.as_tensor(reference_value, dtype=torch.float32)
+            )
+            if tuple(reference.shape) != (num_sensors, num_markers, 2):
+                raise ValueError(
+                    "marker_reference_xy must have shape "
+                    f"[{num_sensors},{num_markers},2]"
+                )
+            marker_reference_xy = tuple(
+                tuple((float(point[0]), float(point[1])) for point in sensor)
+                for sensor in reference
+            )
+        elif reference_path is not None and Path(reference_path).expanduser().is_file():
+            marker_reference_xy = load_marker_reference_xy(
+                reference_path,
+                sensor_names=sensor_names,
+                num_markers=num_markers,
+            )
+        elif enabled and use_markers and tokenization.mode == "regional":
+            raise ValueError(
+                "Regional marker tokenization requires marker_reference_xy_path or "
+                "embedded marker_reference_xy"
+            )
+        else:
+            marker_reference_xy = ()
+        contact_gate = MarkerContactGateConfig.from_mapping(
+            values.get("marker_contact_gate"),
+            num_sensors=num_sensors,
+            num_markers=num_markers,
+            sensor_names=sensor_names,
+        )
+        marker_ablation = MarkerAblationConfig.from_mapping(
+            values.get("marker_ablation")
+        )
+        gate_tactile_rgb = (
+            contact_gate.mode != "none" and contact_gate.target == "marker_and_rgb"
+        )
+        if "gate_tactile_rgb" in values and _read_bool(
+            values.get("gate_tactile_rgb"), False
+        ) != gate_tactile_rgb:
+            raise ValueError(
+                "gate_tactile_rgb must agree with marker_contact_gate.target"
+            )
+
         return cls(
             enabled=enabled,
             num_sensors=num_sensors,
@@ -218,10 +479,17 @@ class TactileVTLAConfig:
             marker_sample_hz=marker_sample_hz,
             marker_input_features=marker_input_features,
             marker_feature_mode=marker_feature_mode,
-            marker_temporal_embedding=_read_bool(
-                values.get("marker_temporal_embedding"), True
+            marker_temporal_embedding=position_encoding.temporal_type == "learned",
+            marker_hidden_dim=marker_hidden_dim,
+            marker_tokenization=tokenization,
+            marker_position_encoding=position_encoding,
+            marker_contact_gate=contact_gate,
+            gate_tactile_rgb=gate_tactile_rgb,
+            marker_ablation=marker_ablation,
+            marker_reference_xy_path=(
+                str(reference_path) if reference_path is not None else None
             ),
-            marker_hidden_dim=int(values.get("marker_hidden_dim", 512)),
+            marker_reference_xy=marker_reference_xy,
             add_modality_embedding=_read_bool(values.get("add_modality_embedding"), True),
             add_sensor_side_embedding=_read_bool(values.get("add_sensor_side_embedding"), True),
             marker_stats_path=str(stats_path) if stats_path is not None else None,
@@ -241,10 +509,25 @@ class TactileVTLAConfig:
         """Return JSON/YAML-safe values for Hugging Face config serialization."""
 
         result = asdict(self)
-        for key, value in tuple(result.items()):
+        result["marker_tokenization"] = asdict(self.marker_tokenization)
+        result["marker_position_encoding"] = asdict(self.marker_position_encoding)
+        result["marker_contact_gate"] = self.marker_contact_gate.to_dict()
+        result["marker_ablation"] = asdict(self.marker_ablation)
+
+        def _lists(value: Any) -> Any:
             if isinstance(value, tuple):
-                result[key] = list(value)
+                return [_lists(item) for item in value]
+            if isinstance(value, dict):
+                return {key: _lists(item) for key, item in value.items()}
+            return value
+
+        result = _lists(result)
         return result
+
+    @property
+    def marker_tokens_per_sensor(self) -> int:
+        regions = self.marker_tokenization.num_regions
+        return self.marker_history_length * regions
 
 
 def validate_marker_displacement_history(
@@ -365,6 +648,175 @@ class MarkerEncoder(nn.Module):
         return tokens
 
 
+class RegionalMarkerEncoder(nn.Module):
+    """Shared point encoder and masked regional pooling for all sensors."""
+
+    def __init__(
+        self,
+        *,
+        reference_xy: Tensor,
+        region_ids: Tensor,
+        context_dim: int,
+        point_hidden_dim: int,
+        region_hidden_dim: int,
+        aggregation: str,
+        include_reference_xy: bool,
+        marker_mean: Sequence[float],
+        marker_std: Sequence[float],
+        disable_spatial_content: bool,
+    ) -> None:
+        super().__init__()
+        if aggregation not in {"mean", "max", "mean_max"}:
+            raise ValueError(f"Unsupported regional marker aggregation: {aggregation}")
+        reference_xy = torch.as_tensor(reference_xy, dtype=torch.float32)
+        region_ids = torch.as_tensor(region_ids, dtype=torch.long)
+        if reference_xy.ndim != 3 or reference_xy.shape[-1] != 2:
+            raise ValueError("reference_xy must be [S,N,2]")
+        if region_ids.shape != reference_xy.shape[:2]:
+            raise ValueError("region_ids must be [S,N]")
+        self.num_regions = int(region_ids.max().item()) + 1
+        self.aggregation = aggregation
+        self.include_reference_xy = bool(include_reference_xy)
+        self.disable_spatial_content = bool(disable_spatial_content)
+        self.register_buffer("reference_xy", reference_xy, persistent=True)
+        self.register_buffer("region_ids", region_ids, persistent=True)
+        membership = torch.nn.functional.one_hot(
+            region_ids, num_classes=self.num_regions
+        ).to(torch.bool)
+        self.register_buffer("region_membership", membership, persistent=True)
+        self.register_buffer(
+            "marker_mean",
+            torch.tensor(marker_mean, dtype=torch.float32),
+            persistent=True,
+        )
+        self.register_buffer(
+            "marker_std",
+            torch.tensor(marker_std, dtype=torch.float32),
+            persistent=True,
+        )
+        input_dim = 4 if include_reference_xy else 2
+        self.point_encoder = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.GELU(),
+            nn.Linear(64, point_hidden_dim),
+            nn.LayerNorm(point_hidden_dim),
+            nn.GELU(),
+        )
+        pooled_dim = point_hidden_dim * (2 if aggregation == "mean_max" else 1)
+        self.region_projection = nn.Sequential(
+            nn.Linear(pooled_dim, region_hidden_dim),
+            nn.LayerNorm(region_hidden_dim),
+            nn.GELU(),
+            nn.Linear(region_hidden_dim, context_dim),
+        )
+
+    def forward(
+        self,
+        marker_features: Tensor,
+        marker_valid_mask: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        if marker_features.ndim != 5 or marker_features.shape[-1] != 2:
+            raise ValueError("Regional marker features must be [B,S,H,N,2]")
+        if marker_valid_mask.shape != marker_features.shape[:-1]:
+            raise ValueError("Regional marker valid mask must be [B,S,H,N]")
+        if (
+            marker_features.shape[1] != self.reference_xy.shape[0]
+            or marker_features.shape[3] != self.reference_xy.shape[1]
+        ):
+            raise ValueError("Regional marker input does not match reference coordinates")
+        mean = self.marker_mean.to(marker_features)
+        std = self.marker_std.to(marker_features)
+        normalized = (marker_features - mean) / (std + 1e-6)
+        normalized = normalized * marker_valid_mask.unsqueeze(-1).to(normalized.dtype)
+        point_input = normalized
+        if self.include_reference_xy:
+            reference = self.reference_xy.to(marker_features)[None, :, None]
+            reference = reference.expand(
+                marker_features.shape[0],
+                -1,
+                marker_features.shape[2],
+                -1,
+                -1,
+            )
+            if self.disable_spatial_content:
+                reference = torch.zeros_like(reference)
+            point_input = torch.cat([normalized, reference], dim=-1)
+        point_features = self.point_encoder(point_input)
+
+        membership = self.region_membership.to(marker_valid_mask.device)[None, :, None]
+        pool_mask = marker_valid_mask.unsqueeze(-1) & membership
+        counts = pool_mask.sum(dim=3)
+        region_valid = counts > 0
+        expanded = point_features.unsqueeze(-2)
+        mean_features = (
+            expanded * pool_mask.unsqueeze(-1).to(point_features.dtype)
+        ).sum(dim=3) / counts.clamp_min(1).unsqueeze(-1)
+        max_features = expanded.expand(-1, -1, -1, -1, self.num_regions, -1)
+        max_features = max_features.masked_fill(
+            ~pool_mask.unsqueeze(-1),
+            torch.finfo(point_features.dtype).min,
+        ).amax(dim=3)
+        max_features = torch.where(
+            region_valid.unsqueeze(-1),
+            max_features,
+            torch.zeros_like(max_features),
+        )
+        if self.aggregation == "mean":
+            pooled = mean_features
+        elif self.aggregation == "max":
+            pooled = max_features
+        else:
+            pooled = torch.cat([mean_features, max_features], dim=-1)
+        tokens = self.region_projection(pooled)
+        tokens = tokens * region_valid.unsqueeze(-1).to(tokens.dtype)
+        return tokens, region_valid
+
+
+def continuous_sincos_1d(values: Tensor, dim: int) -> Tensor:
+    """Encode arbitrary continuous values, padding an unmatched final dimension."""
+
+    if dim <= 0:
+        raise ValueError("sincos dimension must be positive")
+    values = torch.as_tensor(values, dtype=torch.float32)
+    pairs = dim // 2
+    output = torch.zeros(*values.shape, dim, dtype=torch.float32, device=values.device)
+    if pairs == 0:
+        return output
+    exponent = torch.arange(pairs, dtype=torch.float32, device=values.device)
+    exponent = exponent / max(1, pairs - 1)
+    frequencies = torch.exp(-math.log(10000.0) * exponent)
+    angles = values.unsqueeze(-1) * frequencies * (2.0 * math.pi)
+    encoded = torch.stack([angles.sin(), angles.cos()], dim=-1).flatten(-2)
+    output[..., : 2 * pairs] = encoded
+    return output
+
+
+def continuous_sincos_2d(coordinates: Tensor, dim: int) -> Tensor:
+    if coordinates.shape[-1] != 2:
+        raise ValueError("2D sincos coordinates must end in [x,y]")
+    x_dim = dim // 2
+    y_dim = dim - x_dim
+    return torch.cat(
+        [
+            continuous_sincos_1d(coordinates[..., 0], x_dim),
+            continuous_sincos_1d(coordinates[..., 1], y_dim),
+        ],
+        dim=-1,
+    )
+
+
+@dataclass(frozen=True)
+class MarkerEncodingOutput:
+    tokens: Tensor
+    token_mask: Tensor
+    content_tokens: Tensor
+    regional_scores: Tensor
+    regional_soft_gates: Tensor
+    region_valid_mask: Tensor
+    global_contact_state: Tensor
+    token_layout: Mapping[str, Any]
+
+
 class TactileTokenEncoder(nn.Module):
     """Add modality/sensor identity and emit fixed-length tactile token blocks."""
 
@@ -383,17 +835,51 @@ class TactileTokenEncoder(nn.Module):
         self.context_dim = int(context_dim)
         vision_output_dim = int(vision_output_dim or context_dim)
 
+        self.marker_encoder: MarkerEncoder | None = None
+        self.regional_marker_encoder: RegionalMarkerEncoder | None = None
+        self.register_buffer("marker_reference_xy", torch.empty(0), persistent=True)
+        self.register_buffer("marker_region_ids", torch.empty(0, dtype=torch.long), persistent=True)
+        self.register_buffer("marker_region_centers", torch.empty(0), persistent=True)
         if settings.use_markers:
-            self.marker_encoder = MarkerEncoder(
-                num_markers=settings.num_markers,
-                context_dim=context_dim,
-                input_features=settings.marker_input_features,
-                hidden_dim=settings.marker_hidden_dim,
-                marker_mean=settings.marker_mean,
-                marker_std=settings.marker_std,
+            if settings.marker_reference_xy:
+                reference = torch.tensor(settings.marker_reference_xy, dtype=torch.float32)
+            else:
+                reference = torch.zeros(
+                    settings.num_sensors, settings.num_markers, 2, dtype=torch.float32
+                )
+                reference[..., 0] = torch.linspace(-1.0, 1.0, settings.num_markers)
+                reference[..., 1] = torch.linspace(-1.0, 1.0, settings.num_markers)
+            region_ids, region_centers = build_marker_region_mapping(
+                reference,
+                num_regions=settings.marker_tokenization.num_regions,
+                region_layout=settings.marker_tokenization.region_layout,
             )
-        else:
-            self.marker_encoder = None
+            self.marker_reference_xy = reference
+            self.marker_region_ids = region_ids
+            self.marker_region_centers = region_centers
+            if settings.marker_tokenization.mode == "global":
+                self.marker_encoder = MarkerEncoder(
+                    num_markers=settings.num_markers,
+                    context_dim=context_dim,
+                    input_features=settings.marker_input_features,
+                    hidden_dim=settings.marker_hidden_dim,
+                    marker_mean=settings.marker_mean,
+                    marker_std=settings.marker_std,
+                )
+            else:
+                tokenization = settings.marker_tokenization
+                self.regional_marker_encoder = RegionalMarkerEncoder(
+                    reference_xy=reference,
+                    region_ids=region_ids,
+                    context_dim=context_dim,
+                    point_hidden_dim=tokenization.point_hidden_dim,
+                    region_hidden_dim=tokenization.region_hidden_dim,
+                    aggregation=tokenization.aggregation,
+                    include_reference_xy=tokenization.include_reference_xy,
+                    marker_mean=settings.marker_mean,
+                    marker_std=settings.marker_std,
+                    disable_spatial_content=settings.marker_ablation.disable_spatial_content,
+                )
 
         if settings.use_rgb and vision_output_dim != context_dim:
             self.tactile_rgb_projection: nn.Module = nn.Linear(vision_output_dim, context_dim)
@@ -413,13 +899,64 @@ class TactileTokenEncoder(nn.Module):
             )
         else:
             self.sensor_side_embeddings = None
-        if settings.marker_temporal_embedding:
+        position = settings.marker_position_encoding
+        if settings.use_markers and position.temporal_type == "learned":
             self.marker_temporal_embedding: nn.Module | None = nn.Embedding(
                 settings.marker_history_length,
                 context_dim,
             )
         else:
             self.marker_temporal_embedding = None
+
+        temporal_values = torch.arange(settings.marker_history_length, dtype=torch.float32)
+        if position.use_real_time:
+            temporal_values = (
+                temporal_values - float(settings.marker_history_length - 1)
+            ) / float(settings.marker_sample_hz)
+        if settings.use_markers and position.temporal_type == "sincos":
+            temporal_encoding = continuous_sincos_1d(temporal_values, context_dim)
+        else:
+            temporal_encoding = torch.zeros(settings.marker_history_length, context_dim)
+        self.register_buffer("marker_temporal_encoding", temporal_encoding, persistent=True)
+
+        regions = settings.marker_tokenization.num_regions
+        if settings.use_markers and position.spatial_type == "learned":
+            self.marker_spatial_embedding: nn.Module | None = nn.Embedding(
+                regions, context_dim
+            )
+        else:
+            self.marker_spatial_embedding = None
+        if settings.use_markers and position.spatial_type == "sincos":
+            spatial_encoding = continuous_sincos_2d(
+                self.marker_region_centers,
+                context_dim,
+            )
+        else:
+            spatial_encoding = torch.zeros(settings.num_sensors, regions, context_dim)
+        self.register_buffer("marker_spatial_encoding", spatial_encoding, persistent=True)
+
+        generator = torch.Generator().manual_seed(settings.marker_ablation.shuffle_seed)
+        temporal_order = torch.arange(settings.marker_history_length)
+        spatial_order = torch.arange(regions)
+        if settings.marker_ablation.shuffle_temporal_order:
+            temporal_order = torch.randperm(settings.marker_history_length, generator=generator)
+        if settings.marker_ablation.shuffle_region_order:
+            spatial_order = torch.randperm(regions, generator=generator)
+        self.register_buffer("marker_temporal_content_order", temporal_order, persistent=True)
+        self.register_buffer("marker_spatial_content_order", spatial_order, persistent=True)
+
+        gate = settings.marker_contact_gate
+        self.register_buffer(
+            "marker_gate_point_thresholds",
+            torch.tensor(gate.point_thresholds, dtype=torch.float32),
+            persistent=True,
+        )
+        self.register_buffer(
+            "marker_gate_soft_thresholds",
+            torch.tensor(gate.soft_thresholds, dtype=torch.float32),
+            persistent=True,
+        )
+        self.last_marker_diagnostics: dict[str, Tensor] = {}
 
     def _sensor_embedding(self, dtype: torch.dtype, device: torch.device) -> Tensor:
         if self.sensor_side_embeddings is None:
@@ -445,6 +982,13 @@ class TactileTokenEncoder(nn.Module):
             with torch.no_grad():
                 parameter.zero_()
 
+    @property
+    def marker_dtype(self) -> torch.dtype:
+        module: nn.Module | None = self.marker_encoder or self.regional_marker_encoder
+        if module is None:
+            return torch.float32
+        return next(module.parameters()).dtype
+
     @staticmethod
     def _sensor_mask(
         sensor_mask: Tensor | None,
@@ -468,10 +1012,13 @@ class TactileTokenEncoder(nn.Module):
         marker_valid_mask: Tensor | None,
         marker_history_valid_mask: Tensor | None,
         tactile_sensor_mask: Tensor | None,
-    ) -> tuple[Tensor, Tensor]:
-        """Return marker tokens/mask with shapes ``[B,S,H,D]`` and ``[B,S,H]``."""
+        marker_contact_state: Tensor | None = None,
+        *,
+        return_debug_info: bool = False,
+    ) -> tuple[Tensor, Tensor] | MarkerEncodingOutput:
+        """Return global [B,S,H,D] or regional [B,S,H*R,D] marker tokens."""
 
-        if self.marker_encoder is None:
+        if self.marker_encoder is None and self.regional_marker_encoder is None:
             raise RuntimeError("Marker encoding is disabled")
         if marker_displacement_history.ndim != 5:
             raise ValueError(
@@ -525,21 +1072,158 @@ class TactileTokenEncoder(nn.Module):
                 device=marker_displacement_history.device,
                 dtype=torch.bool,
             )
-        token_mask = (
-            sensor_mask.unsqueeze(-1)
-            & history_mask
-            & marker_mask.any(dim=-1)
-        )
-        tokens = self.marker_encoder(features, marker_mask)
+        if self.marker_encoder is not None:
+            content = self.marker_encoder(features, marker_mask).unsqueeze(-2)
+            region_valid = marker_mask.any(dim=-1, keepdim=True)
+        else:
+            assert self.regional_marker_encoder is not None
+            content, region_valid = self.regional_marker_encoder(features, marker_mask)
+
+        content = content[:, :, self.marker_temporal_content_order]
+        region_valid = region_valid[:, :, self.marker_temporal_content_order]
+        history_mask = history_mask[:, :, self.marker_temporal_content_order]
+        content = content[:, :, :, self.marker_spatial_content_order]
+        region_valid = region_valid[:, :, :, self.marker_spatial_content_order]
+
+        scores, regional_soft_gates = self._regional_contact_scores(features, marker_mask)
+        scores = scores[:, :, self.marker_temporal_content_order]
+        regional_soft_gates = regional_soft_gates[:, :, self.marker_temporal_content_order]
+        scores = scores[:, :, :, self.marker_spatial_content_order]
+        regional_soft_gates = regional_soft_gates[:, :, :, self.marker_spatial_content_order]
+
+        gate = self.settings.marker_contact_gate
+        if gate.mode == "none":
+            global_state = torch.full(
+                (batch_size, num_sensors),
+                1,
+                dtype=torch.int8,
+                device=features.device,
+            )
+        else:
+            if marker_contact_state is None:
+                raise ValueError(
+                    "Stateful marker contact gating requires marker_contact_state [B,S] "
+                    "from episode preprocessing or online TacThruSource"
+                )
+            if tuple(marker_contact_state.shape) != (batch_size, num_sensors):
+                raise ValueError(
+                    f"marker_contact_state must be [{batch_size},{num_sensors}]"
+                )
+            global_state = marker_contact_state.to(device=features.device, dtype=torch.int8)
+
+        if gate.regional_soft_gate and gate.mode == "hard_hysteresis_soft_region":
+            content = content * regional_soft_gates.unsqueeze(-1).to(content.dtype)
+        if self.settings.marker_ablation.zero_marker_content:
+            content = torch.zeros_like(content)
+
+        tokens = content
+        temporal = self._temporal_position(tokens.dtype, tokens.device)
+        spatial = self._spatial_position(tokens.dtype, tokens.device)
+        tokens = tokens + temporal[None, None, :, None, :]
+        tokens = tokens + spatial[None, :, None, :, :]
         if self.marker_modality_embedding is not None:
             tokens = tokens + self.marker_modality_embedding.to(dtype=tokens.dtype)
-        tokens = tokens + self._sensor_embedding(tokens.dtype, tokens.device)[None, :, None, :]
-        if self.marker_temporal_embedding is not None:
-            temporal_indices = torch.arange(history_length, device=tokens.device)
-            temporal = self.marker_temporal_embedding(temporal_indices).to(dtype=tokens.dtype)
-            tokens = tokens + temporal[None, None, :, :]
+        tokens = tokens + self._sensor_embedding(tokens.dtype, tokens.device)[
+            None, :, None, None, :
+        ]
+        token_mask = (
+            sensor_mask[:, :, None, None]
+            & history_mask[:, :, :, None]
+            & region_valid
+            & contact_state_is_visible(global_state)[:, :, None, None]
+        )
         tokens = tokens * token_mask.unsqueeze(-1).to(dtype=tokens.dtype)
-        return tokens, token_mask
+        content = content * token_mask.unsqueeze(-1).to(dtype=content.dtype)
+        tokens = tokens.flatten(2, 3)
+        token_mask = token_mask.flatten(2, 3)
+        rgb_ratio = self.last_marker_diagnostics.get("rgb_token_valid_ratio")
+        self.last_marker_diagnostics = {
+            "contact_on_ratio": (global_state == 1).float().mean().detach(),
+            "contact_hold_ratio": ((global_state == 2) | (global_state == 5)).float().mean().detach(),
+            "contact_off_ratio": ((global_state == 0) | (global_state == 3)).float().mean().detach(),
+            "contact_unknown_ratio": contact_state_is_unknown(global_state).float().mean().detach(),
+            "marker_token_valid_ratio": token_mask.float().mean().detach(),
+            "regional_soft_gate_mean": regional_soft_gates.mean(dim=(0, 1, 2)).detach(),
+            "regional_valid_marker_count": self._regional_valid_counts(marker_mask).float().mean(dim=(0, 1, 2)).detach(),
+        }
+        if rgb_ratio is not None:
+            self.last_marker_diagnostics["rgb_token_valid_ratio"] = rgb_ratio
+        output = MarkerEncodingOutput(
+            tokens=tokens,
+            token_mask=token_mask,
+            content_tokens=content.flatten(2, 3),
+            regional_scores=scores,
+            regional_soft_gates=regional_soft_gates,
+            region_valid_mask=region_valid,
+            global_contact_state=global_state,
+            token_layout={
+                "mode": self.settings.marker_tokenization.mode,
+                "history_length": history_length,
+                "num_regions": self.settings.marker_tokenization.num_regions,
+                "order": "sensor-major,time-major,region-minor",
+            },
+        )
+        return output if return_debug_info else (output.tokens, output.token_mask)
+
+    def _temporal_position(self, dtype: torch.dtype, device: torch.device) -> Tensor:
+        if self.marker_temporal_embedding is not None:
+            indices = torch.arange(self.settings.marker_history_length, device=device)
+            return self.marker_temporal_embedding(indices).to(dtype=dtype)
+        return self.marker_temporal_encoding.to(device=device, dtype=dtype)
+
+    def _spatial_position(self, dtype: torch.dtype, device: torch.device) -> Tensor:
+        if self.marker_spatial_embedding is not None:
+            indices = torch.arange(
+                self.settings.marker_tokenization.num_regions, device=device
+            )
+            value = self.marker_spatial_embedding(indices).to(dtype=dtype)
+            return value[None].expand(self.settings.num_sensors, -1, -1)
+        return self.marker_spatial_encoding.to(device=device, dtype=dtype)
+
+    def _regional_valid_counts(self, marker_mask: Tensor) -> Tensor:
+        membership = torch.nn.functional.one_hot(
+            self.marker_region_ids,
+            num_classes=self.settings.marker_tokenization.num_regions,
+        ).to(device=marker_mask.device, dtype=torch.bool)
+        return (marker_mask.unsqueeze(-1) & membership[None, :, None]).sum(dim=3)
+
+    def _regional_contact_scores(self, raw: Tensor, marker_mask: Tensor) -> tuple[Tensor, Tensor]:
+        amplitudes = torch.linalg.vector_norm(raw, dim=-1)
+        membership = torch.nn.functional.one_hot(
+            self.marker_region_ids,
+            num_classes=self.settings.marker_tokenization.num_regions,
+        ).to(device=raw.device, dtype=torch.bool)
+        mask = marker_mask.unsqueeze(-1) & membership[None, :, None]
+        expanded = amplitudes.unsqueeze(-1).expand_as(mask)
+        negative = torch.finfo(amplitudes.dtype).min
+        ranked = expanded.masked_fill(~mask, negative).transpose(3, 4)
+        k = min(self.settings.marker_contact_gate.topk_markers, raw.shape[3])
+        top = torch.topk(ranked, k=k, dim=-1).values
+        top_valid = torch.isfinite(top) & (top != negative)
+        scores = torch.where(top_valid, top, torch.zeros_like(top)).sum(-1)
+        scores = scores / top_valid.sum(-1).clamp_min(1)
+        soft_threshold = self.marker_gate_soft_thresholds.to(raw.device, raw.dtype)
+        soft = torch.sigmoid(
+            (scores - soft_threshold[None, :, None, None])
+            / self.settings.marker_contact_gate.soft_gate_temperature
+        )
+        return scores, soft
+
+    def gate_rgb_sensor_mask(
+        self,
+        rgb_sensor_mask: Tensor,
+        marker_contact_state: Tensor | None,
+    ) -> Tensor:
+        """Apply the explicit negative-control gate; marker_only is unchanged."""
+
+        gate = self.settings.marker_contact_gate
+        if gate.mode == "none" or gate.target == "marker_only":
+            return rgb_sensor_mask
+        if marker_contact_state is None:
+            raise ValueError("marker_and_rgb gate requires marker_contact_state")
+        return rgb_sensor_mask & contact_state_is_visible(
+            marker_contact_state.to(rgb_sensor_mask.device)
+        )
 
     def encode_rgb_embeddings(
         self,
@@ -586,6 +1270,9 @@ class TactileTokenEncoder(nn.Module):
             tokens = tokens + self.tactile_rgb_modality_embedding.to(dtype=tokens.dtype)
         tokens = tokens + self._sensor_embedding(tokens.dtype, tokens.device)[None, :, None, :]
         tokens = tokens * rgb_mask.unsqueeze(-1).to(dtype=tokens.dtype)
+        self.last_marker_diagnostics["rgb_token_valid_ratio"] = (
+            rgb_mask.float().mean().detach()
+        )
         return tokens.flatten(1, 2), rgb_mask.flatten(1, 2)
 
 
@@ -597,6 +1284,21 @@ _LEGACY_MARKER_REINITIALIZED_SUFFIXES = (
     "marker_temporal_embedding.weight",
 )
 
+_CONFIG_DERIVED_MARKER_SUFFIXES = (
+    "marker_reference_xy",
+    "marker_region_ids",
+    "marker_region_centers",
+    "regional_marker_encoder.reference_xy",
+    "regional_marker_encoder.region_ids",
+    "regional_marker_encoder.region_membership",
+    "marker_temporal_encoding",
+    "marker_spatial_encoding",
+    "marker_temporal_content_order",
+    "marker_spatial_content_order",
+    "marker_gate_point_thresholds",
+    "marker_gate_soft_thresholds",
+)
+
 
 def load_vtla_checkpoint_state_dict(
     model: nn.Module,
@@ -604,7 +1306,7 @@ def load_vtla_checkpoint_state_dict(
     *,
     allow_legacy_marker_reinit: bool = False,
 ) -> dict[str, Any]:
-    """Load a VTLA checkpoint with a narrow, explicit legacy marker policy.
+    """Load a VTLA checkpoint with explicit marker-only migration policies.
 
     A one-token ``[dx,dy,vx,vy]`` checkpoint differs only in the first marker
     MLP weight and its four-channel normalization buffers, and has no temporal
@@ -616,6 +1318,57 @@ def load_vtla_checkpoint_state_dict(
 
     target = model.state_dict()
     supplied: MutableMapping[str, Tensor] = dict(state_dict)
+    target_is_regional = any("regional_marker_encoder." in name for name in target)
+    supplied_has_global = any("marker_encoder.encoder." in name for name in supplied)
+    supplied_has_regional = any("regional_marker_encoder." in name for name in supplied)
+    config_initialized = {
+        name
+        for name in target
+        if any(name.endswith(suffix) for suffix in _CONFIG_DERIVED_MARKER_SUFFIXES)
+    }
+    intentionally_ignored: list[str] = []
+    reinitialized: list[str] = []
+    config_incompatibilities: list[str] = []
+
+    for name in list(supplied):
+        if any(name.endswith(suffix) for suffix in _CONFIG_DERIVED_MARKER_SUFFIXES):
+            supplied.pop(name)
+            intentionally_ignored.append(name)
+
+    if target_is_regional and supplied_has_global and not supplied_has_regional:
+        config_incompatibilities.append("global_marker_encoder_to_regional")
+        for name in list(supplied):
+            if "marker_encoder." in name:
+                supplied.pop(name)
+                intentionally_ignored.append(name)
+        reinitialized.extend(
+            name for name in target if "regional_marker_encoder." in name
+        )
+        if any(name.endswith("marker_spatial_embedding.weight") for name in target):
+            reinitialized.extend(
+                name for name in target if name.endswith("marker_spatial_embedding.weight")
+            )
+
+    target_has_learned_temporal = any(
+        name.endswith("marker_temporal_embedding.weight") for name in target
+    )
+    if not target_has_learned_temporal:
+        for name in list(supplied):
+            if name.endswith("marker_temporal_embedding.weight"):
+                supplied.pop(name)
+                intentionally_ignored.append(name)
+                config_incompatibilities.append("learned_temporal_to_fixed_or_none")
+
+    for suffix, incompatibility in (
+        ("marker_temporal_embedding.weight", "fixed_or_missing_temporal_to_learned"),
+        ("marker_spatial_embedding.weight", "fixed_or_missing_spatial_to_learned"),
+    ):
+        target_names = [name for name in target if name.endswith(suffix)]
+        for name in target_names:
+            if name not in supplied:
+                reinitialized.append(name)
+                config_incompatibilities.append(incompatibility)
+
     shape_mismatches = {
         name: (tuple(value.shape), tuple(target[name].shape))
         for name, value in supplied.items()
@@ -659,7 +1412,6 @@ def load_vtla_checkpoint_state_dict(
             "non-marker weights will remain loaded."
         )
 
-    reinitialized: list[str] = []
     if shape_mismatches:
         for name in target:
             if any(name.endswith(suffix) for suffix in _LEGACY_MARKER_REINITIALIZED_SUFFIXES):
@@ -669,19 +1421,29 @@ def load_vtla_checkpoint_state_dict(
     incompatible = model.load_state_dict(supplied, strict=False)
     missing = sorted(incompatible.missing_keys)
     unexpected = sorted(set(unexpected) | set(incompatible.unexpected_keys))
-    allowed_missing = set(reinitialized)
-    unsupported_missing = sorted(set(missing) - allowed_missing)
-    if unsupported_missing or unexpected:
+    allowed_missing = set(reinitialized) | config_initialized
+    missing_config_initialized = set(missing) & config_initialized
+    forbidden_missing = sorted(set(missing) - allowed_missing)
+    if forbidden_missing or unexpected:
         raise RuntimeError(
             "Checkpoint is incompatible after marker migration: "
-            f"missing={unsupported_missing}, unexpected={unexpected}"
+            f"missing={forbidden_missing}, unexpected={unexpected}"
         )
+    loaded_keys = sorted(set(supplied) & set(target))
     return {
-        "legacy_marker_reinitialized": bool(reinitialized),
-        "reinitialized_keys": sorted(reinitialized),
+        "legacy_marker_reinitialized": bool(shape_mismatches),
+        "marker_modules_reinitialized": bool(reinitialized),
+        "loaded_keys": loaded_keys,
+        "intentionally_reinitialized_keys": sorted(
+            set(reinitialized) | missing_config_initialized
+        ),
+        "reinitialized_keys": sorted(set(reinitialized)),
+        "intentionally_ignored_keys": sorted(intentionally_ignored),
         "missing_keys": missing,
+        "forbidden_missing_keys": forbidden_missing,
         "unexpected_keys": unexpected,
         "shape_mismatches": shape_mismatches,
+        "config_incompatibilities": sorted(set(config_incompatibilities)),
     }
 
 
@@ -711,10 +1473,20 @@ def concatenate_vtla_context(
 
 
 __all__ = [
+    "MarkerAblationConfig",
+    "MarkerContactGateConfig",
     "MarkerEncoder",
+    "MarkerEncodingOutput",
+    "MarkerPositionEncodingConfig",
+    "MarkerTokenizationConfig",
+    "RegionalMarkerEncoder",
     "TactileTokenEncoder",
     "TactileVTLAConfig",
+    "build_marker_region_mapping",
     "concatenate_vtla_context",
+    "continuous_sincos_1d",
+    "continuous_sincos_2d",
+    "load_marker_reference_xy",
     "load_vtla_checkpoint_state_dict",
     "load_marker_statistics",
     "validate_marker_displacement_history",

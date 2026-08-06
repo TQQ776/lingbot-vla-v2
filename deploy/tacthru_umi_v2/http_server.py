@@ -17,6 +17,9 @@ from typing import Any
 import numpy as np
 import yaml
 
+from lingbotvla.tactile_contact import CONTACT_OFF
+from lingbotvla.models.vla.lingbot_vla.tactile_vtla import TactileVTLAConfig
+
 from .protocol import (
     CAMERA_KEY,
     CONTROL_FREQUENCY_HZ,
@@ -100,6 +103,7 @@ class LingBotV2Backend:
         norm_stats = norm_stats.expanduser().resolve()
         robot_config_path = (project_root / "configs/robot_configs/tacthru_umi_v2.yaml").resolve()
         _validate_runtime_paths(project_root, checkpoint, norm_stats, robot_config_path, qwen_path)
+        os.chdir(project_root)
         contract = _validate_deployment_contract(
             project_root=project_root,
             checkpoint=checkpoint,
@@ -113,7 +117,6 @@ class LingBotV2Backend:
                 flush=True,
             )
 
-        os.chdir(project_root)
         if qwen_path is not None:
             os.environ["QWEN3VL_PATH"] = str(qwen_path.expanduser().resolve())
 
@@ -821,7 +824,9 @@ def _tactile_contract_from_policy(policy: Any) -> dict[str, Any]:
 
 def _tactile_contract_from_mapping(value: Any) -> dict[str, Any]:
     tactile = dict(value or {})
-    enabled = bool(tactile.get("enabled", False))
+    settings = TactileVTLAConfig.from_mapping(tactile)
+    resolved = settings.to_dict()
+    enabled = settings.enabled
     if not enabled:
         return {
             "enabled": False,
@@ -834,12 +839,12 @@ def _tactile_contract_from_mapping(value: Any) -> dict[str, Any]:
         }
     contract = {
         "enabled": enabled,
-        "num_sensors": int(tactile.get("num_sensors", TACTILE_SENSOR_COUNT)),
-        "num_markers": int(tactile.get("num_markers", TACTILE_MARKER_COUNT)),
-        "use_rgb": bool(tactile.get("use_rgb", False)) if enabled else False,
-        "use_markers": bool(tactile.get("use_markers", False)) if enabled else False,
-        "marker_history_length": int(tactile.get("marker_history_length", 0)),
-        "marker_sample_hz": float(tactile.get("marker_sample_hz", 0.0)),
+        "num_sensors": settings.num_sensors,
+        "num_markers": settings.num_markers,
+        "use_rgb": settings.use_rgb if enabled else False,
+        "use_markers": settings.use_markers if enabled else False,
+        "marker_history_length": settings.marker_history_length,
+        "marker_sample_hz": settings.marker_sample_hz,
     }
     _require_equal(contract["num_sensors"], TACTILE_SENSOR_COUNT, "tactile num_sensors")
     _require_equal(contract["num_markers"], TACTILE_MARKER_COUNT, "tactile num_markers")
@@ -873,6 +878,19 @@ def _tactile_contract_from_mapping(value: Any) -> dict[str, Any]:
             [MARKER_VALID_KEY],
             "tactile marker_valid_mask_keys",
         )
+        contract.update(
+            marker_tokenization=resolved["marker_tokenization"],
+            marker_position_encoding=resolved["marker_position_encoding"],
+            marker_contact_gate=resolved["marker_contact_gate"],
+            marker_ablation=resolved["marker_ablation"],
+            marker_reference_xy_path=resolved["marker_reference_xy_path"],
+            marker_reference_xy=resolved["marker_reference_xy"],
+            marker_tokens_per_sensor=settings.marker_tokens_per_sensor,
+            gate_tactile_rgb=(
+                settings.marker_contact_gate.mode != "none"
+                and settings.marker_contact_gate.target == "marker_and_rgb"
+            ),
+        )
     return contract
 
 
@@ -885,6 +903,7 @@ def _model_tactile_observation(
         "marker_displacement_history": observation.marker_displacement_history,
         "marker_valid_mask": observation.marker_valid_mask,
         "marker_history_valid_mask": observation.marker_history_valid_mask,
+        "marker_contact_state": observation.marker_contact_state,
         "tactile_sensor_mask": observation.tactile_sensor_mask,
     }
     supplied = {name for name, value in values.items() if value is not None}
@@ -904,6 +923,8 @@ def _model_tactile_observation(
                 "marker_history_valid_mask",
             }
         )
+        if contract.get("marker_contact_gate", {}).get("mode", "none") != "none":
+            required.add("marker_contact_state")
     missing = sorted(required - supplied)
     unexpected = sorted(supplied - required)
     if missing or unexpected:
@@ -941,6 +962,10 @@ def _synthetic_tactile_observation(
             marker_valid_mask=np.ones(marker_shape[:-1], dtype=np.bool_),
             marker_history_valid_mask=np.ones(marker_shape[:2], dtype=np.bool_),
         )
+        if contract.get("marker_contact_gate", {}).get("mode", "none") != "none":
+            result["marker_contact_state"] = np.full(
+                (TACTILE_SENSOR_COUNT,), CONTACT_OFF, dtype=np.int8
+            )
     return result
 
 

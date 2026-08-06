@@ -44,6 +44,7 @@ class Observation:
     marker_displacement_history: np.ndarray | None = None
     marker_valid_mask: np.ndarray | None = None
     marker_history_valid_mask: np.ndarray | None = None
+    marker_contact_state: np.ndarray | None = None
     tactile_sensor_mask: np.ndarray | None = None
     control_frequency_hz: float = 30.0
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
@@ -301,6 +302,7 @@ def _tactile_to_payload(obs: Observation, *, jpeg_quality: int) -> dict[str, Any
         "marker_displacement_history": obs.marker_displacement_history,
         "marker_valid_mask": obs.marker_valid_mask,
         "marker_history_valid_mask": obs.marker_history_valid_mask,
+        "marker_contact_state": obs.marker_contact_state,
         "sensor_mask": obs.tactile_sensor_mask,
     }
     supplied = {name for name, value in values.items() if value is not None}
@@ -367,6 +369,18 @@ def _tactile_to_payload(obs: Observation, *, jpeg_quality: int) -> dict[str, Any
                 f"{history_valid.dtype} {history_valid.shape}"
             )
         payload["marker_history_valid_mask"] = history_valid.astype(bool).tolist()
+        if obs.marker_contact_state is not None:
+            contact_state = np.asarray(obs.marker_contact_state)
+            if (
+                contact_state.shape != (TACTILE_SENSOR_COUNT,)
+                or not np.issubdtype(contact_state.dtype, np.integer)
+                or np.any((contact_state < 0) | (contact_state > 5))
+            ):
+                raise ValueError(
+                    "marker_contact_state must be integer contact-state codes with shape "
+                    f"({TACTILE_SENSOR_COUNT},), got {contact_state.dtype} {contact_state.shape}"
+                )
+            payload["marker_contact_state"] = contact_state.astype(int).tolist()
         payload["marker_sample_hz"] = TACTILE_MARKER_SAMPLE_HZ
     if "rgb" not in payload and not marker_supplied:
         raise ValueError("Tactile input must include RGB and/or marker data")
@@ -379,6 +393,7 @@ def _tactile_from_payload(value: Any) -> dict[str, np.ndarray | None]:
         "marker_displacement_history": None,
         "marker_valid_mask": None,
         "marker_history_valid_mask": None,
+        "marker_contact_state": None,
         "tactile_sensor_mask": None,
     }
     if value is None:
@@ -390,6 +405,7 @@ def _tactile_from_payload(value: Any) -> dict[str, np.ndarray | None]:
         "marker_displacement_history",
         "marker_valid_mask",
         "marker_history_valid_mask",
+        "marker_contact_state",
         "marker_sample_hz",
         "sensor_mask",
     }
@@ -455,6 +471,21 @@ def _tactile_from_payload(value: Any) -> dict[str, np.ndarray | None]:
                 f"{history_valid.dtype} {history_valid.shape}"
             )
         result["marker_history_valid_mask"] = np.ascontiguousarray(history_valid)
+        contact_value = value.get("marker_contact_state")
+        if contact_value is not None:
+            contact_state = np.asarray(contact_value)
+            if (
+                contact_state.shape != (TACTILE_SENSOR_COUNT,)
+                or not np.issubdtype(contact_state.dtype, np.integer)
+                or np.any((contact_state < 0) | (contact_state > 5))
+            ):
+                raise ValueError(
+                    "tactile.marker_contact_state must contain integer state codes "
+                    f"with shape ({TACTILE_SENSOR_COUNT},)"
+                )
+            result["marker_contact_state"] = np.ascontiguousarray(
+                contact_state, dtype=np.int8
+            )
         marker_sample_hz = float(value.get("marker_sample_hz", float("nan")))
         if not np.isclose(
             marker_sample_hz,

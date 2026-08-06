@@ -73,6 +73,7 @@ class PolicyPreprocessMixin:
             "marker_displacement_history": 5,
             "marker_valid_mask": 4,
             "marker_history_valid_mask": 3,
+            "marker_contact_state": 2,
             "tactile_sensor_mask": 2,
             "tactile_rgb_mask": 2,
         }
@@ -80,7 +81,7 @@ class PolicyPreprocessMixin:
             "tactile_rgb",
             "marker_displacement_history",
         }
-        integer = {"tactile_rgb_grid_thw"}
+        integer = {"tactile_rgb_grid_thw", "marker_contact_state"}
         result = {}
         for key, expected_rank in expected_ranks.items():
             value = observation.get(key)
@@ -299,11 +300,12 @@ class LingbotVLAv2Server:
                 os.environ.get("LINGBOT_V2_ALLOW_LEGACY_MARKER_REINIT", "0") == "1"
             ),
         )
-        if report["legacy_marker_reinitialized"]:
+        if report["marker_modules_reinitialized"]:
             print(
-                "[lingbot-v2-server] loaded legacy checkpoint with explicit "
-                "marker-only reinitialization: "
-                f"{report['reinitialized_keys']}"
+                "[lingbot-v2-server] checkpoint marker migration applied: "
+                f"reinitialized={report['reinitialized_keys']} "
+                f"ignored={report['intentionally_ignored_keys']} "
+                f"incompatibilities={report['config_incompatibilities']}"
             )
         return report
 

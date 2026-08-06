@@ -18,6 +18,7 @@ MODEL_TACTILE_KEYS = (
     "marker_displacement_history",
     "marker_valid_mask",
     "marker_history_valid_mask",
+    "marker_contact_state",
     "tactile_sensor_mask",
     "tactile_rgb_mask",
 )
@@ -209,6 +210,19 @@ def prepare_tactile_sample(
             marker_valid_mask=torch.stack(valid_masks, dim=0),
             marker_history_valid_mask=torch.stack(history_valid_masks, dim=0),
         )
+        contact_state = item.get("marker_contact_state")
+        gate = settings.marker_contact_gate
+        gate_mode = gate.get("mode", "none") if isinstance(gate, Mapping) else gate.mode
+        if contact_state is not None:
+            contact_state = _as_tensor(contact_state).to(dtype=torch.int8)
+            if tuple(contact_state.shape) != (num_sensors,):
+                raise ValueError("marker_contact_state must have shape [S]")
+            result["marker_contact_state"] = contact_state
+        elif gate_mode != "none":
+            raise ValueError(
+                "Contact-gated marker input requires episode-precomputed "
+                "marker_contact_state"
+            )
 
     if settings.use_rgb:
         aggregate_rgb = item.get("tactile_rgb")
@@ -283,6 +297,12 @@ def prepare_tactile_sample(
         if "marker_valid_mask" in result:
             result["marker_valid_mask"] &= explicit_sensor_mask[:, None, None]
             result["marker_history_valid_mask"] &= explicit_sensor_mask[:, None]
+            if "marker_contact_state" in result:
+                result["marker_contact_state"] = torch.where(
+                    explicit_sensor_mask,
+                    result["marker_contact_state"],
+                    torch.zeros_like(result["marker_contact_state"]),
+                )
         if "tactile_rgb_mask" in result:
             result["tactile_rgb_mask"] &= explicit_sensor_mask
     result["tactile_sensor_mask"] = sensor_present

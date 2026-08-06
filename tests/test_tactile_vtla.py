@@ -13,6 +13,8 @@ import torch
 from torch import nn
 import yaml
 
+from lingbotvla.models.vla.lingbot_vla import tactile_vtla as _tactile_model
+
 ROOT = Path(__file__).parents[1]
 
 
@@ -25,10 +27,6 @@ def _load_module(name: str, path: Path):
     return module
 
 
-_tactile_model = _load_module(
-    "_test_tactile_vtla_module",
-    ROOT / "lingbotvla/models/vla/lingbot_vla/tactile_vtla.py",
-)
 _tactile_data = _load_module(
     "_test_tactile_data_module",
     ROOT / "lingbotvla/data/vla_data/tactile.py",
@@ -421,6 +419,7 @@ def test_model_training_and_sampling_interfaces_expose_all_tactile_fields():
         "marker_displacement_history",
         "marker_valid_mask",
         "marker_history_valid_mask",
+        "marker_contact_state",
         "tactile_sensor_mask",
         "tactile_rgb_mask",
     }
@@ -604,6 +603,7 @@ def test_full_vtla_prefix_path_preserves_order_masks_rope_and_deepstack():
         marker_displacement_history=marker_history,
         marker_valid_mask=marker_valid,
         marker_history_valid_mask=marker_history_valid,
+        marker_contact_state=None,
         tactile_sensor_mask=sensor_mask,
         tactile_rgb_mask=sensor_mask,
     )
@@ -780,4 +780,8 @@ def test_ablation_configs_validate(name, enabled, use_rgb, use_markers):
         assert settings.marker_history_length == 8
         assert settings.marker_input_features == 2
         assert settings.marker_feature_mode == "displacement_history"
-        assert settings.marker_temporal_embedding is True
+        assert settings.marker_position_encoding.temporal_type in {
+            "none",
+            "learned",
+            "sincos",
+        }

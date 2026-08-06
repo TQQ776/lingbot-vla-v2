@@ -30,6 +30,7 @@ from lingbotvla.data.vla_data.base_dataset import (  # noqa: E402
     VLADataset,
     build_complete_chunk_anchor_indices,
     is_tacthru_umi_v2,
+    precompute_marker_contact_states,
 )
 from lingbotvla.data.vla_data.multi_vla_dataset import MultiVLADataset  # noqa: E402
 from lingbotvla.data.vla_data.transform import prepare_images  # noqa: E402
@@ -75,6 +76,62 @@ def test_complete_chunk_anchors_accept_column_or_index_mappings():
     expected = [0, 1, 2, 100, 101, 102, 103, 104]
     assert build_complete_chunk_anchor_indices(columnar, 50) == expected
     assert build_complete_chunk_anchor_indices(indexed, 50) == expected
+
+
+def test_contact_state_precompute_resets_at_each_episode_boundary():
+    reference = np.asarray(
+        [[x, y] for y in range(6) for x in range(8)], dtype=np.float32
+    )
+    displacement = torch.zeros(4, 48, 2)
+    displacement[:, :3, 0] = 0.8
+    valid = torch.ones(4, 48, dtype=torch.bool)
+
+    class _Rows:
+        def __getitem__(self, indices):
+            return {
+                "disp": displacement[indices],
+                "valid": valid[indices],
+            }
+
+    class _Dataset:
+        hf_dataset = _Rows()
+
+        def __len__(self):
+            return 4
+
+    settings = SimpleNamespace(
+        num_sensors=1,
+        num_markers=48,
+        marker_displacement_keys=["disp"],
+        marker_valid_mask_keys=["valid"],
+        marker_reference_xy=[reference.tolist()],
+        marker_tokenization={
+            "mode": "regional",
+            "num_regions": 4,
+            "region_layout": "2x2",
+        },
+        marker_contact_gate={
+            "mode": "hard_hysteresis",
+            "point_threshold": 0.4,
+            "on_threshold": 0.5,
+            "off_threshold": 0.2,
+            "soft_threshold": 0.2,
+            "topk_markers": 3,
+            "min_active_markers": 2,
+            "min_valid_markers_per_region": 2,
+            "min_valid_markers_global": 24,
+            "on_consecutive_frames": 2,
+            "off_consecutive_frames": 2,
+        },
+    )
+    episodes = [
+        {"dataset_from_index": 0, "dataset_to_index": 2},
+        {"dataset_from_index": 2, "dataset_to_index": 4},
+    ]
+
+    states = precompute_marker_contact_states(_Dataset(), episodes, settings)
+
+    assert states[:, 0].tolist() == [0, 1, 0, 1]
 
 
 def test_future_video_effective_fps_survives_feature_conversion():

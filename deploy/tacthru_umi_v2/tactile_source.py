@@ -10,6 +10,13 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from lingbotvla.tactile_contact import (
+    CONTACT_OFF,
+    MarkerContactGate,
+    build_marker_region_mapping_numpy,
+    runtime_gate_config_from_mapping,
+)
+
 from .protocol import (
     TACTILE_MARKER_COUNT,
     TACTILE_MARKER_HISTORY_LENGTH,
@@ -24,6 +31,7 @@ class TactileFrame:
     marker_displacement_history: np.ndarray | None
     marker_valid_mask: np.ndarray | None
     marker_history_valid_mask: np.ndarray | None
+    marker_contact_state: np.ndarray | None
     tactile_sensor_mask: np.ndarray
     capture_timestamp: float
     receive_timestamp: float
@@ -134,6 +142,7 @@ def build_tactile_frame(
         marker_displacement_history=marker_displacement_history,
         marker_valid_mask=marker_valid_mask,
         marker_history_valid_mask=marker_history_valid_mask,
+        marker_contact_state=None,
         tactile_sensor_mask=np.ones((TACTILE_SENSOR_COUNT,), dtype=np.bool_),
         capture_timestamp=float(timestamps[-1]),
         receive_timestamp=time.time(),
@@ -159,6 +168,7 @@ class TacThruSource:
         sensor_cfg_path: Path,
         use_rgb: bool,
         use_markers: bool,
+        tactile_config: Mapping[str, Any] | None = None,
     ) -> None:
         self.tacthru_repo = tacthru_repo.expanduser().resolve()
         self.sensor_cfg_path = sensor_cfg_path.expanduser().resolve()
@@ -173,6 +183,41 @@ class TacThruSource:
             maxlen=TACTILE_MARKER_HISTORY_LENGTH
         )
         self._last_marker_timestamp: float | None = None
+        self._contact_gates: list[MarkerContactGate] = []
+        self._contact_state = np.full(
+            (TACTILE_SENSOR_COUNT,), CONTACT_OFF, dtype=np.int8
+        )
+        if self.use_markers and tactile_config is not None:
+            gate_mapping = dict(tactile_config.get("marker_contact_gate", {}))
+            gate_settings = runtime_gate_config_from_mapping(
+                gate_mapping,
+                num_sensors=int(tactile_config["num_sensors"]),
+                num_markers=int(tactile_config["num_markers"]),
+            )
+            if gate_settings.mode != "none":
+                tokenization = dict(tactile_config.get("marker_tokenization", {}))
+                if tokenization.get("mode", "global") == "regional":
+                    region_ids, _ = build_marker_region_mapping_numpy(
+                        tactile_config["marker_reference_xy"],
+                        num_regions=int(tokenization["num_regions"]),
+                        region_layout=str(tokenization["region_layout"]),
+                    )
+                else:
+                    region_ids = np.zeros(
+                        (
+                            int(tactile_config["num_sensors"]),
+                            int(tactile_config["num_markers"]),
+                        ),
+                        dtype=np.int64,
+                    )
+                self._contact_gates = [
+                    MarkerContactGate(
+                        gate_settings,
+                        region_ids[sensor_index],
+                        sensor_index=sensor_index,
+                    )
+                    for sensor_index in range(int(tactile_config["num_sensors"]))
+                ]
         if not self.tacthru_repo.is_dir():
             raise NotADirectoryError(self.tacthru_repo)
         if not self.sensor_cfg_path.is_file():
@@ -272,6 +317,11 @@ class TacThruSource:
                 self._marker_history.append(displacement.copy())
                 self._marker_valid_history.append(valid.copy())
             self._last_marker_timestamp = float(timestamp)
+            for sensor_index, gate in enumerate(self._contact_gates):
+                self._contact_state[sensor_index] = gate.step(
+                    displacement,
+                    valid,
+                ).state
 
         if not self._marker_history:
             raise RuntimeError("TacThru marker history is empty after capture")
@@ -287,12 +337,20 @@ class TacThruSource:
                 (TACTILE_SENSOR_COUNT, TACTILE_MARKER_HISTORY_LENGTH),
                 dtype=np.bool_,
             ),
+            marker_contact_state=(
+                np.ascontiguousarray(self._contact_state, dtype=np.int8)
+                if self._contact_gates
+                else None
+            ),
         )
 
     def _clear_marker_history(self) -> None:
         self._marker_history.clear()
         self._marker_valid_history.clear()
         self._last_marker_timestamp = None
+        self._contact_state.fill(CONTACT_OFF)
+        for gate in self._contact_gates:
+            gate.reset()
 
     def close(self) -> None:
         sensor, self._sensor = self._sensor, None

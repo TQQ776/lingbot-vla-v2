@@ -37,6 +37,12 @@ except ImportError:
 from datasets import load_dataset as _hf_load_dataset
 
 from ...utils import logging
+from ...tactile_contact import (
+    CONTACT_OFF,
+    MarkerContactGate,
+    build_marker_region_mapping_numpy,
+    runtime_gate_config_from_mapping,
+)
 from .utils import FeatureTransform
 from .video_utils import decode_video_frames
 
@@ -123,6 +129,73 @@ def _to_relative_indices(dataset, query_indices):
     if index_map is None:
         return query_indices
     return [index_map[idx] for idx in query_indices]
+
+
+def _stack_hf_column(value, *, dtype):
+    if isinstance(value, torch.Tensor):
+        return value.to(dtype=dtype)
+    if isinstance(value, (list, tuple)):
+        return torch.stack([torch.as_tensor(item) for item in value]).to(dtype=dtype)
+    return torch.as_tensor(value, dtype=dtype)
+
+
+def precompute_marker_contact_states(dataset, episodes, settings):
+    """Run the shared gate in episode order and return [dataset_row,S] states."""
+
+    gate_mapping = dict(settings.marker_contact_gate)
+    gate_config = runtime_gate_config_from_mapping(
+        gate_mapping,
+        num_sensors=int(settings.num_sensors),
+        num_markers=int(settings.num_markers),
+    )
+    if gate_config.mode == "none":
+        return None
+    tokenization = dict(settings.marker_tokenization)
+    if tokenization.get("mode", "global") == "regional":
+        region_ids, _ = build_marker_region_mapping_numpy(
+            settings.marker_reference_xy,
+            num_regions=int(tokenization.get("num_regions", 4)),
+            region_layout=str(tokenization.get("region_layout", "2x2")),
+        )
+    else:
+        region_ids = torch.zeros(
+            settings.num_sensors, settings.num_markers, dtype=torch.long
+        ).numpy()
+    cache = torch.full(
+        (len(dataset), settings.num_sensors),
+        CONTACT_OFF,
+        dtype=torch.int8,
+    )
+    for record in _episode_records(episodes):
+        start = int(record["dataset_from_index"])
+        end = int(record["dataset_to_index"])
+        absolute_indices = list(range(start, end))
+        relative_indices = _to_relative_indices(dataset, absolute_indices)
+        rows = dataset.hf_dataset[relative_indices]
+        for sensor_index, (displacement_key, valid_key) in enumerate(
+            zip(settings.marker_displacement_keys, settings.marker_valid_mask_keys)
+        ):
+            if displacement_key not in rows:
+                raise KeyError(
+                    f"Contact-gated training dataset is missing {displacement_key}"
+                )
+            displacement = _stack_hf_column(
+                rows[displacement_key], dtype=torch.float32
+            )
+            if valid_key in rows:
+                valid = _stack_hf_column(rows[valid_key], dtype=torch.bool)
+            else:
+                valid = torch.isfinite(displacement).all(dim=-1)
+            gate = MarkerContactGate(
+                gate_config,
+                region_ids[sensor_index],
+                sensor_index=sensor_index,
+            )
+            states = gate.run_episode(displacement, valid).states
+            cache[torch.as_tensor(relative_indices, dtype=torch.long), sensor_index] = (
+                torch.as_tensor(states, dtype=torch.int8)
+            )
+    return cache
 
 
 def _get_task_name(tasks, task_idx):
@@ -310,6 +383,24 @@ class VLADataset(Dataset):
             load_image=load_image
         )
 
+        self.marker_contact_state_cache = None
+        tactile_settings = getattr(self.feature_transform, "tactile_settings", None)
+        if (
+            getattr(self.feature_transform, "tactile_enabled", False)
+            and getattr(tactile_settings, "use_markers", False)
+            and dict(tactile_settings.marker_contact_gate).get("mode", "none")
+            != "none"
+        ):
+            logger.info(
+                "Precomputing episode-safe TacThru marker contact states for %d rows",
+                len(self.dataset),
+            )
+            self.marker_contact_state_cache = precompute_marker_contact_states(
+                self.dataset,
+                self.dataset_meta.episodes,
+                tactile_settings,
+            )
+
         self.sample_indices = None
         if self.is_tacthru_umi_v2:
             fps = float(self.dataset_meta.fps)
@@ -430,7 +521,13 @@ class VLADataset(Dataset):
             if idx < 0 or idx >= len(self.sample_indices):
                 raise IndexError(f"Index {idx} out of bounds for dataset of size {len(self)}")
             idx = self.sample_indices[idx]
-        raw_item = self.check_lerobot_item(self.dataset[idx])
+        physical_idx = idx
+        raw_item = self.check_lerobot_item(self.dataset[physical_idx])
+        if self.marker_contact_state_cache is not None:
+            relative_idx = _to_relative_indices(self.dataset, [physical_idx])[0]
+            raw_item["marker_contact_state"] = self.marker_contact_state_cache[
+                relative_idx
+            ].clone()
         if (
             self.use_future_image
             and "future_video_effective_fps" not in raw_item

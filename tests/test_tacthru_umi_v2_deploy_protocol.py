@@ -38,6 +38,7 @@ def tactile_observation() -> Observation:
         marker_displacement_history=marker,
         marker_valid_mask=np.ones((1, 8, 48), dtype=np.bool_),
         marker_history_valid_mask=np.ones((1, 8), dtype=np.bool_),
+        marker_contact_state=np.asarray([2], dtype=np.int8),
         tactile_sensor_mask=np.ones((1,), dtype=np.bool_),
     )
 
@@ -132,7 +133,16 @@ def test_v3_tactile_roundtrip_preserves_rgb_and_marker_history_contract() -> Non
     assert decoded.marker_valid_mask.dtype == np.bool_
     assert decoded.marker_valid_mask.all()
     assert decoded.marker_history_valid_mask.all()
+    assert decoded.marker_contact_state.tolist() == [2]
     assert decoded.tactile_sensor_mask.tolist() == [True]
+
+
+def test_tactile_protocol_rejects_invalid_contact_state() -> None:
+    observation = tactile_observation()
+    values = dict(observation.__dict__)
+    values["marker_contact_state"] = np.asarray([99], dtype=np.int8)
+    with pytest.raises(ValueError, match="contact-state"):
+        observation_to_payload(Observation(**values))
 
 
 def test_tactile_marker_payload_rejects_partial_contract() -> None:

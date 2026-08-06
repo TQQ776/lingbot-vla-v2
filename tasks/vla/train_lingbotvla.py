@@ -2,6 +2,7 @@ import json
 import os
 import re
 import time
+from pathlib import Path
 from dataclasses import asdict, dataclass, field
 from functools import partial
 from io import BytesIO
@@ -11,6 +12,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import wandb
+import yaml
 from PIL import Image
 from tqdm import trange
 from torch.utils.tensorboard import SummaryWriter
@@ -42,6 +44,7 @@ from lingbotvla.utils.async_hf_checkpoint import AsyncHFCheckpointSaver
 from lingbotvla.utils.arguments import EvalArguments, DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from lingbotvla.utils.dist_utils import all_reduce
 from lingbotvla.models.config_registry import get_config_registry
+from lingbotvla.models.vla.lingbot_vla.tactile_vtla import TactileVTLAConfig
 
 from lingbotvla.models.vla.vision_models.module_utils import (
     build_depth_model,
@@ -176,6 +179,87 @@ def log_vtla_parameter_stats(model: "torch.nn.Module", param_groups) -> None:
         f"frozen={summary['frozen']} tactile={tactile} "
         f"action_expert={action} groups={summary['groups']}"
     )
+
+
+def save_vtla_runtime_metadata(model: "torch.nn.Module", args_train) -> dict[str, Any] | None:
+    """Persist the resolved tactile config and the exact region mapping once."""
+
+    settings = TactileVTLAConfig.from_mapping(args_train.tactile)
+    if not settings.enabled:
+        return None
+    flow_model = getattr(model, "model", None)
+    encoder = getattr(flow_model, "tactile_encoder", None)
+    if encoder is None:
+        raise RuntimeError("VTLA is enabled but the model has no tactile encoder")
+    trainable = sum(
+        parameter.numel()
+        for parameter in encoder.parameters()
+        if parameter.requires_grad
+    )
+    resolved = settings.to_dict()
+    marker_tokens_per_sensor = (
+        settings.marker_tokens_per_sensor if settings.use_markers else 0
+    )
+    resolved["marker_tokens_per_sensor"] = marker_tokens_per_sensor
+    resolved["trainable_tactile_parameters"] = trainable
+    output_dir = Path(args_train.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "resolved_tactile_config.yaml").write_text(
+        yaml.safe_dump(resolved, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    region_names = []
+    if settings.use_markers:
+        region_names = (
+            ["global"]
+            if settings.marker_tokenization.num_regions == 1
+            else ["left-top", "right-top", "left-bottom", "right-bottom"]
+        )
+    region_ids = encoder.marker_region_ids.detach().cpu()
+    mapping = {
+        "version": 1,
+        "sensor_names": list(settings.sensor_names),
+        "region_order": region_names,
+        "reference_xy_path": settings.marker_reference_xy_path,
+        "regions": {
+            sensor_name: {
+                region_names[region_index]: torch.nonzero(
+                    region_ids[sensor_index] == region_index
+                ).flatten().tolist()
+                for region_index in range(len(region_names))
+            }
+            for sensor_index, sensor_name in enumerate(settings.sensor_names)
+        },
+        "region_ids": region_ids.tolist(),
+        "region_centers": encoder.marker_region_centers.detach().cpu().tolist(),
+    }
+    (output_dir / "marker_region_mapping.json").write_text(
+        json.dumps(mapping, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    summary = {
+        "tokenization": settings.marker_tokenization.mode,
+        "tokens_per_sensor": marker_tokens_per_sensor,
+        "history_length": settings.marker_history_length,
+        "num_regions": settings.marker_tokenization.num_regions,
+        "region_layout": settings.marker_tokenization.region_layout,
+        "temporal_position": settings.marker_position_encoding.temporal_type,
+        "spatial_position": settings.marker_position_encoding.spatial_type,
+        "contact_gate": settings.marker_contact_gate.mode,
+        "gate_target": settings.marker_contact_gate.target,
+        "on_thresholds": settings.marker_contact_gate.on_thresholds,
+        "off_thresholds": settings.marker_contact_gate.off_thresholds,
+        "on_frames": settings.marker_contact_gate.on_consecutive_frames,
+        "off_frames": settings.marker_contact_gate.off_consecutive_frames,
+        "hold_frames": settings.marker_contact_gate.release_hold_frames,
+        "rgb_gated": settings.gate_tactile_rgb,
+        "contact_stats": settings.marker_contact_gate.threshold_stats_path,
+        "reference_xy": settings.marker_reference_xy_path,
+        "trainable_tactile_parameters": trainable,
+    }
+    logger.info_rank0(f"Resolved VTLA tactile architecture: {summary}")
+    logger.info_rank0(f"Resolved marker region mapping: {mapping['regions']}")
+    return {"resolved": resolved, "mapping": mapping, "summary": summary}
 
 @dataclass
 class MyTrainingArguments(TrainingArguments):
@@ -500,6 +584,9 @@ def main():
     log_model_param_stats(model)
 
     model_config = model.config
+    vtla_runtime_metadata = None
+    if args.train.global_rank == 0:
+        vtla_runtime_metadata = save_vtla_runtime_metadata(model, args.train)
     helper.print_device_mem_info("VRAM usage after building model")
 
     logger.info_rank0("Prepare data")
@@ -664,6 +751,11 @@ def main():
                 name=args.train.wandb_name,
                 config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
             )
+            if vtla_runtime_metadata is not None:
+                wandb.config.update(
+                    {"resolved_tactile": vtla_runtime_metadata["resolved"]},
+                    allow_val_change=True,
+                )
 
         if args.train.enable_profiling:
             profiler = helper.create_profiler(
@@ -1071,7 +1163,7 @@ def main():
                         scalar = _tb_scalar(value)
                         if scalar is not None:
                             writer.add_scalar(key, scalar, global_step)
-                    elif key.startswith("align/"):
+                    elif key.startswith(("align/", "tactile/")):
                         scalar = _tb_scalar(value)
                         if scalar is not None:
                             writer.add_scalar(key, scalar, global_step)

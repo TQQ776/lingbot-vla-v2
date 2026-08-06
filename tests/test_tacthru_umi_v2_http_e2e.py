@@ -69,8 +69,8 @@ def make_observation(index: int = 0) -> Observation:
     )
 
 
-def tactile_contract() -> dict:
-    return {
+def tactile_contract(*, gated: bool = False) -> dict:
+    contract = {
         "enabled": True,
         "num_sensors": 1,
         "num_markers": 48,
@@ -85,6 +85,19 @@ def tactile_contract() -> dict:
         ],
         "marker_valid_mask_keys": ["observation.tactile.marker_valid_left"],
     }
+    if gated:
+        contract.update(
+            marker_contact_gate={
+                "enabled": True,
+                "mode": "hard",
+                "target": "marker_only",
+                "point_threshold": 0.1,
+                "on_threshold": 0.2,
+                "off_threshold": 0.1,
+            },
+            gate_tactile_rgb=False,
+        )
+    return contract
 
 
 def make_tactile_observation() -> Observation:
@@ -148,7 +161,7 @@ def test_http_roundtrip_forwards_vtla_inputs_instead_of_dropping_them() -> None:
         )
         health = client.health()
         assert health["tactile_enabled"] is True
-        assert health["tactile"] == {
+        expected_contract = {
             "enabled": True,
             "num_sensors": 1,
             "num_markers": 48,
@@ -157,6 +170,9 @@ def test_http_roundtrip_forwards_vtla_inputs_instead_of_dropping_them() -> None:
             "marker_history_length": 8,
             "marker_sample_hz": 30.0,
         }
+        assert expected_contract.items() <= health["tactile"].items()
+        assert health["tactile"]["marker_tokens_per_sensor"] == 8
+        assert health["tactile"]["marker_contact_gate"]["mode"] == "none"
         chunk_size = validate_server_health(health)
         response = client.predict(
             make_tactile_observation(), expected_steps=chunk_size
@@ -184,6 +200,20 @@ def test_vtla_backend_rejects_request_that_omits_checkpoint_modalities() -> None
 
     with pytest.raises(ValueError, match="does not match checkpoint"):
         backend.predict(make_observation())
+
+
+def test_gated_backend_requires_and_forwards_contact_state() -> None:
+    policy = FakePolicy(tactile=tactile_contract(gated=True))
+    backend = make_backend(policy)
+    observation = make_tactile_observation()
+    with pytest.raises(ValueError, match="does not match checkpoint"):
+        backend.predict(observation)
+
+    values = dict(observation.__dict__)
+    values["marker_contact_state"] = np.asarray([1], dtype=np.int8)
+    backend.predict(Observation(**values))
+
+    assert policy.inputs[-1]["marker_contact_state"].tolist() == [1]
 
 
 def test_vision_backend_rejects_unexpected_tactile_request() -> None:

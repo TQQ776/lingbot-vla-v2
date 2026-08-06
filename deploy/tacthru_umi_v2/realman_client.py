@@ -848,6 +848,12 @@ def _tactile_contract_from_health(health: dict) -> dict[str, Any]:
         "use_markers": use_markers,
         "marker_history_length": marker_history_length,
         "marker_sample_hz": marker_sample_hz,
+        "marker_tokenization": value.get("marker_tokenization", {}),
+        "marker_position_encoding": value.get("marker_position_encoding", {}),
+        "marker_contact_gate": value.get("marker_contact_gate", {}),
+        "marker_ablation": value.get("marker_ablation", {}),
+        "marker_reference_xy_path": value.get("marker_reference_xy_path"),
+        "marker_reference_xy": value.get("marker_reference_xy", []),
     }
 
 
@@ -873,6 +879,10 @@ def _synthetic_tactile_inputs(contract: dict[str, Any]) -> dict[str, np.ndarray]
             marker_valid_mask=np.ones(marker_shape[:-1], dtype=np.bool_),
             marker_history_valid_mask=np.ones(marker_shape[:2], dtype=np.bool_),
         )
+        if contract.get("marker_contact_gate", {}).get("mode", "none") != "none":
+            result["marker_contact_state"] = np.zeros(
+                (TACTILE_SENSOR_COUNT,), dtype=np.int8
+            )
     return result
 
 
@@ -1038,6 +1048,7 @@ def run_realman(
                 sensor_cfg_path=tactile_sensor_cfg,
                 use_rgb=tactile_contract["use_rgb"],
                 use_markers=tactile_contract["use_markers"],
+                tactile_config=tactile_contract,
             )
             tactile_source.start()
             print(
@@ -1106,6 +1117,7 @@ def run_realman(
                     "marker_displacement_history": tactile_frame.marker_displacement_history,
                     "marker_valid_mask": tactile_frame.marker_valid_mask,
                     "marker_history_valid_mask": tactile_frame.marker_history_valid_mask,
+                    "marker_contact_state": tactile_frame.marker_contact_state,
                     "tactile_sensor_mask": tactile_frame.tactile_sensor_mask,
                 }
                 tactile_inputs = {

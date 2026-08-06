@@ -557,6 +557,7 @@ class FlowMatchingV2(FlowMatchingV1):
         marker_displacement_history=None,
         marker_valid_mask=None,
         marker_history_valid_mask=None,
+        marker_contact_state=None,
         tactile_sensor_mask=None,
         tactile_rgb_mask=None,
     ):
@@ -572,6 +573,7 @@ class FlowMatchingV2(FlowMatchingV1):
                 marker_displacement_history=marker_displacement_history,
                 marker_valid_mask=marker_valid_mask,
                 marker_history_valid_mask=marker_history_valid_mask,
+                marker_contact_state=marker_contact_state,
                 tactile_sensor_mask=tactile_sensor_mask,
                 tactile_rgb_mask=tactile_rgb_mask,
             )
@@ -822,6 +824,7 @@ class FlowMatchingV2(FlowMatchingV1):
         marker_displacement_history,
         marker_valid_mask,
         marker_history_valid_mask,
+        marker_contact_state,
         tactile_sensor_mask,
         tactile_rgb_mask,
     ):
@@ -933,6 +936,10 @@ class FlowMatchingV2(FlowMatchingV1):
                     raise ValueError("tactile_rgb_mask must have shape [B,S]")
                 rgb_sensor_mask = tactile_rgb_mask.to(device=device, dtype=torch.bool)
             rgb_sensor_mask &= sensor_mask
+            rgb_sensor_mask = self.tactile_encoder.gate_rgb_sensor_mask(
+                rgb_sensor_mask,
+                marker_contact_state,
+            )
             all_images = torch.cat([images, tactile_rgb], dim=1)
             all_grid = torch.cat([scene_grid, tactile_rgb_grid_thw], dim=1)
 
@@ -1117,10 +1124,7 @@ class FlowMatchingV2(FlowMatchingV1):
                     dtype=torch.bool,
                     device=device,
                 )
-            marker_module = self.tactile_encoder.marker_encoder
-            if marker_module is None:
-                raise RuntimeError("MarkerEncoder is unavailable")
-            marker_dtype = next(marker_module.parameters()).dtype
+            marker_dtype = self.tactile_encoder.marker_dtype
             marker_displacement_history = marker_displacement_history.to(
                 device=device, dtype=marker_dtype
             )
@@ -1135,12 +1139,13 @@ class FlowMatchingV2(FlowMatchingV1):
                 marker_valid_mask,
                 marker_history_valid_mask,
                 sensor_mask,
+                marker_contact_state,
             )
             # Sensor-major, time-minor: left[t-7:t], then right[t-7:t].
             marker_tokens = marker_tokens.to(dtype=embed_dtype).flatten(1, 2)
             marker_token_mask = marker_token_mask.flatten(1, 2)
             marker_ids = torch.full(
-                (bsize, sensor_count * self.tactile_settings.marker_history_length),
+                (bsize, marker_tokens.shape[1]),
                 cfg.text_config.eos_token_id,
                 dtype=torch.long,
                 device=device,
@@ -1340,12 +1345,12 @@ class FlowMatchingV2(FlowMatchingV1):
                 marker_shape = (
                     bsize,
                     sensor_count,
-                    self.tactile_settings.marker_history_length,
+                    marker_token_mask.shape[1] // sensor_count,
                     embs.shape[-1],
                 )
             logger.info(
                 "VTLA prefix shapes: scene=%s tactile_rgb=%s marker=%s "
-                "context=%s mask=%s rgb_valid=%.4f marker_valid=%.4f",
+                "context=%s mask=%s prefix_length=%d rgb_valid=%.4f marker_valid=%.4f",
                 tuple(scene_tokens.shape),
                 None
                 if not self.tactile_settings.use_rgb
@@ -1353,6 +1358,7 @@ class FlowMatchingV2(FlowMatchingV1):
                 marker_shape,
                 tuple(embs.shape),
                 tuple(pad_masks.shape),
+                embs.shape[1],
                 0.0 if rgb_sensor_mask is None else rgb_sensor_mask.float().mean().item(),
                 0.0 if marker_token_mask is None else marker_token_mask.float().mean().item(),
             )
@@ -1415,6 +1421,7 @@ class FlowMatchingV2(FlowMatchingV1):
         marker_displacement_history=None,
         marker_valid_mask=None,
         marker_history_valid_mask=None,
+        marker_contact_state=None,
         tactile_sensor_mask=None,
         tactile_rgb_mask=None,
     ) -> Tensor:
@@ -1447,6 +1454,7 @@ class FlowMatchingV2(FlowMatchingV1):
             marker_displacement_history=marker_displacement_history,
             marker_valid_mask=marker_valid_mask,
             marker_history_valid_mask=marker_history_valid_mask,
+            marker_contact_state=marker_contact_state,
             tactile_sensor_mask=tactile_sensor_mask,
             tactile_rgb_mask=tactile_rgb_mask,
         )
@@ -1570,6 +1578,13 @@ class FlowMatchingV2(FlowMatchingV1):
         seq_wise_loss, router_z_loss, moe_metrics = self._moe_losses_and_metrics(
             router_logits_list, losses
         )
+        if self.tactile_encoder is not None:
+            for name, value in self.tactile_encoder.last_marker_diagnostics.items():
+                if value.numel() == 1:
+                    moe_metrics[f"tactile/{name}"] = value
+                else:
+                    for region_index, scalar in enumerate(value.flatten()):
+                        moe_metrics[f"tactile/{name}/region_{region_index}"] = scalar
         if align_metrics:
             moe_metrics.update(align_metrics)
         return losses, loss_depth, loss_future_depth, loss_future_video, depth_preds, seq_wise_loss, router_z_loss, moe_metrics, future_depth_preds, future_video_preds, current_video_preds
@@ -1588,6 +1603,7 @@ class FlowMatchingV2(FlowMatchingV1):
         marker_displacement_history=None,
         marker_valid_mask=None,
         marker_history_valid_mask=None,
+        marker_contact_state=None,
         tactile_sensor_mask=None,
         tactile_rgb_mask=None,
     ) -> Tensor:
@@ -1622,6 +1638,7 @@ class FlowMatchingV2(FlowMatchingV1):
             marker_displacement_history=marker_displacement_history,
             marker_valid_mask=marker_valid_mask,
             marker_history_valid_mask=marker_history_valid_mask,
+            marker_contact_state=marker_contact_state,
             tactile_sensor_mask=tactile_sensor_mask,
             tactile_rgb_mask=tactile_rgb_mask,
         )
@@ -1950,6 +1967,7 @@ class LingbotVlaV2Policy(PreTrainedModel):
         marker_displacement_history=None,
         marker_valid_mask=None,
         marker_history_valid_mask=None,
+        marker_contact_state=None,
         tactile_sensor_mask=None,
         tactile_rgb_mask=None,
         **kwargs
@@ -1991,6 +2009,7 @@ class LingbotVlaV2Policy(PreTrainedModel):
             marker_displacement_history=marker_displacement_history,
             marker_valid_mask=marker_valid_mask,
             marker_history_valid_mask=marker_history_valid_mask,
+            marker_contact_state=marker_contact_state,
             tactile_sensor_mask=tactile_sensor_mask,
             tactile_rgb_mask=tactile_rgb_mask,
         )
@@ -2037,6 +2056,7 @@ class LingbotVlaV2Policy(PreTrainedModel):
         marker_displacement_history=None,
         marker_valid_mask=None,
         marker_history_valid_mask=None,
+        marker_contact_state=None,
         tactile_sensor_mask=None,
         tactile_rgb_mask=None,
     ) -> Tensor:
@@ -2053,6 +2073,7 @@ class LingbotVlaV2Policy(PreTrainedModel):
             marker_displacement_history=marker_displacement_history,
             marker_valid_mask=marker_valid_mask,
             marker_history_valid_mask=marker_history_valid_mask,
+            marker_contact_state=marker_contact_state,
             tactile_sensor_mask=tactile_sensor_mask,
             tactile_rgb_mask=tactile_rgb_mask,
         )

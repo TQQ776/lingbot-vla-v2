@@ -1,0 +1,63 @@
+rgb_only:
+  use_rgb: true
+  use_markers: false
+  marker_contact_gate: {enabled: false, mode: none, target: marker_only}
+  gate_tactile_rgb: false
+
+marker_global_8_no_gate:
+  use_rgb: false
+  use_markers: true
+  marker_tokenization: {mode: global, num_regions: 1, region_layout: 1x1, aggregation: mean_max, include_reference_xy: false, point_hidden_dim: 128, region_hidden_dim: 512}
+  marker_position_encoding: {temporal_type: learned, spatial_type: none, use_real_time: false, combination: additive}
+  marker_contact_gate: {enabled: false, mode: none, target: marker_only}
+  gate_tactile_rgb: false
+
+rgb_marker_global_8_no_gate:
+  use_rgb: true
+  use_markers: true
+  marker_tokenization: {mode: global, num_regions: 1, region_layout: 1x1, aggregation: mean_max, include_reference_xy: false, point_hidden_dim: 128, region_hidden_dim: 512}
+  marker_position_encoding: {temporal_type: learned, spatial_type: none, use_real_time: false, combination: additive}
+  marker_contact_gate: {enabled: false, mode: none, target: marker_only}
+  gate_tactile_rgb: false
+
+rgb_marker_regional_32_no_pos:
+  marker_position_encoding: {temporal_type: none, spatial_type: none, use_real_time: true, combination: additive}
+  marker_contact_gate: {enabled: false, mode: none, target: marker_only}
+  gate_tactile_rgb: false
+
+rgb_marker_regional_32_time_only:
+  marker_position_encoding: {temporal_type: sincos, spatial_type: none, use_real_time: true, combination: additive}
+  marker_contact_gate: {enabled: false, mode: none, target: marker_only}
+  gate_tactile_rgb: false
+
+rgb_marker_regional_32_space_only:
+  marker_position_encoding: {temporal_type: none, spatial_type: sincos, use_real_time: true, combination: additive}
+  marker_contact_gate: {enabled: false, mode: none, target: marker_only}
+  gate_tactile_rgb: false
+
+rgb_marker_regional_32_spatiotemporal:
+  marker_position_encoding: {temporal_type: sincos, spatial_type: sincos, use_real_time: true, combination: additive}
+  marker_contact_gate: {enabled: false, mode: none, target: marker_only}
+  gate_tactile_rgb: false
+
+rgb_marker_regional_32_hard_gate:
+  marker_contact_gate: {enabled: true, mode: hard, target: marker_only, release_hold_frames: 0}
+  gate_tactile_rgb: false
+
+rgb_marker_regional_32_hysteresis:
+  marker_contact_gate: {enabled: true, mode: hard_hysteresis, target: marker_only, release_hold_frames: 0}
+  gate_tactile_rgb: false
+
+rgb_marker_regional_32_full_gate:
+  marker_contact_gate: {enabled: true, mode: hard_hysteresis_soft_region, target: marker_only, release_hold_frames: 3, regional_soft_gate: true}
+  gate_tactile_rgb: false
+
+rgb_marker_regional_32_gate_rgb_control:
+  marker_contact_gate: {enabled: true, mode: hard_hysteresis_soft_region, target: marker_and_rgb, release_hold_frames: 3, regional_soft_gate: true}
+  gate_tactile_rgb: true
+
+marker_history_shuffle:
+  marker_ablation: {zero_marker_content: false, shuffle_temporal_order: true, shuffle_region_order: false, disable_spatial_content: false, shuffle_seed: 0}
+
+marker_region_shuffle:
+  marker_ablation: {zero_marker_content: false, shuffle_temporal_order: false, shuffle_region_order: true, disable_spatial_content: false, shuffle_seed: 0}

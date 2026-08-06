@@ -40,7 +40,7 @@ data:
   image_augment: true
 
 train:
-  output_dir: output/insert_ethernet_vtla_rgb_marker_history8_all201_v1
+  output_dir: output/insert_ethernet_vtla_regional32_contact_all201_v1
   freeze_vlm: true
   train_action_expert: true
   new_modules_lr: 1.0e-4
@@ -58,8 +58,50 @@ train:
     marker_sample_hz: 30.0
     marker_input_features: 2
     marker_feature_mode: displacement_history
-    marker_temporal_embedding: true
+    marker_temporal_embedding: false
     marker_hidden_dim: 512
+    marker_reference_xy_path: assets/tactile/tacthru_ml_marker_reference_48.json
+    marker_tokenization:
+      mode: regional
+      num_regions: 4
+      region_layout: 2x2
+      aggregation: mean_max
+      include_reference_xy: true
+      point_hidden_dim: 128
+      region_hidden_dim: 512
+    marker_position_encoding:
+      temporal_type: sincos
+      spatial_type: sincos
+      use_real_time: true
+      combination: additive
+    marker_contact_gate:
+      enabled: true
+      target: marker_only
+      mode: hard_hysteresis_soft_region
+      score_type: topk_mean
+      topk_markers: 3
+      min_active_markers: 2
+      min_valid_markers_per_region: 2
+      min_valid_markers_global: 24
+      threshold_source: calibration
+      threshold_stats_path: assets/tactile/insert_ethernet_contact_calibration_initial15.json
+      on_threshold: null
+      off_threshold: null
+      point_threshold: null
+      mad_multiplier: 6.0
+      on_consecutive_frames: 2
+      off_consecutive_frames: 3
+      release_hold_frames: 3
+      regional_soft_gate: true
+      soft_gate_temperature: 0.1
+      unknown_tracking_policy: hold_previous
+      max_unknown_hold_frames: 3
+    gate_tactile_rgb: false
+    marker_ablation:
+      zero_marker_content: false
+      shuffle_temporal_order: false
+      shuffle_region_order: false
+      disable_spatial_content: false
     add_modality_embedding: true
     add_sensor_side_embedding: true
     marker_stats_path: assets/norm_stats/insert_ethernet_cable_ml_0721_201_vtla_marker.json

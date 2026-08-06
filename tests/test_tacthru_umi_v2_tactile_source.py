@@ -5,6 +5,12 @@ import numpy as np
 import pytest
 
 from deploy.tacthru_umi_v2.tactile_source import TacThruSource, build_tactile_frame
+from lingbotvla.tactile_contact import (
+    CONTACT_OFF,
+    CONTACT_ON,
+    MarkerContactGate,
+    runtime_gate_config_from_mapping,
+)
 
 
 def sensor_history() -> dict[str, np.ndarray]:
@@ -115,6 +121,8 @@ def _source_with_data(data) -> TacThruSource:
     source._marker_history = deque(maxlen=8)
     source._marker_valid_history = deque(maxlen=8)
     source._last_marker_timestamp = None
+    source._contact_gates = []
+    source._contact_state = np.full((1,), CONTACT_OFF, dtype=np.int8)
     return source
 
 
@@ -152,3 +160,28 @@ def test_live_source_episode_reset_discards_previous_history() -> None:
     source._sensor = _FakeSensor(reset_data)
     reset = source.capture(timeout_s=0.1, episode_reset=True)
     assert np.allclose(reset.marker_displacement_history, 0.4)
+
+
+def test_live_source_emits_online_contact_state_from_each_new_frame() -> None:
+    source = _source_with_data(sensor_history())
+    config = runtime_gate_config_from_mapping(
+        {
+            "mode": "hard",
+            "point_threshold": 0.05,
+            "on_threshold": 0.08,
+            "off_threshold": 0.04,
+            "soft_threshold": 0.04,
+            "min_active_markers": 2,
+            "min_valid_markers_per_region": 2,
+            "min_valid_markers_global": 24,
+        },
+        num_sensors=1,
+        num_markers=48,
+    )
+    source._contact_gates = [
+        MarkerContactGate(config, np.zeros(48, dtype=np.int64))
+    ]
+
+    frame = source.capture(timeout_s=0.1, episode_reset=True)
+
+    assert frame.marker_contact_state.tolist() == [CONTACT_ON]
