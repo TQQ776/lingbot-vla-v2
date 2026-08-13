@@ -77,6 +77,23 @@ def test_episode_reset_replicates_current_frame_and_zeros_invalid_markers() -> N
     assert np.count_nonzero(frame.marker_displacement_history[0, :, 3]) == 0
 
 
+def test_tracker_valid_mask_excludes_finite_estimated_markers() -> None:
+    history = sensor_history()
+    history["marker_valid"] = np.ones((2, 48), dtype=np.bool_)
+    history["marker_valid"][-1, :4] = False
+
+    frame = build_tactile_frame(
+        history,
+        use_rgb=False,
+        use_markers=True,
+        episode_reset=True,
+    )
+
+    assert not frame.marker_valid_mask[0, :, :4].any()
+    assert frame.marker_valid_mask[0, :, 4:].all()
+    assert np.count_nonzero(frame.marker_displacement_history[0, :, :4]) == 0
+
+
 def test_build_tactile_frame_supports_rgb_only_checkpoint() -> None:
     frame = build_tactile_frame(
         sensor_history(),
@@ -117,6 +134,7 @@ def _source_with_data(data) -> TacThruSource:
     source = object.__new__(TacThruSource)
     source.use_rgb = False
     source.use_markers = True
+    source.marker_history_length = 8
     source._sensor = _FakeSensor(data)
     source._marker_history = deque(maxlen=8)
     source._marker_valid_history = deque(maxlen=8)
@@ -124,6 +142,19 @@ def _source_with_data(data) -> TacThruSource:
     source._contact_gates = []
     source._contact_state = np.full((1,), CONTACT_OFF, dtype=np.int8)
     return source
+
+
+def test_live_source_uses_checkpoint_four_frame_history() -> None:
+    source = _source_with_data(sensor_history())
+    source.marker_history_length = 4
+    source._marker_history = deque(maxlen=4)
+    source._marker_valid_history = deque(maxlen=4)
+
+    frame = source.capture(timeout_s=0.1, episode_reset=True)
+
+    assert frame.marker_displacement_history.shape == (1, 4, 48, 2)
+    assert frame.marker_valid_mask.shape == (1, 4, 48)
+    assert frame.marker_history_valid_mask.shape == (1, 4)
 
 
 def test_live_source_rolls_only_new_timestamped_marker_frames() -> None:

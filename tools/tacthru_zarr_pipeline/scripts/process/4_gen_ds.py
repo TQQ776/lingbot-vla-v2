@@ -48,14 +48,22 @@ def compute_sensor_padding(orig_img_size_hw: tuple[int, int], sensor_type: str) 
     return top, bottom, left, right
 
 
-def _load_marker_flow(kpts_path: Path) -> np.ndarray:
+def _load_marker_data(kpts_path: Path) -> tuple[np.ndarray, np.ndarray]:
     with kpts_path.open("rb") as f:
         data = pickle.load(f)
     if "marker_flow" in data:
-        return np.asarray(data["marker_flow"], dtype=np.float32)
-    marker = np.asarray(data["marker"], dtype=np.float32)
-    marker_ref = np.asarray(data["marker_ref"], dtype=np.float32)
-    return marker - marker_ref
+        marker_flow = np.asarray(data["marker_flow"], dtype=np.float32)
+    else:
+        marker = np.asarray(data["marker"], dtype=np.float32)
+        marker_ref = np.asarray(data["marker_ref"], dtype=np.float32)
+        marker_flow = marker - marker_ref
+    marker_valid = data.get("marker_valid")
+    if marker_valid is None:
+        marker_valid = np.isfinite(marker_flow).all(axis=-1)
+    else:
+        marker_valid = np.asarray(marker_valid, dtype=bool)
+        marker_valid &= np.isfinite(marker_flow).all(axis=-1)
+    return marker_flow, marker_valid
 
 
 def _infer_marker_count(video_paths: list[str]) -> int:
@@ -65,7 +73,7 @@ def _infer_marker_count(video_paths: list[str]) -> int:
             kpts_path = demo_dir / f"TacThru-{sensor_idx}_synced_kpts.pkl"
             if not kpts_path.is_file():
                 continue
-            marker_flow = _load_marker_flow(kpts_path)
+            marker_flow, _ = _load_marker_data(kpts_path)
             if marker_flow.ndim != 3 or marker_flow.shape[-1] != 2:
                 raise RuntimeError(f"Invalid marker flow shape in {kpts_path}: expected (T, N, 2), got {marker_flow.shape}")
             return int(marker_flow.shape[1])
@@ -238,6 +246,7 @@ def main(
     tactile_streams_by_demo: dict[str, dict[int, str]] = {}
     tactile_rgb_keys: set[str] = set()
     tactile_marker_keys: set[str] = set()
+    tactile_marker_valid_keys: set[str] = set()
     for video_path_str in sorted(videos_dict.keys()):
         demo_dir = Path(video_path_str).parent
         streams = _available_tactile_streams(demo_dir=demo_dir, swap_lr=swap_lr)
@@ -247,6 +256,7 @@ def main(
         for dataset_base in streams.values():
             tactile_rgb_keys.add(f"{dataset_base}_rgb")
             tactile_marker_keys.add(f"{dataset_base}_marker")
+            tactile_marker_valid_keys.add(f"{dataset_base}_marker_valid")
 
     marker_count = _infer_marker_count(sorted(videos_dict.keys())) if write_markers else None
 
@@ -269,6 +279,17 @@ def main(
                 compressor=None,
                 dtype=np.float32,
             )
+        for key in _ordered_existing_keys(
+            tactile_marker_valid_keys,
+            ("tacthru_l_marker_valid", "tacthru_r_marker_valid"),
+        ):
+            replay_buffer.data.require_dataset(
+                name=key,
+                shape=(total_steps, int(marker_count)),
+                chunks=(1, int(marker_count)),
+                compressor=None,
+                dtype=bool,
+            )
 
     if not videos_dict:
         raise click.ClickException("No camera video tasks were collected from the dataset plan.")
@@ -288,11 +309,9 @@ def main(
                 kpts_path = demo_dir / f"TacThru-{sensor_idx}_synced_kpts.pkl"
                 if not kpts_path.is_file():
                     raise FileNotFoundError(f"Missing synced tactile keypoints for {demo_dir}: {kpts_path.name}")
-                sensor_kpts[sensor_idx] = _load_marker_flow(kpts_path)
+                sensor_kpts[sensor_idx] = _load_marker_data(kpts_path)
         if write_markers:
-            for sensor_idx, marker_flow in sensor_kpts.items():
-                if marker_flow is None:
-                    continue
+            for sensor_idx, (marker_flow, marker_valid) in sensor_kpts.items():
                 if marker_flow.ndim != 3 or marker_flow.shape[-1] != 2:
                     raise RuntimeError(
                         f"Invalid marker flow shape in {demo_dir / f'TacThru-{sensor_idx}_synced_kpts.pkl'}: "
@@ -302,6 +321,11 @@ def main(
                     raise RuntimeError(
                         f"Inconsistent tactile marker count in {demo_dir / f'TacThru-{sensor_idx}_synced_kpts.pkl'}: "
                         f"expected {marker_count}, got {marker_flow.shape[1]}"
+                    )
+                if marker_valid.shape != marker_flow.shape[:-1]:
+                    raise RuntimeError(
+                        f"Invalid marker validity shape in {demo_dir / f'TacThru-{sensor_idx}_synced_kpts.pkl'}: "
+                        f"expected {marker_flow.shape[:-1]}, got {marker_valid.shape}"
                     )
 
         camera_cap = cv2.VideoCapture(str(video_path))
@@ -361,10 +385,11 @@ def main(
                         dataset_base = tactile_streams[sensor_idx]
                         replay_buffer.data[f"{dataset_base}_rgb"][buffer_start + offset] = sensor_frame
 
-                        if write_markers and sensor_kpts[sensor_idx] is not None:
-                            marker_flow = sensor_kpts[sensor_idx]
+                        if write_markers:
+                            marker_flow, marker_valid = sensor_kpts[sensor_idx]
                             if frame_idx < len(marker_flow):
                                 replay_buffer.data[f"{dataset_base}_marker"][buffer_start + offset] = marker_flow[frame_idx]
+                                replay_buffer.data[f"{dataset_base}_marker_valid"][buffer_start + offset] = marker_valid[frame_idx]
         finally:
             camera_cap.release()
             for cap in sensor_caps.values():

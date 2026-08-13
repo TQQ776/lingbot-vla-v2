@@ -30,6 +30,7 @@ from lingbotvla.models.vla.lingbot_vla.modeling_lingbot_vla_v2 import LingbotVla
 from lingbotvla.models.vla.lingbot_vla.qwen3vl_in_vla import apply_lingbot_qwen3_vl_patch
 from lingbotvla.models.vla.lingbot_vla.tactile_vtla import (
     load_vtla_checkpoint_state_dict,
+    migrate_legacy_tactile_config,
 )
 
 from lingbotvla.data.vla_data.utils import FeatureTransform
@@ -354,8 +355,21 @@ class LingbotVLAv2Server:
         f.close()
 
         # update model config according to training config
-        training_model_config = training_config['model']
+        training_model_config = dict(training_config['model'])
         training_model_config.update(training_config['train'])
+        allow_legacy_marker_reinit = (
+            os.environ.get("LINGBOT_V2_ALLOW_LEGACY_MARKER_REINIT", "0") == "1"
+        )
+        tactile_config, tactile_migration = migrate_legacy_tactile_config(
+            training_model_config.get("tactile"),
+            allow_legacy_marker_reinit=allow_legacy_marker_reinit,
+        )
+        if tactile_migration is not None:
+            training_model_config["tactile"] = tactile_config
+            print(
+                "[lingbot-v2-server] legacy tactile config migration enabled: "
+                f"{tactile_migration}"
+            )
         config = LingbotVLAV2Config(**training_model_config)
         for key, value in training_model_config.items():
             if not hasattr(config, key):

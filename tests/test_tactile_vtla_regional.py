@@ -53,6 +53,7 @@ def _mapping(
     *,
     mode: str = "regional",
     num_sensors: int = 2,
+    history_length: int = 8,
     temporal: str = "sincos",
     spatial: str = "sincos",
     sample_hz: float = 30.0,
@@ -67,7 +68,7 @@ def _mapping(
         "num_markers": 48,
         "use_rgb": True,
         "use_markers": True,
-        "marker_history_length": 8,
+        "marker_history_length": history_length,
         "marker_sample_hz": sample_hz,
         "marker_input_features": 2,
         "marker_feature_mode": "displacement_history",
@@ -77,10 +78,18 @@ def _mapping(
         "marker_reference_xy": _reference(num_sensors),
         "marker_tokenization": {
             "mode": mode,
-            "num_regions": 1 if mode == "global" else 4,
-            "region_layout": "1x1" if mode == "global" else "2x2",
+            "num_regions": {
+                "global": 1,
+                "regional": 4,
+                "point_spatiotemporal": 48,
+            }[mode],
+            "region_layout": {
+                "global": "1x1",
+                "regional": "2x2",
+                "point_spatiotemporal": "points",
+            }[mode],
             "aggregation": "mean_max",
-            "include_reference_xy": mode == "regional",
+            "include_reference_xy": mode != "global",
             "point_hidden_dim": 16,
             "region_hidden_dim": 32,
         },
@@ -133,15 +142,62 @@ def _inputs(settings: TactileVTLAConfig, batch: int = 2):
     return history, valid, history_valid, sensors
 
 
-@pytest.mark.parametrize(("mode", "tokens"), [("global", 8), ("regional", 32)])
-def test_global_and_regional_token_shapes(mode: str, tokens: int):
-    settings = TactileVTLAConfig.from_mapping(_mapping(mode=mode))
+@pytest.mark.parametrize(
+    ("mode", "history_length", "tokens"),
+    [
+        ("global", 8, 8),
+        ("regional", 8, 32),
+        ("point_spatiotemporal", 4, 192),
+    ],
+)
+def test_marker_tokenization_shapes(
+    mode: str, history_length: int, tokens: int
+):
+    settings = TactileVTLAConfig.from_mapping(
+        _mapping(mode=mode, history_length=history_length)
+    )
     encoder = TactileTokenEncoder(settings, context_dim=17)
     inputs = _inputs(settings)
     output, mask = encoder.encode_markers(*inputs)
     assert output.shape == (2, 2, tokens, 17)
     assert mask.shape == (2, 2, tokens)
     assert output.flatten(1, 2).shape == (2, 2 * tokens, 17)
+
+
+def test_point_spatiotemporal_tokens_preserve_point_mask_and_order():
+    settings = TactileVTLAConfig.from_mapping(
+        _mapping(
+            mode="point_spatiotemporal",
+            history_length=4,
+            num_sensors=1,
+            gate_mode="none",
+        )
+    )
+    encoder = TactileTokenEncoder(settings, context_dim=16)
+    history, valid, history_valid, sensors = _inputs(settings, batch=1)
+    valid[0, 0, 1, 7] = False
+    output = encoder.encode_markers(
+        history,
+        valid,
+        history_valid,
+        sensors,
+        return_debug_info=True,
+    )
+
+    assert output.tokens.shape == (1, 1, 192, 16)
+    assert output.token_mask.shape == (1, 1, 192)
+    assert not output.token_mask[0, 0, 1 * 48 + 7]
+    assert torch.count_nonzero(output.tokens[0, 0, 1 * 48 + 7]) == 0
+    assert output.token_layout == {
+        "mode": "point_spatiotemporal",
+        "history_length": 4,
+        "num_regions": 48,
+        "order": "sensor-major,time-major,spatial-minor",
+    }
+    restored = TactileTokenEncoder(settings, context_dim=16)
+    report = load_vtla_checkpoint_state_dict(restored, encoder.state_dict())
+    assert not report["marker_modules_reinitialized"]
+    assert report["forbidden_missing_keys"] == []
 
 
 def test_region_mapping_covers_once_and_matches_deployment_numpy():
@@ -333,6 +389,50 @@ def test_unknown_frame_breaks_consecutive_contact_evidence():
     assert gate.step(contact, valid).state == CONTACT_ON
 
 
+def test_global_active_count_gate_requires_two_large_valid_markers():
+    mapping = _mapping(
+        num_sensors=1,
+        gate_mode="global_active_count_hysteresis_soft_region",
+    )
+    mapping["marker_contact_gate"]["min_active_markers"] = 2
+    settings = TactileVTLAConfig.from_mapping(mapping)
+    runtime = runtime_gate_config_from_mapping(
+        settings.marker_contact_gate.to_dict(), num_sensors=1, num_markers=48
+    )
+    region_ids, _ = build_marker_region_mapping_numpy(
+        settings.marker_reference_xy, num_regions=4, region_layout="2x2"
+    )
+    gate = MarkerContactGate(runtime, region_ids[0])
+    valid = np.ones(48, dtype=np.bool_)
+
+    one = np.zeros((48, 2), dtype=np.float32)
+    one[0, 0] = 0.8
+    assert gate.step(one, valid).state == CONTACT_OFF
+    frame = gate.step(one, valid)
+    assert frame.state == CONTACT_OFF
+    assert frame.on_active_marker_count == 1
+
+    two = one.copy()
+    two[1, 1] = 0.8
+    first = gate.step(two, valid)
+    second = gate.step(two, valid)
+    assert first.state == CONTACT_OFF
+    assert second.state == CONTACT_ON
+    assert second.on_active_marker_count == 2
+    assert second.active_counts.sum() == 2
+
+    between_thresholds = np.zeros_like(two)
+    between_thresholds[:2, 0] = 0.3
+    held = gate.step(between_thresholds, valid)
+    assert held.state == CONTACT_ON
+    assert held.on_active_marker_count == 0
+    assert held.off_active_marker_count == 2
+
+    quiet = np.zeros_like(two)
+    assert gate.step(quiet, valid).state == CONTACT_ON
+    assert gate.step(quiet, valid).state == CONTACT_HOLD
+
+
 def test_runtime_gate_validation_rejects_bad_thresholds_and_temperature():
     settings = TactileVTLAConfig.from_mapping(
         _mapping(num_sensors=1, gate_mode="hard")
@@ -459,16 +559,17 @@ def test_every_yaml_ablation_resolves_without_source_changes():
     presets = yaml.safe_load(
         (config_dir / "ablations/presets.yaml").read_text()
     )
-    assert len(presets) == 13
+    assert len(presets) == 14
     for name in presets:
         resolved = resolve_config(base, presets, name)
         settings = TactileVTLAConfig.from_mapping(resolved["train"]["tactile"])
         encoder = TactileTokenEncoder(settings, context_dim=16, vision_output_dim=16)
         assert resolved["train"]["output_dir"].endswith(name)
-        assert settings.marker_tokens_per_sensor in {8, 32}
+        assert settings.marker_tokens_per_sensor in {8, 32, 192}
         if not settings.use_markers:
             assert encoder.marker_encoder is None
             assert encoder.regional_marker_encoder is None
+            assert encoder.point_spatiotemporal_marker_encoder is None
 
 
 def test_huggingface_config_round_trip_embeds_resolved_tactile_values(tmp_path):

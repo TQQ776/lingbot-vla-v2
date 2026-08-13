@@ -11,11 +11,25 @@ receive_latency: 0.115
 with_marker: false
 put_downsample: false
 put_fps: 30
+v4l2_controls:
+  auto_exposure: 1
+  exposure_time_absolute: 280
+  white_balance_automatic: 0
+  white_balance_temperature: 5000
+  backlight_compensation: 1
+  brightness: 12
+  contrast: 32
+  gamma: 400
 tracking:
+  algorithm: high-reliability
   tracking_pts_path: cfg/sensor/ml-ref_kpts.npy
   grid_shape:
   - 6
   - 8
+  template_warmup_frames: 300
+  opencv_threads: 12
+  max_fallback_frames: 2
+  minimum_measured_fraction_for_fallback: 0.75
 optics:
   CameraMatrix:
   - - 450.0

@@ -333,18 +333,20 @@ def _tactile_to_payload(obs: Observation, *, jpeg_quality: int) -> dict[str, Any
         missing = sorted(set(marker_names) - marker_supplied)
         raise ValueError(f"Marker tactile input is incomplete; missing {missing}")
     if marker_supplied:
-        marker_shape = (
-            TACTILE_SENSOR_COUNT,
-            TACTILE_MARKER_HISTORY_LENGTH,
-            TACTILE_MARKER_COUNT,
-            2,
-        )
         history = np.asarray(obs.marker_displacement_history, dtype=np.float32)
-        if history.shape != marker_shape or not np.all(np.isfinite(history)):
+        if (
+            history.ndim != 4
+            or history.shape[0] != TACTILE_SENSOR_COUNT
+            or history.shape[1] <= 0
+            or history.shape[2:] != (TACTILE_MARKER_COUNT, 2)
+            or not np.all(np.isfinite(history))
+        ):
             raise ValueError(
                 "marker_displacement_history must be finite float data with shape "
-                f"{marker_shape}, got {history.shape}"
+                f"[{TACTILE_SENSOR_COUNT},H,{TACTILE_MARKER_COUNT},2] with H>0, "
+                f"got {history.shape}"
             )
+        marker_shape = history.shape
         payload["marker_displacement_history"] = history.astype(float).tolist()
         valid = np.asarray(obs.marker_valid_mask)
         expected_valid_shape = marker_shape[:-1]
@@ -357,7 +359,7 @@ def _tactile_to_payload(obs: Observation, *, jpeg_quality: int) -> dict[str, Any
         history_valid = np.asarray(obs.marker_history_valid_mask)
         expected_history_valid_shape = (
             TACTILE_SENSOR_COUNT,
-            TACTILE_MARKER_HISTORY_LENGTH,
+            marker_shape[1],
         )
         if (
             history_valid.dtype != np.bool_
@@ -435,18 +437,20 @@ def _tactile_from_payload(value: Any) -> dict[str, np.ndarray | None]:
         missing = sorted(set(marker_fields) - marker_supplied)
         raise ValueError(f"Marker tactile input is incomplete; missing {missing}")
     if marker_supplied:
-        marker_shape = (
-            TACTILE_SENSOR_COUNT,
-            TACTILE_MARKER_HISTORY_LENGTH,
-            TACTILE_MARKER_COUNT,
-            2,
-        )
         history = np.asarray(value["marker_displacement_history"], dtype=np.float32)
-        if history.shape != marker_shape or not np.all(np.isfinite(history)):
+        if (
+            history.ndim != 4
+            or history.shape[0] != TACTILE_SENSOR_COUNT
+            or history.shape[1] <= 0
+            or history.shape[2:] != (TACTILE_MARKER_COUNT, 2)
+            or not np.all(np.isfinite(history))
+        ):
             raise ValueError(
                 "tactile.marker_displacement_history must be finite with shape "
-                f"{marker_shape}, got {history.shape}"
+                f"[{TACTILE_SENSOR_COUNT},H,{TACTILE_MARKER_COUNT},2] with H>0, "
+                f"got {history.shape}"
             )
+        marker_shape = history.shape
         result["marker_displacement_history"] = np.ascontiguousarray(history)
         valid = np.asarray(value["marker_valid_mask"])
         expected_valid_shape = marker_shape[:-1]
@@ -459,7 +463,7 @@ def _tactile_from_payload(value: Any) -> dict[str, np.ndarray | None]:
         history_valid = np.asarray(value["marker_history_valid_mask"])
         expected_history_valid_shape = (
             TACTILE_SENSOR_COUNT,
-            TACTILE_MARKER_HISTORY_LENGTH,
+            marker_shape[1],
         )
         if (
             history_valid.dtype != np.bool_

@@ -7,7 +7,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from deploy.tacthru_umi_v2.http_server import LingBotV2Backend, create_http_server
+from deploy.tacthru_umi_v2.http_server import (
+    LingBotV2Backend,
+    _resolve_training_project_path,
+    create_http_server,
+)
 from deploy.tacthru_umi_v2.protocol import Observation
 from deploy.tacthru_umi_v2.realman_client import LingBotV2HttpClient, validate_server_health
 
@@ -56,6 +60,18 @@ def make_backend(policy: FakePolicy) -> LingBotV2Backend:
     )
 
 
+def test_training_artifact_path_rebases_only_matching_project_root(tmp_path) -> None:
+    project_root = tmp_path / "lingbot-vla-v2"
+    expected = project_root / "assets/norm_stats/example.json"
+    saved = Path(
+        "/root/kube-user/ns/example/lingbot-vla-v2/assets/norm_stats/example.json"
+    )
+    assert _resolve_training_project_path(project_root, saved) == expected.resolve()
+
+    external = Path("/opt/checkpoints/example.json")
+    assert _resolve_training_project_path(project_root, external) == external
+
+
 def make_observation(index: int = 0) -> Observation:
     image = np.zeros((224, 224, 3), dtype=np.uint8)
     image[..., 1] = 50 + index
@@ -69,14 +85,25 @@ def make_observation(index: int = 0) -> Observation:
     )
 
 
-def tactile_contract(*, gated: bool = False) -> dict:
+def test_compile_warmup_uses_the_real_task_instruction() -> None:
+    policy = FakePolicy()
+    backend = make_backend(policy)
+
+    result = backend.warmup(instruction="Insert the Ethernet cable.")
+
+    assert result["instruction"] == "Insert the Ethernet cable."
+    assert result["action_shape"] == [50, 8]
+    assert policy.inputs[-1]["task"] == "Insert the Ethernet cable."
+
+
+def tactile_contract(*, gated: bool = False, history_length: int = 8) -> dict:
     contract = {
         "enabled": True,
         "num_sensors": 1,
         "num_markers": 48,
         "use_rgb": True,
         "use_markers": True,
-        "marker_history_length": 8,
+        "marker_history_length": history_length,
         "marker_sample_hz": 30.0,
         "marker_feature_mode": "displacement_history",
         "rgb_keys": ["observation.images.tactile_left"],
@@ -100,16 +127,16 @@ def tactile_contract(*, gated: bool = False) -> dict:
     return contract
 
 
-def make_tactile_observation() -> Observation:
-    marker = np.full((1, 8, 48, 2), 0.2, dtype=np.float32)
+def make_tactile_observation(history_length: int = 8) -> Observation:
+    marker = np.full((1, history_length, 48, 2), 0.2, dtype=np.float32)
     return Observation(
         instruction="Insert the Ethernet cable",
         state=np.asarray([0, 0, 0, 0, 0, 0, 1, 0.04], dtype=np.float32),
         wrist_rgb=np.zeros((224, 224, 3), dtype=np.uint8),
         tactile_rgb=np.full((1, 480, 640, 3), 30, dtype=np.uint8),
         marker_displacement_history=marker,
-        marker_valid_mask=np.ones((1, 8, 48), dtype=np.bool_),
-        marker_history_valid_mask=np.ones((1, 8), dtype=np.bool_),
+        marker_valid_mask=np.ones((1, history_length, 48), dtype=np.bool_),
+        marker_history_valid_mask=np.ones((1, history_length), dtype=np.bool_),
         tactile_sensor_mask=np.ones((1,), dtype=np.bool_),
         request_id="request-tactile",
         session_id="session-tactile",
@@ -142,6 +169,40 @@ def test_http_roundtrip_maps_exact_v3_observation_and_response_contract() -> Non
         assert policy.inputs[0]["observation.state"][7] == pytest.approx(0.04)
         assert policy.inputs[0]["observation.images.camera_wrist_left"].shape == (224, 224, 3)
         assert policy.inputs[0]["task"] == "Pull the tissue"
+    finally:
+        client.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+
+
+def test_reset_connection_discards_idle_health_socket_before_prediction() -> None:
+    policy = FakePolicy()
+    server = create_http_server(
+        make_backend(policy),
+        host="127.0.0.1",
+        port=0,
+        http_keep_alive=True,
+        keep_alive_idle_timeout_s=0.05,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        client = LingBotV2HttpClient(
+            f"http://{host}:{port}",
+            timeout_s=5.0,
+            jpeg_quality=100,
+            keep_alive=True,
+        )
+        validate_server_health(client.health())
+        time.sleep(0.1)
+
+        client.reset_connection()
+        response = client.predict(make_observation(), expected_steps=50)
+
+        assert response.action_chunk.shape == (50, 8)
+        assert policy.inputs[-1]["task"] == "Pull the tissue"
     finally:
         client.close()
         server.shutdown()
@@ -193,6 +254,22 @@ def test_http_roundtrip_forwards_vtla_inputs_instead_of_dropping_them() -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2.0)
+
+
+def test_backend_accepts_four_frame_history_and_rejects_wrong_length() -> None:
+    backend = make_backend(
+        FakePolicy(tactile=tactile_contract(history_length=4))
+    )
+
+    backend.predict(make_tactile_observation(history_length=4))
+    assert backend.policy.inputs[-1]["marker_displacement_history"].shape == (
+        1,
+        4,
+        48,
+        2,
+    )
+    with pytest.raises(ValueError, match="does not match checkpoint"):
+        backend.predict(make_tactile_observation(history_length=8))
 
 
 def test_vtla_backend_rejects_request_that_omits_checkpoint_modalities() -> None:

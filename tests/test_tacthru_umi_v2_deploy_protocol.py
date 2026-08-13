@@ -24,10 +24,10 @@ def identity_actions(steps: int = 50, gripper_width_m: float = 0.03) -> np.ndarr
     return action
 
 
-def tactile_observation() -> Observation:
+def tactile_observation(history_length: int = 8) -> Observation:
     marker = np.linspace(
-        -0.2, 0.2, 8 * 48 * 2, dtype=np.float32
-    ).reshape(1, 8, 48, 2)
+        -0.2, 0.2, history_length * 48 * 2, dtype=np.float32
+    ).reshape(1, history_length, 48, 2)
     tactile_rgb = np.zeros((1, 480, 640, 3), dtype=np.uint8)
     tactile_rgb[..., 1] = 180
     return Observation(
@@ -36,8 +36,8 @@ def tactile_observation() -> Observation:
         wrist_rgb=np.zeros((224, 224, 3), dtype=np.uint8),
         tactile_rgb=tactile_rgb,
         marker_displacement_history=marker,
-        marker_valid_mask=np.ones((1, 8, 48), dtype=np.bool_),
-        marker_history_valid_mask=np.ones((1, 8), dtype=np.bool_),
+        marker_valid_mask=np.ones((1, history_length, 48), dtype=np.bool_),
+        marker_history_valid_mask=np.ones((1, history_length), dtype=np.bool_),
         marker_contact_state=np.asarray([2], dtype=np.int8),
         tactile_sensor_mask=np.ones((1,), dtype=np.bool_),
     )
@@ -137,6 +137,22 @@ def test_v3_tactile_roundtrip_preserves_rgb_and_marker_history_contract() -> Non
     assert decoded.tactile_sensor_mask.tolist() == [True]
 
 
+def test_v3_tactile_roundtrip_supports_four_frame_marker_history() -> None:
+    observation = tactile_observation(history_length=4)
+
+    decoded = observation_from_payload(
+        observation_to_payload(observation, jpeg_quality=100)
+    )
+
+    assert decoded.marker_displacement_history.shape == (1, 4, 48, 2)
+    assert decoded.marker_valid_mask.shape == (1, 4, 48)
+    assert decoded.marker_history_valid_mask.shape == (1, 4)
+    assert np.allclose(
+        decoded.marker_displacement_history,
+        observation.marker_displacement_history,
+    )
+
+
 def test_tactile_protocol_rejects_invalid_contact_state() -> None:
     observation = tactile_observation()
     values = dict(observation.__dict__)
@@ -163,7 +179,7 @@ def test_tactile_marker_payload_rejects_partial_contract() -> None:
     [
         (
             "marker_displacement_history",
-            np.zeros((1, 7, 48, 2), dtype=np.float32),
+            np.zeros((1, 0, 48, 2), dtype=np.float32),
             "shape",
         ),
         (

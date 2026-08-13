@@ -67,6 +67,8 @@ class MarkerGateFrame:
     regional_soft_gates: np.ndarray
     region_valid_mask: np.ndarray
     active_counts: np.ndarray
+    on_active_marker_count: int
+    off_active_marker_count: int
     valid_marker_count: int
     tracking_unknown: bool
 
@@ -78,6 +80,8 @@ class MarkerGateEpisodeOutput:
     regional_soft_gates: np.ndarray
     region_valid_mask: np.ndarray
     active_counts: np.ndarray
+    on_active_marker_count: np.ndarray
+    off_active_marker_count: np.ndarray
     tracking_unknown: np.ndarray
 
 
@@ -129,6 +133,7 @@ def runtime_gate_config_from_mapping(
         "hard_hysteresis",
         "hard_hysteresis_hold",
         "hard_hysteresis_soft_region",
+        "global_active_count_hysteresis_soft_region",
     }
     if config.mode not in supported_modes:
         raise ValueError(f"Unsupported marker contact gate mode: {config.mode}")
@@ -238,7 +243,15 @@ class MarkerContactGate:
                 )
             )
         )
-        return scores, soft.astype(np.float32), region_valid, active, np.asarray(valid.sum())
+        return (
+            scores,
+            soft.astype(np.float32),
+            region_valid,
+            active,
+            np.asarray(valid.sum()),
+            amplitude,
+            valid,
+        )
 
     def _has_contact(
         self,
@@ -263,6 +276,7 @@ class MarkerContactGate:
                 if self.config.release_hold_frames > 0 and self.config.mode in {
                     "hard_hysteresis_hold",
                     "hard_hysteresis_soft_region",
+                    "global_active_count_hysteresis_soft_region",
                 }:
                     self._state = CONTACT_HOLD
                     self._hold_remaining = self.config.release_hold_frames
@@ -292,6 +306,7 @@ class MarkerContactGate:
             if self.config.release_hold_frames > 0 and self.config.mode in {
                 "hard_hysteresis_hold",
                 "hard_hysteresis_soft_region",
+                "global_active_count_hysteresis_soft_region",
             }:
                 self._state = CONTACT_HOLD
                 self._hold_remaining = self.config.release_hold_frames
@@ -305,9 +320,24 @@ class MarkerContactGate:
                 self._hold_remaining = 0
 
     def step(self, displacement: Any, valid_mask: Any) -> MarkerGateFrame:
-        scores, soft, region_valid, active, valid_count = self._measure(
+        scores, soft, region_valid, active, valid_count, amplitude, valid = self._measure(
             displacement, valid_mask
         )
+        on_active_mask = valid & (amplitude > self.on_threshold)
+        off_active_mask = valid & (amplitude > self.off_threshold)
+        on_active_count = int(on_active_mask.sum())
+        off_active_count = int(off_active_mask.sum())
+        global_count_mode = (
+            self.config.mode == "global_active_count_hysteresis_soft_region"
+        )
+        if global_count_mode:
+            active = np.asarray(
+                [
+                    np.count_nonzero(on_active_mask & (self.region_ids == region_index))
+                    for region_index in range(self.num_regions)
+                ],
+                dtype=np.int64,
+            )
         unknown = int(valid_count) < self.config.min_valid_markers_global
         if self.config.mode == "none":
             self._state = CONTACT_ON
@@ -327,8 +357,16 @@ class MarkerContactGate:
                 self._expire_unknown_hold()
         else:
             self._unknown_count = 0
-            on_evidence = self._has_contact(scores, active, region_valid, self.on_threshold)
-            off_contact = self._has_contact(scores, active, region_valid, self.off_threshold)
+            if global_count_mode:
+                on_evidence = on_active_count >= self.config.min_active_markers
+                off_contact = off_active_count >= self.config.min_active_markers
+            else:
+                on_evidence = self._has_contact(
+                    scores, active, region_valid, self.on_threshold
+                )
+                off_contact = self._has_contact(
+                    scores, active, region_valid, self.off_threshold
+                )
             if self.config.mode == "hard":
                 self._state = CONTACT_ON if on_evidence else CONTACT_OFF
             elif on_evidence:
@@ -351,6 +389,8 @@ class MarkerContactGate:
             regional_soft_gates=soft,
             region_valid_mask=region_valid,
             active_counts=active,
+            on_active_marker_count=on_active_count,
+            off_active_marker_count=off_active_count,
             valid_marker_count=int(valid_count),
             tracking_unknown=unknown,
         )
@@ -370,6 +410,12 @@ class MarkerContactGate:
             regional_soft_gates=np.stack([frame.regional_soft_gates for frame in frames]),
             region_valid_mask=np.stack([frame.region_valid_mask for frame in frames]),
             active_counts=np.stack([frame.active_counts for frame in frames]),
+            on_active_marker_count=np.asarray(
+                [frame.on_active_marker_count for frame in frames], dtype=np.int64
+            ),
+            off_active_marker_count=np.asarray(
+                [frame.off_active_marker_count for frame in frames], dtype=np.int64
+            ),
             tracking_unknown=np.asarray(
                 [frame.tracking_unknown for frame in frames], dtype=np.bool_
             ),

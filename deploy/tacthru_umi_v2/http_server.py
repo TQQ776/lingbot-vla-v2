@@ -18,7 +18,10 @@ import numpy as np
 import yaml
 
 from lingbotvla.tactile_contact import CONTACT_OFF
-from lingbotvla.models.vla.lingbot_vla.tactile_vtla import TactileVTLAConfig
+from lingbotvla.models.vla.lingbot_vla.tactile_vtla import (
+    TactileVTLAConfig,
+    migrate_legacy_tactile_config,
+)
 
 from .protocol import (
     CAMERA_KEY,
@@ -35,6 +38,7 @@ from .protocol import (
     TACTILE_MARKER_SAMPLE_HZ,
     TACTILE_RGB_KEY,
     TACTILE_SENSOR_COUNT,
+    ActionResponse,
     Observation,
     action_response_to_payload,
     action_spec,
@@ -184,6 +188,20 @@ class LingBotV2Backend:
         }
 
     def predict(self, observation: Observation) -> dict[str, Any]:
+        """Run inference and return the existing HTTP protocol payload."""
+
+        response = self.predict_response(observation)
+        return action_response_to_payload(
+            action_chunk=response.action_chunk,
+            request_id=response.request_id,
+            session_id=response.session_id,
+            expected_steps=self.chunk_size,
+            metadata=response.metadata,
+        )
+
+    def predict_response(self, observation: Observation) -> ActionResponse:
+        """Run inference without JSON/JPEG serialization for in-process callers."""
+
         if not np.isclose(observation.control_frequency_hz, CONTROL_FREQUENCY_HZ, atol=1e-6):
             raise ValueError(
                 f"This checkpoint was trained at {CONTROL_FREQUENCY_HZ:g}Hz; "
@@ -237,11 +255,10 @@ class LingBotV2Backend:
                 "backend_total_s": time.perf_counter() - backend_started,
             }
             self._request_count += 1
-            return action_response_to_payload(
+            return ActionResponse(
                 action_chunk=action,
                 request_id=observation.request_id,
                 session_id=observation.session_id,
-                expected_steps=self.chunk_size,
                 metadata={
                     "backend": "lingbot-vla-v2-tacthru-umi-http",
                     "checkpoint": str(self.checkpoint),
@@ -255,14 +272,18 @@ class LingBotV2Backend:
                     "output_action": "episode-start-frame absolute xyz+quaternion_xyzw+gripper_width_m",
                     "contract_sha256": self.contract.get("combined_sha256"),
                 },
+                server_timestamp=time.time(),
             )
         finally:
             self._lock.release()
 
-    def warmup(self) -> dict[str, Any]:
+    def warmup(self, *, instruction: str = "Pull the tissue") -> dict[str, Any]:
+        instruction = str(instruction).strip()
+        if not instruction:
+            raise ValueError("Warmup instruction must not be empty")
         tactile = _synthetic_tactile_observation(self.tactile_contract)
         observation = Observation(
-            instruction="Pull the tissue",
+            instruction=instruction,
             state=np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.045], dtype=np.float32),
             wrist_rgb=np.zeros((224, 224, 3), dtype=np.uint8),
             **tactile,
@@ -272,6 +293,7 @@ class LingBotV2Backend:
         response = self.predict(observation)
         return {
             "warmup_s": time.time() - started,
+            "instruction": instruction,
             "action_shape": list(np.asarray(response["action_chunk"]).shape),
         }
 
@@ -631,6 +653,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=["bf16", "fp32"], default="bf16")
     parser.add_argument("--use-compile", action="store_true")
     parser.add_argument("--warmup", action="store_true")
+    parser.add_argument(
+        "--warmup-instruction",
+        default="Pull the tissue",
+        help="Task instruction used by --warmup; match the real client instruction when using torch.compile.",
+    )
     parser.add_argument("--api-key", default=os.environ.get("LINGBOT_V2_API_KEY"))
     parser.add_argument("--max-body-mb", type=_positive_float, default=8.0)
     parser.add_argument("--inference-lock-timeout", type=_positive_float, default=5.0)
@@ -672,7 +699,14 @@ def main() -> None:
     )
     print(json.dumps(backend.health(), indent=2, ensure_ascii=False), flush=True)
     if args.warmup:
-        print(json.dumps(backend.warmup(), indent=2, ensure_ascii=False), flush=True)
+        print(
+            json.dumps(
+                backend.warmup(instruction=args.warmup_instruction),
+                indent=2,
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
     server = create_http_server(
         backend,
         host=args.host,
@@ -696,6 +730,20 @@ def main() -> None:
 def _resolve_project_path(project_root: Path, path: Path) -> Path:
     value = path.expanduser()
     return value.resolve() if value.is_absolute() else (project_root / value).resolve()
+
+
+def _resolve_training_project_path(project_root: Path, path: Path) -> Path:
+    """Rebase an artifact path saved under a previous copy of this project."""
+
+    value = path.expanduser()
+    if value.is_absolute():
+        matching_indices = [
+            index for index, part in enumerate(value.parts) if part == project_root.name
+        ]
+        if matching_indices:
+            relative_parts = value.parts[matching_indices[-1] + 1 :]
+            return project_root.joinpath(*relative_parts).resolve()
+    return _resolve_project_path(project_root, value)
 
 
 def _validate_runtime_paths(
@@ -737,7 +785,13 @@ def _validate_deployment_contract(
 
     data = training.get("data") or {}
     train = training.get("train") or {}
-    tactile = _tactile_contract_from_mapping(train.get("tactile"))
+    tactile_mapping, tactile_migration = migrate_legacy_tactile_config(
+        train.get("tactile"),
+        allow_legacy_marker_reinit=(
+            os.environ.get("LINGBOT_V2_ALLOW_LEGACY_MARKER_REINIT", "0") == "1"
+        ),
+    )
+    tactile = _tactile_contract_from_mapping(tactile_mapping)
     _require_equal(data.get("data_name"), ROBOT_CONFIG, "training data.data_name")
     _require_equal(data.get("cameras"), ["camera_wrist_left"], "training data.cameras")
     for key, expected in (
@@ -748,7 +802,9 @@ def _validate_deployment_contract(
     ):
         _require_equal(train.get(key), expected, f"training train.{key}")
 
-    expected_norm_from_training = _resolve_project_path(project_root, Path(str(data.get("norm_stats_file"))))
+    expected_norm_from_training = _resolve_training_project_path(
+        project_root, Path(str(data.get("norm_stats_file")))
+    )
     expected_norm_from_robot = _resolve_project_path(project_root, Path(str(robot.get("norm_stats"))))
     if expected_norm_from_training != norm_stats:
         raise RuntimeError(
@@ -813,6 +869,7 @@ def _validate_deployment_contract(
         "robot_default_norm_stats": str(expected_norm_from_robot),
         "robot_default_norm_overridden": robot_default_norm_overridden,
         "tactile": tactile,
+        "legacy_tactile_config_migration": tactile_migration,
     }
 
 
@@ -853,11 +910,8 @@ def _tactile_contract_from_mapping(value: Any) -> dict[str, Any]:
     if contract["use_rgb"]:
         _require_equal(tactile.get("rgb_keys"), [TACTILE_RGB_KEY], "tactile rgb_keys")
     if contract["use_markers"]:
-        _require_equal(
-            contract["marker_history_length"],
-            TACTILE_MARKER_HISTORY_LENGTH,
-            "tactile marker_history_length",
-        )
+        if contract["marker_history_length"] <= 0:
+            raise RuntimeError("tactile marker_history_length must be positive")
         _require_equal(
             contract["marker_sample_hz"],
             TACTILE_MARKER_SAMPLE_HZ,
@@ -935,6 +989,19 @@ def _model_tactile_observation(
     result: dict[str, np.ndarray] = {
         name: np.asarray(value) for name, value in values.items() if value is not None
     }
+    if contract["use_markers"]:
+        marker_shape = (
+            contract["num_sensors"],
+            contract["marker_history_length"],
+            contract["num_markers"],
+            2,
+        )
+        if result["marker_displacement_history"].shape != marker_shape:
+            raise ValueError(
+                "Tactile marker history does not match checkpoint: "
+                f"expected={marker_shape}, "
+                f"got={result['marker_displacement_history'].shape}"
+            )
     return result
 
 
@@ -953,7 +1020,7 @@ def _synthetic_tactile_observation(
     if contract["use_markers"]:
         marker_shape = (
             TACTILE_SENSOR_COUNT,
-            TACTILE_MARKER_HISTORY_LENGTH,
+            int(contract["marker_history_length"]),
             TACTILE_MARKER_COUNT,
             2,
         )

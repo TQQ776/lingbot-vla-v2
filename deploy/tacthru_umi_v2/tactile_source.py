@@ -32,6 +32,8 @@ class TactileFrame:
     marker_valid_mask: np.ndarray | None
     marker_history_valid_mask: np.ndarray | None
     marker_contact_state: np.ndarray | None
+    marker_reference_pixels: np.ndarray | None
+    marker_current_pixels: np.ndarray | None
     tactile_sensor_mask: np.ndarray
     capture_timestamp: float
     receive_timestamp: float
@@ -56,6 +58,15 @@ def _normalized_marker_frames(
     scale_xy = np.asarray([image_width, image_height], dtype=np.float32)
     valid = np.isfinite(marker).all(axis=-1)
     valid &= np.isfinite(reference).all(axis=-1)
+    tracker_valid = sensor_data.get("marker_valid")
+    if tracker_valid is not None:
+        tracker_valid = np.asarray(tracker_valid, dtype=np.bool_)
+        if tracker_valid.shape != expected_shape[:-1]:
+            raise ValueError(
+                "TacThru marker_valid must have shape "
+                f"{expected_shape[:-1]}, got {tracker_valid.shape}"
+            )
+        valid &= tracker_valid
     displacement = (marker - reference) / scale_xy * 2.0
     displacement = np.where(
         valid[..., None], displacement, 0.0
@@ -104,9 +115,13 @@ def build_tactile_frame(
     marker_displacement_history = None
     marker_valid_mask = None
     marker_history_valid_mask = None
+    marker_reference_pixels = None
+    marker_current_pixels = None
     valid_count = None
     if use_markers:
         flow, valid = _normalized_marker_frames(sensor_data)
+        marker_pixels = np.asarray(sensor_data.get("marker"), dtype=np.float32)
+        reference_pixels = np.asarray(sensor_data.get("marker_ref"), dtype=np.float32)
         if episode_reset:
             flow = flow[-1:]
             valid = valid[-1:]
@@ -128,6 +143,8 @@ def build_tactile_frame(
         marker_history_valid_mask = np.ones(
             (TACTILE_SENSOR_COUNT, marker_history_length), dtype=np.bool_
         )
+        marker_reference_pixels = np.ascontiguousarray(reference_pixels[-1:])
+        marker_current_pixels = np.ascontiguousarray(marker_pixels[-1:])
         valid_count = int(valid[-1].sum())
 
     detected = sensor_data.get("n_all_kpts")
@@ -143,6 +160,8 @@ def build_tactile_frame(
         marker_valid_mask=marker_valid_mask,
         marker_history_valid_mask=marker_history_valid_mask,
         marker_contact_state=None,
+        marker_reference_pixels=marker_reference_pixels,
+        marker_current_pixels=marker_current_pixels,
         tactile_sensor_mask=np.ones((TACTILE_SENSOR_COUNT,), dtype=np.bool_),
         capture_timestamp=float(timestamps[-1]),
         receive_timestamp=time.time(),
@@ -174,13 +193,20 @@ class TacThruSource:
         self.sensor_cfg_path = sensor_cfg_path.expanduser().resolve()
         self.use_rgb = bool(use_rgb)
         self.use_markers = bool(use_markers)
+        self.marker_history_length = int(
+            (tactile_config or {}).get(
+                "marker_history_length", TACTILE_MARKER_HISTORY_LENGTH
+            )
+        )
+        if self.marker_history_length <= 0:
+            raise ValueError("marker_history_length must be positive")
         self._manager: SharedMemoryManager | None = None
         self._sensor = None
         self._marker_history: deque[np.ndarray] = deque(
-            maxlen=TACTILE_MARKER_HISTORY_LENGTH
+            maxlen=self.marker_history_length
         )
         self._marker_valid_history: deque[np.ndarray] = deque(
-            maxlen=TACTILE_MARKER_HISTORY_LENGTH
+            maxlen=self.marker_history_length
         )
         self._last_marker_timestamp: float | None = None
         self._contact_gates: list[MarkerContactGate] = []
@@ -284,6 +310,7 @@ class TacThruSource:
             use_rgb=self.use_rgb,
             use_markers=self.use_markers,
             episode_reset=episode_reset,
+            marker_history_length=self.marker_history_length,
         )
         if not self.use_markers:
             return frame
@@ -310,7 +337,7 @@ class TacThruSource:
             selected_history, selected_valid, selected_timestamps
         ):
             if not self._marker_history:
-                for _ in range(TACTILE_MARKER_HISTORY_LENGTH):
+                for _ in range(self.marker_history_length):
                     self._marker_history.append(displacement.copy())
                     self._marker_valid_history.append(valid.copy())
             else:
@@ -334,7 +361,7 @@ class TacThruSource:
             ),
             marker_valid_mask=np.ascontiguousarray(valid_mask[None], dtype=np.bool_),
             marker_history_valid_mask=np.ones(
-                (TACTILE_SENSOR_COUNT, TACTILE_MARKER_HISTORY_LENGTH),
+                (TACTILE_SENSOR_COUNT, self.marker_history_length),
                 dtype=np.bool_,
             ),
             marker_contact_state=(

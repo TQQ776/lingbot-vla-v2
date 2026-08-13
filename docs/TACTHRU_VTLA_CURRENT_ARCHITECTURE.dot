@@ -1,0 +1,185 @@
+digraph CurrentVTLAArchitecture {
+  graph [
+    rankdir=TB,
+    bgcolor="#F7F9FC",
+    pad=0.28,
+    nodesep=0.32,
+    ranksep=0.48,
+    splines=ortho,
+    compound=true,
+    newrank=true,
+    fontname="Noto Sans CJK SC",
+    fontsize=25,
+    labelloc=t,
+    label="当前 LingBot-VLA 2.0 + TacThru VTLA 架构"
+  ];
+
+  node [
+    shape=rect,
+    style="rounded,filled",
+    fontname="Noto Sans CJK SC",
+    fontsize=11,
+    penwidth=1.4,
+    margin="0.13,0.09",
+    color="#64748B",
+    fillcolor="#FFFFFF",
+    fontcolor="#172033"
+  ];
+  edge [
+    fontname="Noto Sans CJK SC",
+    fontsize=9,
+    color="#64748B",
+    fontcolor="#475569",
+    penwidth=1.4,
+    arrowsize=0.72
+  ];
+
+  subgraph cluster_inputs {
+    label="1  在线输入与训练数据";
+    color="#CBD5E1";
+    fillcolor="#FFFFFF";
+    style="rounded,filled";
+    penwidth=1.4;
+
+    language [label="语言指令\n例如：插入网线", fillcolor="#FFE8D6", color="#E07A5F"];
+    wrist_rgb [label="腕部场景 RGB\ncamera_wrist_left\n当前帧", fillcolor="#E6F0FF", color="#4C78A8"];
+    tactile_rgb [label="TacThru 触觉 RGB\n左侧单传感器\n当前帧", fillcolor="#DFF7F2", color="#2A9D8F"];
+    marker_history [label="Marker 位移历史\n[S=1,H=8,N=48,F=2]\n(dx,dy) @ 30 Hz + valid mask", fillcolor="#E8F6E8", color="#4C9F70"];
+    robot_state [label="机器人状态\nEEF pose 7D + gripper 1D\n8D → pad 到 55D", fillcolor="#FFF2CC", color="#D9A321"];
+    flow_noise [label="Flow 初始噪声 x₁\n[50 steps,55D]\n+ 时间 t", fillcolor="#FFF2CC", color="#D9A321"];
+    {rank=same; language; wrist_rgb; tactile_rgb; marker_history; robot_state; flow_noise;}
+  }
+
+  subgraph cluster_tokenizers {
+    label="2  Token 构造";
+    color="#CBD5E1";
+    fillcolor="#FFFFFF";
+    style="rounded,filled";
+    penwidth=1.4;
+
+    language_embed [label="Qwen3-VL\n语言 Embedding", fillcolor="#FFE8D6", color="#E07A5F"];
+    shared_vit [label="共享且冻结的\nQwen3-VL ViT", fillcolor="#DDEBFF", color="#4C78A8", penwidth=2.0];
+    scene_tokens [label="场景视觉 tokens\n+ mRoPE / DeepStack", fillcolor="#E6F0FF", color="#4C78A8"];
+    tactile_rgb_tokens [label="触觉 RGB tokens\n+ modality / sensor embedding\n不经过接触 gate", fillcolor="#DFF7F2", color="#2A9D8F"];
+
+    marker_encoder [
+      label="Regional Marker Encoder\n① 按 mean/std 归一化 (dx,dy)\n② 拼接标定 reference (x,y)\n③ Point MLP → 128D\n④ 2×2 区域 mean+max pooling\n⑤ 每帧 4 tokens × 8 帧 = 32 tokens\n⑥ temporal/spatial sincos + modality/sensor embedding",
+      fillcolor="#E8F6E8",
+      color="#4C9F70",
+      penwidth=2.0
+    ];
+    global_gate [
+      label="全局 Contact Gate\n最新帧逐点阈值 + active count ≥ 2\n连续 2 帧开启 / 3 帧关闭 + hold\n训练：逐 episode 预计算\n推理：TacThruSource 在线维护状态",
+      fillcolor="#FFF0E5",
+      color="#F28E2B",
+      penwidth=2.0
+    ];
+    marker_tokens [label="32 个 Marker tokens\n全局 gate 对全部 token 做 mask\n当前 global 模式不乘区域 soft gate", fillcolor="#E8F6E8", color="#4C9F70"];
+
+    query_tokens [
+      label="学习的 Current / Future Query tokens\n未来图像不是推理输入\nFuture queries 对动作分支受 attention block",
+      fillcolor="#F1EAFE",
+      color="#8F63C7"
+    ];
+    suffix_embed [
+      label="Action suffix embedding\nstate_proj + action_in_proj\nflow-time MLP + AdaNorm",
+      fillcolor="#FFF2CC",
+      color="#D9A321"
+    ];
+
+    {rank=same; language_embed; shared_vit; marker_encoder; global_gate; suffix_embed;}
+    {rank=same; scene_tokens; tactile_rgb_tokens; marker_tokens; query_tokens;}
+  }
+
+  subgraph cluster_prefix {
+    label="3  VTLA Prefix 与双流融合";
+    color="#B8C4D6";
+    fillcolor="#F8FAFF";
+    style="rounded,filled";
+    penwidth=1.7;
+
+    prefix_concat [
+      label="Qwen3-VL Prefix tokens（真实拼接顺序）\n[ Scene | Language | Tactile RGB | Marker | Current Query | Future Query ]",
+      fillcolor="#E9EEF7",
+      color="#5B6F91",
+      penwidth=2.0
+    ];
+
+    coupled_layer [
+      label="36 × Coupled Transformer Layer\n\nPrefix / Understanding stream\nQwen3-VL hidden 2560，Dense FFN，冻结\n            │\n两条流的 Q/K/V 在每层联合注意力中拼接\n动作 tokens 可读取 prefix context\n            │\nSuffix / Action stream\nhidden 768，AdaNorm(time)，可训练 MoE FFN\n\n推理：Prefix 只算一次并缓存每层 K/V\n10 次 Flow 步只重复计算 Action suffix",
+      fillcolor="#E8EDF5",
+      color="#43536D",
+      penwidth=2.4,
+      fontsize=12
+    ];
+
+    moe_detail [
+      label="每个 Action MoE Layer\nSigmoid Router\n32 routed experts，Top-4\n+ 1 shared expert\nFused expert implementation",
+      fillcolor="#FDE8E8",
+      color="#C95D63",
+      penwidth=1.8
+    ];
+    prefix_cache [
+      label="Prefix K/V Cache\n场景 + 语言 + 触觉上下文",
+      fillcolor="#E6F0FF",
+      color="#4C78A8"
+    ];
+
+    {rank=same; coupled_layer; moe_detail; prefix_cache;}
+  }
+
+  subgraph cluster_flow {
+    label="4  Flow Matching 动作生成与真机执行";
+    color="#CBD5E1";
+    fillcolor="#FFFFFF";
+    style="rounded,filled";
+    penwidth=1.4;
+
+    velocity [label="速度场预测\nvθ(xₜ,t | prefix,state)\n[50,55]", fillcolor="#FFF2CC", color="#D9A321"];
+    euler [label="Euler 积分 × 10\nxₜ₊dt = xₜ + dt·vθ\ndt = -1/10\n每步将新 xₜ 回送 Action suffix", fillcolor="#FFF2CC", color="#D9A321", penwidth=2.0];
+    action_chunk [label="归一化动作 chunk\n50 steps × 55D", fillcolor="#FFF2CC", color="#D9A321"];
+    physical_action [label="Unpad + Unnormalize\n物理动作 8D\nEEF pose 7D + gripper 1D", fillcolor="#E8F6E8", color="#4C9F70"];
+    client_exec [label="RealMan 客户端\n默认执行 action[2:8)\n再采集新观测并请求下一次推理", fillcolor="#DFF7F2", color="#2A9D8F", penwidth=2.0];
+    train_targets [label="仅训练期目标\nGT action chunk\nCurrent/Future depth & video", style="rounded,dashed,filled", fillcolor="#FCE7F3", color="#DB7093"];
+    aux_heads [label="仅训练：LingBot-Depth / DINO-Video\n辅助预测头与 loss", style="rounded,dashed,filled", fillcolor="#FCE7F3", color="#DB7093"];
+    fm_loss [label="仅训练：Flow Matching loss\n监督速度 uₜ", style="rounded,dashed,filled", fillcolor="#FCE7F3", color="#DB7093"];
+
+    {rank=same; velocity; euler; action_chunk; physical_action; client_exec;}
+    {rank=same; train_targets; aux_heads; fm_loss;}
+  }
+
+  language -> language_embed;
+  wrist_rgb -> shared_vit [label="同一次 ViT batch"];
+  tactile_rgb -> shared_vit;
+  shared_vit -> scene_tokens [color="#4C78A8"];
+  shared_vit -> tactile_rgb_tokens [color="#2A9D8F"];
+
+  marker_history -> marker_encoder [color="#4C9F70"];
+  marker_history -> global_gate [label="最新帧/状态序列", color="#F28E2B"];
+  marker_encoder -> marker_tokens [color="#4C9F70"];
+  global_gate -> marker_tokens [style=dashed, label="全局可见性 mask", color="#F28E2B"];
+
+  robot_state -> suffix_embed [color="#D9A321"];
+  flow_noise -> suffix_embed [color="#D9A321"];
+
+  scene_tokens -> prefix_concat [color="#4C78A8"];
+  language_embed -> prefix_concat [color="#E07A5F"];
+  tactile_rgb_tokens -> prefix_concat [color="#2A9D8F"];
+  marker_tokens -> prefix_concat [color="#4C9F70"];
+  query_tokens -> prefix_concat [color="#8F63C7"];
+
+  prefix_concat -> coupled_layer [label="Understanding prefix"];
+  suffix_embed -> coupled_layer [label="Action suffix", color="#D9A321"];
+  coupled_layer -> prefix_cache [label="首轮填充", color="#4C78A8"];
+  prefix_cache -> coupled_layer [label="后续 Flow steps 复用", style=dashed, color="#4C78A8"];
+  coupled_layer -> moe_detail [style=dotted, arrowhead=none, color="#C95D63"];
+  coupled_layer -> velocity [label="Action suffix output", color="#D9A321"];
+  velocity -> euler [color="#D9A321"];
+  euler -> action_chunk [label="t = 0", color="#D9A321"];
+  action_chunk -> physical_action;
+  physical_action -> client_exec;
+  coupled_layer -> aux_heads [style=dashed, color="#DB7093"];
+  train_targets -> aux_heads [style=dashed, color="#DB7093"];
+  train_targets -> fm_loss [style=dashed, color="#DB7093"];
+  velocity -> fm_loss [style=dashed, color="#DB7093"];
+}

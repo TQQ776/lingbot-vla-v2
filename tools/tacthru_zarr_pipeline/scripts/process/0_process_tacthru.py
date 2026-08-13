@@ -15,12 +15,17 @@ import numpy as np
 from supp.pipeline_utils import (
     copy_if_needed,
     ensure_demo_specs,
+    load_sensor_cfg,
     process_tactile_video,
     resolve_tactile_cfg_names,
     tactile_marker_count,
     tactile_reference_points,
 )
-from utils.proc_utils import KeypointsKFProcessor
+from utils.tactile_marker_processor import (
+    MARKER_QUALITY_KEYS,
+    create_tactile_marker_processor,
+    tracking_algorithm,
+)
 
 
 def _prepare_demo(
@@ -63,20 +68,37 @@ def _prepare_demo(
         raise FileNotFoundError(f"No tactile streams found in {recording_dir}: expected at least one TacThru-*.avi/.txt pair")
 
 
-def _should_regenerate_kpts(kpts_path: Path, force: bool) -> bool:
+def _should_regenerate_kpts(
+    kpts_path: Path,
+    force: bool,
+    cfg_name: str,
+) -> bool:
     if force or (not kpts_path.is_file()):
         return True
     try:
         with kpts_path.open("rb") as f:
             data = pickle.load(f)
-        return not all(key in data for key in ("marker", "marker_ref", "marker_flow"))
+        expected_algorithm = tracking_algorithm(
+            load_sensor_cfg(cfg_name).get("tracking", {})
+        )
+        required_keys = ("marker", "marker_ref", "marker_flow")
+        if expected_algorithm == "high-reliability":
+            required_keys = (*required_keys, *MARKER_QUALITY_KEYS)
+        return (
+            data.get("tracking_algorithm") != expected_algorithm
+            or not all(key in data for key in required_keys)
+        )
     except Exception:
         return True
 
 
 def _track_tactile_video(video_path: Path, cfg_name: str, force: bool) -> None:
     kpts_path = video_path.with_name(f"{video_path.stem}_kpts.pkl")
-    if not _should_regenerate_kpts(kpts_path=kpts_path, force=force):
+    if not _should_regenerate_kpts(
+        kpts_path=kpts_path,
+        force=force,
+        cfg_name=cfg_name,
+    ):
         return
 
     cap = cv2.VideoCapture(str(video_path))
@@ -91,12 +113,28 @@ def _track_tactile_video(video_path: Path, cfg_name: str, force: bool) -> None:
     frame_shape_hw = frame.shape[:2]
     ref_marker_pos = tactile_reference_points(cfg_name=cfg_name, frame_shape_hw=frame_shape_hw)
     marker_count = int(ref_marker_pos.shape[0])
-    detector = KeypointsKFProcessor(ref_marker_pos)
+    sensor_cfg = load_sensor_cfg(cfg_name)
+    tracking_cfg = sensor_cfg.get("tracking", {})
+    algorithm = tracking_algorithm(tracking_cfg)
+    detector = create_tactile_marker_processor(
+        ref_marker_pos,
+        tracking_cfg,
+        color_order="BGR",
+    )
     detector.reset()
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-    labels = {"marker": [], "marker_ref": [], "marker_flow": []}
+    labels = {
+        "marker": [],
+        "marker_ref": [],
+        "marker_flow": [],
+        "marker_valid": [],
+        "marker_fallback": [],
+        "marker_estimated": [],
+        "marker_confidence": [],
+        "tracking_warmup_remaining": [],
+    }
     frame_shape_wh = np.array([frame_shape_hw[1], frame_shape_hw[0]], dtype=np.float32)
 
     while True:
@@ -111,12 +149,53 @@ def _track_tactile_video(video_path: Path, cfg_name: str, force: bool) -> None:
         labels["marker"].append(marker)
         labels["marker_ref"].append(marker_ref)
         labels["marker_flow"].append(marker - marker_ref)
+        labels["marker_valid"].append(
+            np.asarray(
+                result.get("marker_valid", np.ones((marker_count,), dtype=bool)),
+                dtype=bool,
+            )
+        )
+        labels["marker_fallback"].append(
+            np.asarray(
+                result.get("marker_fallback", np.zeros((marker_count,), dtype=bool)),
+                dtype=bool,
+            )
+        )
+        labels["marker_estimated"].append(
+            np.asarray(
+                result.get("marker_estimated", np.zeros((marker_count,), dtype=bool)),
+                dtype=bool,
+            )
+        )
+        labels["marker_confidence"].append(
+            np.asarray(
+                result.get("marker_confidence", np.ones((marker_count,), dtype=np.float32)),
+                dtype=np.float32,
+            )
+        )
+        labels["tracking_warmup_remaining"].append(
+            int(result.get("tracking_warmup_remaining", 0))
+        )
 
     cap.release()
 
-    labels = {key: np.asarray(value, dtype=np.float32) if value else np.zeros((0, marker_count, 2), dtype=np.float32) for key, value in labels.items()}
+    serialized = {
+        "marker": np.asarray(labels["marker"], dtype=np.float32),
+        "marker_ref": np.asarray(labels["marker_ref"], dtype=np.float32),
+        "marker_flow": np.asarray(labels["marker_flow"], dtype=np.float32),
+        "marker_valid": np.asarray(labels["marker_valid"], dtype=bool),
+        "marker_fallback": np.asarray(labels["marker_fallback"], dtype=bool),
+        "marker_estimated": np.asarray(labels["marker_estimated"], dtype=bool),
+        "marker_confidence": np.asarray(labels["marker_confidence"], dtype=np.float32),
+        "tracking_warmup_remaining": np.asarray(
+            labels["tracking_warmup_remaining"],
+            dtype=np.int32,
+        ),
+        "tracking_algorithm": algorithm,
+        "tracking_config": dict(tracking_cfg),
+    }
     with kpts_path.open("wb") as f:
-        pickle.dump(labels, f)
+        pickle.dump(serialized, f)
 
 
 def _write_placeholder_kpts(video_path: Path, cfg_name: str) -> None:

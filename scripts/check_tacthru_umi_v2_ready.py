@@ -15,6 +15,8 @@ import numpy as np
 CHUNK_SIZE = 50
 EXPECTED_SOURCE_FPS = 30
 EXPECTED_DATASET_FPS = 30
+EXPECTED_BASE_CONVERTER_VERSION = 4
+EXPECTED_TACTILE_CONVERTER_VERSION = 7
 EXPECTED_FUTURE_EFFECTIVE_FPS = EXPECTED_DATASET_FPS / (CHUNK_SIZE - 1)
 REQUIRED_VIDEO_KEYS = {
     "observation.images.camera_wrist_left",
@@ -305,7 +307,11 @@ def check_dataset(
             manifest_errors = []
             expected_manifest_values = {
                 "converter": "tacthru_umi_v2_native_30hz",
-                "converter_version": 6 if expect_tactile else 4,
+                "converter_version": (
+                    EXPECTED_TACTILE_CONVERTER_VERSION
+                    if expect_tactile
+                    else EXPECTED_BASE_CONVERTER_VERSION
+                ),
                 "source_fps": EXPECTED_SOURCE_FPS,
                 "output_fps": EXPECTED_DATASET_FPS,
                 "action_chunk_size": CHUNK_SIZE,

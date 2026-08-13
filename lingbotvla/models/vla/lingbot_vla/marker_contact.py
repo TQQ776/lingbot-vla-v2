@@ -169,6 +169,7 @@ class MarkerContactGateConfig:
             "hard_hysteresis",
             "hard_hysteresis_hold",
             "hard_hysteresis_soft_region",
+            "global_active_count_hysteresis_soft_region",
         }
         if mode not in modes:
             raise ValueError(f"Unsupported marker contact gate mode: {mode}")

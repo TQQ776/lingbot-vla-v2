@@ -1141,7 +1141,7 @@ class FlowMatchingV2(FlowMatchingV1):
                 sensor_mask,
                 marker_contact_state,
             )
-            # Sensor-major, time-minor: left[t-7:t], then right[t-7:t].
+            # Sensor-major, then time-major and spatial-minor within each sensor.
             marker_tokens = marker_tokens.to(dtype=embed_dtype).flatten(1, 2)
             marker_token_mask = marker_token_mask.flatten(1, 2)
             marker_ids = torch.full(

@@ -33,6 +33,84 @@ def _read_bool(value: Any, default: bool) -> bool:
     return bool(value)
 
 
+def migrate_legacy_tactile_config(
+    config: Mapping[str, Any] | None,
+    *,
+    allow_legacy_marker_reinit: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Resolve the pre-history marker contract for explicit deployment migration.
+
+    The first TacThru checkpoint used one four-channel global marker token per
+    sensor. Current deployment accepts an eight-frame ``[dx, dy]`` history.
+    Converting the config is only safe together with the existing checkpoint
+    loader's marker-only reinitialization, so the conversion remains opt-in.
+    """
+
+    values = dict(config or {})
+    if not _read_bool(values.get("enabled"), False) or not _read_bool(
+        values.get("use_markers"), True
+    ):
+        return values, None
+
+    input_features = int(values.get("marker_input_features", 2))
+    legacy_keys = {
+        "marker_flow_keys",
+        "marker_positions_keys",
+        "marker_reference_keys",
+    }
+    is_legacy = input_features == 4 or bool(legacy_keys & values.keys())
+    if not is_legacy or not allow_legacy_marker_reinit:
+        return values, None
+
+    removed_keys = sorted(legacy_keys & values.keys())
+    for key in legacy_keys:
+        values.pop(key, None)
+    values.pop("marker_tokens_per_sensor", None)
+    if len(values.get("marker_mean", ())) == 4:
+        values.pop("marker_mean")
+    if len(values.get("marker_std", ())) == 4:
+        values.pop("marker_std")
+
+    sensor_names = tuple(values.get("sensor_names") or ("left",))
+    values.update(
+        marker_input_features=2,
+        marker_feature_mode="displacement_history",
+        marker_history_length=8,
+        marker_sample_hz=30.0,
+        marker_tokenization={
+            "mode": "global",
+            "num_regions": 1,
+            "region_layout": "1x1",
+            "aggregation": "mean_max",
+            "include_reference_xy": False,
+        },
+        marker_position_encoding={
+            "temporal_type": "learned",
+            "spatial_type": "none",
+            "use_real_time": True,
+            "combination": "additive",
+        },
+        marker_displacement_keys=[
+            f"observation.tactile.marker_displacement_{name}"
+            for name in sensor_names
+        ],
+        marker_valid_mask_keys=[
+            f"observation.tactile.marker_valid_{name}" for name in sensor_names
+        ],
+    )
+    report = {
+        "kind": "legacy_four_channel_global_to_displacement_history",
+        "marker_input_features": [input_features, 2],
+        "marker_tokens_per_sensor": [
+            config.get("marker_tokens_per_sensor") if config else None,
+            8,
+        ],
+        "removed_keys": removed_keys,
+        "requires_marker_module_reinitialization": True,
+    }
+    return values, report
+
+
 def _as_float_tuple(value: Sequence[float], *, name: str, length: int) -> tuple[float, ...]:
     result = tuple(float(item) for item in value)
     if len(result) != length:
@@ -94,15 +172,28 @@ class MarkerTokenizationConfig:
     ) -> "MarkerTokenizationConfig":
         values = dict(value or {})
         mode = str(values.get("mode", "global"))
-        if mode not in {"global", "regional"}:
-            raise ValueError("marker_tokenization.mode must be global or regional")
-        default_regions = 1 if mode == "global" else 4
+        modes = {"global", "regional", "point_spatiotemporal"}
+        if mode not in modes:
+            raise ValueError(
+                "marker_tokenization.mode must be global, regional, or "
+                "point_spatiotemporal"
+            )
+        default_regions = {"global": 1, "regional": 4}.get(mode, 48)
         num_regions = int(values.get("num_regions", default_regions))
-        layout = str(values.get("region_layout", "1x1" if mode == "global" else "2x2"))
+        default_layout = {
+            "global": "1x1",
+            "regional": "2x2",
+            "point_spatiotemporal": "points",
+        }[mode]
+        layout = str(values.get("region_layout", default_layout))
         if mode == "global" and (num_regions != 1 or layout != "1x1"):
             raise ValueError("Global marker tokenization requires num_regions=1 and region_layout=1x1")
         if mode == "regional" and (num_regions != 4 or layout != "2x2"):
             raise ValueError("Regional marker tokenization currently requires four 2x2 regions")
+        if mode == "point_spatiotemporal" and layout != "points":
+            raise ValueError(
+                "Point spatiotemporal tokenization requires region_layout=points"
+            )
         aggregation = str(values.get("aggregation", "mean_max"))
         if aggregation not in {"mean", "max", "mean_max"}:
             raise ValueError("marker aggregation must be mean, max, or mean_max")
@@ -116,7 +207,8 @@ class MarkerTokenizationConfig:
             region_layout=layout,
             aggregation=aggregation,
             include_reference_xy=_read_bool(
-                values.get("include_reference_xy"), mode == "regional"
+                values.get("include_reference_xy"),
+                mode in {"regional", "point_spatiotemporal"},
             ),
             point_hidden_dim=point_hidden_dim,
             region_hidden_dim=region_hidden_dim,
@@ -348,13 +440,6 @@ class TactileVTLAConfig:
                 "marker_input_features must be 2 ([dx, dy]); explicit marker velocity "
                 "is not supported by displacement_history mode"
             )
-        legacy_token_count = values.get("marker_tokens_per_sensor")
-        if legacy_token_count is not None and int(legacy_token_count) != marker_history_length:
-            raise ValueError(
-                "marker_tokens_per_sensor is deprecated; displacement_history emits exactly "
-                "marker_history_length tokens per sensor. Remove the old field and set "
-                "marker_history_length explicitly."
-            )
         if marker_hidden_dim <= 0:
             raise ValueError("tactile.marker_hidden_dim must be positive")
 
@@ -415,6 +500,25 @@ class TactileVTLAConfig:
             values.get("marker_tokenization"),
             legacy_hidden_dim=marker_hidden_dim,
         )
+        if (
+            tokenization.mode == "point_spatiotemporal"
+            and tokenization.num_regions != num_markers
+        ):
+            raise ValueError(
+                "Point spatiotemporal tokenization requires num_regions to equal "
+                f"num_markers={num_markers}"
+            )
+        legacy_token_count = values.get("marker_tokens_per_sensor")
+        expected_token_count = marker_history_length * tokenization.num_regions
+        if (
+            legacy_token_count is not None
+            and int(legacy_token_count) != expected_token_count
+        ):
+            raise ValueError(
+                "marker_tokens_per_sensor is deprecated; the selected marker "
+                "tokenization emits exactly marker_history_length * num_regions="
+                f"{expected_token_count} tokens per sensor. Remove the old field."
+            )
         legacy_temporal = _read_bool(values.get("marker_temporal_embedding"), True)
         position_encoding = MarkerPositionEncodingConfig.from_mapping(
             values.get("marker_position_encoding"),
@@ -422,7 +526,8 @@ class TactileVTLAConfig:
         )
         reference_path = values.get("marker_reference_xy_path")
         reference_value = values.get("marker_reference_xy")
-        if reference_value is not None:
+        has_reference_value = reference_value is not None and len(reference_value) > 0
+        if has_reference_value:
             reference = _normalize_reference_xy(
                 torch.as_tensor(reference_value, dtype=torch.float32)
             )
@@ -441,10 +546,13 @@ class TactileVTLAConfig:
                 sensor_names=sensor_names,
                 num_markers=num_markers,
             )
-        elif enabled and use_markers and tokenization.mode == "regional":
+        elif enabled and use_markers and tokenization.mode in {
+            "regional",
+            "point_spatiotemporal",
+        }:
             raise ValueError(
-                "Regional marker tokenization requires marker_reference_xy_path or "
-                "embedded marker_reference_xy"
+                f"{tokenization.mode} marker tokenization requires "
+                "marker_reference_xy_path or embedded marker_reference_xy"
             )
         else:
             marker_reference_xy = ()
@@ -526,8 +634,8 @@ class TactileVTLAConfig:
 
     @property
     def marker_tokens_per_sensor(self) -> int:
-        regions = self.marker_tokenization.num_regions
-        return self.marker_history_length * regions
+        spatial_tokens = self.marker_tokenization.num_regions
+        return self.marker_history_length * spatial_tokens
 
 
 def validate_marker_displacement_history(
@@ -772,6 +880,97 @@ class RegionalMarkerEncoder(nn.Module):
         return tokens, region_valid
 
 
+class PointSpatiotemporalMarkerEncoder(nn.Module):
+    """Encode every marker in every history frame without spatial pooling."""
+
+    def __init__(
+        self,
+        *,
+        reference_xy: Tensor,
+        context_dim: int,
+        point_hidden_dim: int,
+        projection_hidden_dim: int,
+        include_reference_xy: bool,
+        marker_mean: Sequence[float],
+        marker_std: Sequence[float],
+        disable_spatial_content: bool,
+    ) -> None:
+        super().__init__()
+        reference_xy = torch.as_tensor(reference_xy, dtype=torch.float32)
+        if reference_xy.ndim != 3 or reference_xy.shape[-1] != 2:
+            raise ValueError("reference_xy must be [S,N,2]")
+        if point_hidden_dim <= 0 or projection_hidden_dim <= 0:
+            raise ValueError("Point encoder hidden dimensions must be positive")
+        self.include_reference_xy = bool(include_reference_xy)
+        self.disable_spatial_content = bool(disable_spatial_content)
+        self.register_buffer("reference_xy", reference_xy, persistent=True)
+        self.register_buffer(
+            "marker_mean",
+            torch.tensor(marker_mean, dtype=torch.float32),
+            persistent=True,
+        )
+        self.register_buffer(
+            "marker_std",
+            torch.tensor(marker_std, dtype=torch.float32),
+            persistent=True,
+        )
+        input_dim = 4 if include_reference_xy else 2
+        self.point_encoder = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.GELU(),
+            nn.Linear(64, point_hidden_dim),
+            nn.LayerNorm(point_hidden_dim),
+            nn.GELU(),
+            nn.Linear(point_hidden_dim, projection_hidden_dim),
+            nn.LayerNorm(projection_hidden_dim),
+            nn.GELU(),
+            nn.Linear(projection_hidden_dim, context_dim),
+        )
+
+    def forward(
+        self,
+        marker_features: Tensor,
+        marker_valid_mask: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        if marker_features.ndim != 5 or marker_features.shape[-1] != 2:
+            raise ValueError(
+                "Point spatiotemporal marker features must be [B,S,H,N,2]"
+            )
+        if marker_valid_mask.shape != marker_features.shape[:-1]:
+            raise ValueError(
+                "Point spatiotemporal marker valid mask must be [B,S,H,N]"
+            )
+        if (
+            marker_features.shape[1] != self.reference_xy.shape[0]
+            or marker_features.shape[3] != self.reference_xy.shape[1]
+        ):
+            raise ValueError(
+                "Point spatiotemporal marker input does not match reference coordinates"
+            )
+        mean = self.marker_mean.to(marker_features)
+        std = self.marker_std.to(marker_features)
+        normalized = (marker_features - mean) / (std + 1e-6)
+        normalized = normalized * marker_valid_mask.unsqueeze(-1).to(
+            normalized.dtype
+        )
+        point_input = normalized
+        if self.include_reference_xy:
+            reference = self.reference_xy.to(marker_features)[None, :, None]
+            reference = reference.expand(
+                marker_features.shape[0],
+                -1,
+                marker_features.shape[2],
+                -1,
+                -1,
+            )
+            if self.disable_spatial_content:
+                reference = torch.zeros_like(reference)
+            point_input = torch.cat([normalized, reference], dim=-1)
+        tokens = self.point_encoder(point_input)
+        tokens = tokens * marker_valid_mask.unsqueeze(-1).to(tokens.dtype)
+        return tokens, marker_valid_mask
+
+
 def continuous_sincos_1d(values: Tensor, dim: int) -> Tensor:
     """Encode arbitrary continuous values, padding an unmatched final dimension."""
 
@@ -837,6 +1036,9 @@ class TactileTokenEncoder(nn.Module):
 
         self.marker_encoder: MarkerEncoder | None = None
         self.regional_marker_encoder: RegionalMarkerEncoder | None = None
+        self.point_spatiotemporal_marker_encoder: (
+            PointSpatiotemporalMarkerEncoder | None
+        ) = None
         self.register_buffer("marker_reference_xy", torch.empty(0), persistent=True)
         self.register_buffer("marker_region_ids", torch.empty(0, dtype=torch.long), persistent=True)
         self.register_buffer("marker_region_centers", torch.empty(0), persistent=True)
@@ -849,11 +1051,17 @@ class TactileTokenEncoder(nn.Module):
                 )
                 reference[..., 0] = torch.linspace(-1.0, 1.0, settings.num_markers)
                 reference[..., 1] = torch.linspace(-1.0, 1.0, settings.num_markers)
-            region_ids, region_centers = build_marker_region_mapping(
-                reference,
-                num_regions=settings.marker_tokenization.num_regions,
-                region_layout=settings.marker_tokenization.region_layout,
-            )
+            if settings.marker_tokenization.mode == "point_spatiotemporal":
+                region_ids = torch.arange(
+                    settings.num_markers, dtype=torch.long
+                )[None].expand(settings.num_sensors, -1).clone()
+                region_centers = reference.clone()
+            else:
+                region_ids, region_centers = build_marker_region_mapping(
+                    reference,
+                    num_regions=settings.marker_tokenization.num_regions,
+                    region_layout=settings.marker_tokenization.region_layout,
+                )
             self.marker_reference_xy = reference
             self.marker_region_ids = region_ids
             self.marker_region_centers = region_centers
@@ -866,7 +1074,7 @@ class TactileTokenEncoder(nn.Module):
                     marker_mean=settings.marker_mean,
                     marker_std=settings.marker_std,
                 )
-            else:
+            elif settings.marker_tokenization.mode == "regional":
                 tokenization = settings.marker_tokenization
                 self.regional_marker_encoder = RegionalMarkerEncoder(
                     reference_xy=reference,
@@ -879,6 +1087,22 @@ class TactileTokenEncoder(nn.Module):
                     marker_mean=settings.marker_mean,
                     marker_std=settings.marker_std,
                     disable_spatial_content=settings.marker_ablation.disable_spatial_content,
+                )
+            else:
+                tokenization = settings.marker_tokenization
+                self.point_spatiotemporal_marker_encoder = (
+                    PointSpatiotemporalMarkerEncoder(
+                        reference_xy=reference,
+                        context_dim=context_dim,
+                        point_hidden_dim=tokenization.point_hidden_dim,
+                        projection_hidden_dim=tokenization.region_hidden_dim,
+                        include_reference_xy=tokenization.include_reference_xy,
+                        marker_mean=settings.marker_mean,
+                        marker_std=settings.marker_std,
+                        disable_spatial_content=(
+                            settings.marker_ablation.disable_spatial_content
+                        ),
+                    )
                 )
 
         if settings.use_rgb and vision_output_dim != context_dim:
@@ -984,7 +1208,11 @@ class TactileTokenEncoder(nn.Module):
 
     @property
     def marker_dtype(self) -> torch.dtype:
-        module: nn.Module | None = self.marker_encoder or self.regional_marker_encoder
+        module: nn.Module | None = (
+            self.marker_encoder
+            or self.regional_marker_encoder
+            or self.point_spatiotemporal_marker_encoder
+        )
         if module is None:
             return torch.float32
         return next(module.parameters()).dtype
@@ -1016,9 +1244,13 @@ class TactileTokenEncoder(nn.Module):
         *,
         return_debug_info: bool = False,
     ) -> tuple[Tensor, Tensor] | MarkerEncodingOutput:
-        """Return global [B,S,H,D] or regional [B,S,H*R,D] marker tokens."""
+        """Return marker tokens flattened in sensor/time/spatial order."""
 
-        if self.marker_encoder is None and self.regional_marker_encoder is None:
+        if (
+            self.marker_encoder is None
+            and self.regional_marker_encoder is None
+            and self.point_spatiotemporal_marker_encoder is None
+        ):
             raise RuntimeError("Marker encoding is disabled")
         if marker_displacement_history.ndim != 5:
             raise ValueError(
@@ -1075,9 +1307,14 @@ class TactileTokenEncoder(nn.Module):
         if self.marker_encoder is not None:
             content = self.marker_encoder(features, marker_mask).unsqueeze(-2)
             region_valid = marker_mask.any(dim=-1, keepdim=True)
-        else:
+        elif self.regional_marker_encoder is not None:
             assert self.regional_marker_encoder is not None
             content, region_valid = self.regional_marker_encoder(features, marker_mask)
+        else:
+            assert self.point_spatiotemporal_marker_encoder is not None
+            content, region_valid = self.point_spatiotemporal_marker_encoder(
+                features, marker_mask
+            )
 
         content = content[:, :, self.marker_temporal_content_order]
         region_valid = region_valid[:, :, self.marker_temporal_content_order]
@@ -1160,7 +1397,7 @@ class TactileTokenEncoder(nn.Module):
                 "mode": self.settings.marker_tokenization.mode,
                 "history_length": history_length,
                 "num_regions": self.settings.marker_tokenization.num_regions,
-                "order": "sensor-major,time-major,region-minor",
+                "order": "sensor-major,time-major,spatial-minor",
             },
         )
         return output if return_debug_info else (output.tokens, output.token_mask)
@@ -1291,6 +1528,7 @@ _CONFIG_DERIVED_MARKER_SUFFIXES = (
     "regional_marker_encoder.reference_xy",
     "regional_marker_encoder.region_ids",
     "regional_marker_encoder.region_membership",
+    "point_spatiotemporal_marker_encoder.reference_xy",
     "marker_temporal_encoding",
     "marker_spatial_encoding",
     "marker_temporal_content_order",
@@ -1479,6 +1717,7 @@ __all__ = [
     "MarkerEncodingOutput",
     "MarkerPositionEncodingConfig",
     "MarkerTokenizationConfig",
+    "PointSpatiotemporalMarkerEncoder",
     "RegionalMarkerEncoder",
     "TactileTokenEncoder",
     "TactileVTLAConfig",
@@ -1487,6 +1726,7 @@ __all__ = [
     "continuous_sincos_1d",
     "continuous_sincos_2d",
     "load_marker_reference_xy",
+    "migrate_legacy_tactile_config",
     "load_vtla_checkpoint_state_dict",
     "load_marker_statistics",
     "validate_marker_displacement_history",

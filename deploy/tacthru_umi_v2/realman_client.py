@@ -43,12 +43,15 @@ from .protocol import (
     validate_action_spec,
 )
 from .realman_runtime import RealmanConfig, RealmanEpisodeRuntime, SafetyViolation
-from .tactile_source import TacThruSource
-from .transforms import validate_state8
+from .tactile_source import TactileFrame, TacThruSource
+from .transforms import validate_action_chunk, validate_state8
 
 
 DEFAULT_IMAGE_SIZE = 224
 CAMERA_FRESHNESS_FRACTION = 0.80
+PREVIEW_WINDOW_NAME = "LingBot V2 TacThru UMI"
+PREVIEW_ARROW_SCALE = 6.0
+_PREVIEW_WINDOW_CREATED = False
 
 
 @dataclass(frozen=True)
@@ -539,6 +542,14 @@ class LingBotV2HttpClient:
             except OSError:
                 pass
 
+    def reset_connection(self) -> None:
+        """Drop an idle keep-alive socket without closing the client."""
+
+        with self._connection_lock:
+            if self._closed:
+                raise RuntimeError("LingBot V2 HTTP client is closed")
+            self._drop_connection()
+
     def close(self) -> None:
         with self._connection_lock:
             if self._closed:
@@ -547,6 +558,119 @@ class LingBotV2HttpClient:
             self._drop_connection()
 
     def __enter__(self) -> "LingBotV2HttpClient":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback_obj) -> None:
+        self.close()
+
+
+class LingBotV2InProcessClient:
+    """Direct policy adapter that bypasses HTTP, JPEG and JSON serialization."""
+
+    def __init__(self, backend, *, warmup_result: dict[str, Any] | None = None) -> None:
+        self.backend = backend
+        self.warmup_result = dict(warmup_result or {})
+        self.last_request_timing: dict[str, Any] = {}
+        self._closed = False
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        *,
+        project_root: Path,
+        checkpoint: Path,
+        norm_stats: Path,
+        qwen_path: Path | None,
+        use_compile: bool,
+        dtype: str,
+        inference_lock_timeout_s: float,
+        warmup: bool,
+    ) -> "LingBotV2InProcessClient":
+        # Keep model-only imports out of the existing lightweight HTTP client path.
+        from .http_server import LingBotV2Backend
+
+        backend = LingBotV2Backend.from_checkpoint(
+            project_root=project_root,
+            checkpoint=checkpoint,
+            norm_stats=norm_stats,
+            qwen_path=qwen_path,
+            use_compile=use_compile,
+            dtype=dtype,
+            inference_lock_timeout_s=inference_lock_timeout_s,
+        )
+        warmup_result = backend.warmup() if warmup else None
+        return cls(backend, warmup_result=warmup_result)
+
+    def health(self) -> dict[str, Any]:
+        if self._closed:
+            raise RuntimeError("LingBot V2 in-process client is closed")
+        payload = dict(self.backend.health())
+        payload["backend"] = "lingbot-vla-v2-tacthru-umi-inprocess"
+        payload["transport"] = {
+            "mode": "inprocess",
+            "http": False,
+            "image_encoding": "raw_rgb_uint8",
+            "serialization": "none",
+        }
+        if self.warmup_result:
+            payload["warmup"] = dict(self.warmup_result)
+        return payload
+
+    def predict(self, observation: Observation, *, expected_steps: int) -> ActionResponse:
+        response, _ = self.predict_timed(observation, expected_steps=expected_steps)
+        return response
+
+    def predict_timed(
+        self,
+        observation: Observation,
+        *,
+        expected_steps: int,
+    ) -> tuple[ActionResponse, dict[str, Any]]:
+        if self._closed:
+            raise RuntimeError("LingBot V2 in-process client is closed")
+        total_started = time.perf_counter()
+        backend_started = time.perf_counter()
+        response = self.backend.predict_response(observation)
+        backend_call_s = time.perf_counter() - backend_started
+        if response.request_id != observation.request_id:
+            raise ValueError(
+                "Response request_id mismatch: "
+                f"expected {observation.request_id!r}, got {response.request_id!r}"
+            )
+        if response.session_id != observation.session_id:
+            raise ValueError(
+                "Response session_id mismatch: "
+                f"expected {observation.session_id!r}, got {response.session_id!r}"
+            )
+        actions = validate_action_chunk(response.action_chunk, expected_steps=expected_steps)
+        metadata = dict(response.metadata)
+        metadata["backend"] = "lingbot-vla-v2-tacthru-umi-inprocess"
+        metadata["transport"] = "inprocess_direct"
+        response = ActionResponse(
+            action_chunk=actions,
+            request_id=response.request_id,
+            session_id=response.session_id,
+            metadata=metadata,
+            server_timestamp=response.server_timestamp,
+        )
+        timing = {
+            "transport": "inprocess",
+            "encode_s": 0.0,
+            "request_response_s": backend_call_s,
+            "response_parse_s": 0.0,
+            "server_timing_s": metadata.get("server_timing_s", {}),
+            "total_s": time.perf_counter() - total_started,
+        }
+        self.last_request_timing = timing
+        return response, timing
+
+    def reset_connection(self) -> None:
+        """Match the HTTP client's recovery interface; there is no connection to reset."""
+
+    def close(self) -> None:
+        self._closed = True
+
+    def __enter__(self) -> "LingBotV2InProcessClient":
         return self
 
     def __exit__(self, exc_type, exc, traceback_obj) -> None:
@@ -625,7 +749,14 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-roundtrip-s", type=float, default=30.0)
     run.add_argument("--execute", action="store_true", help="Enable real actuator commands after a mandatory Space confirmation")
     run.add_argument("--stream-replan", action="store_true", help="Do not wait for the dispatched short chunk to finish")
-    run.add_argument("--preview", action="store_true", help="Show the exact 224x224 RGB frame sent to the server")
+    run.add_argument(
+        "--preview",
+        action="store_true",
+        help=(
+            "Open a local GUI with the wrist RGB and the exact TacThru RGB/marker "
+            "observation sent for inference"
+        ),
+    )
     run.add_argument("--wait-for-space", action="store_true", help="Also gate a dry-run on Space; execute mode is always gated")
     run.add_argument("--output-dir", type=Path, default=None)
     run.add_argument("--log-jsonl", type=Path, default=None)
@@ -713,7 +844,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _add_http_args(parser: argparse.ArgumentParser, *, default_timeout: float) -> None:
-    parser.add_argument("--server-url", required=True)
+    project_root = Path(__file__).resolve().parents[2]
+    checkpoint_default = os.environ.get("LINGBOT_V2_CHECKPOINT")
+    norm_stats_default = os.environ.get(
+        "LINGBOT_V2_NORM_STATS",
+        "assets/norm_stats/tacthru_umi_v2.json",
+    )
+    qwen_default = os.environ.get("QWEN3VL_PATH", "models/Qwen3-VL-4B-Instruct")
+    parser.add_argument(
+        "--transport",
+        choices=["http", "inprocess"],
+        default="http",
+        help="HTTP preserves the existing split deployment; inprocess loads the policy here with no serialization.",
+    )
+    parser.add_argument("--server-url", default=os.environ.get("LINGBOT_V2_SERVER_URL"))
     parser.add_argument("--timeout", type=float, default=default_timeout)
     parser.add_argument("--jpeg-quality", type=int, default=90)
     parser.add_argument("--api-key", default=os.environ.get("LINGBOT_V2_API_KEY"))
@@ -723,17 +867,82 @@ def _add_http_args(parser: argparse.ArgumentParser, *, default_timeout: float) -
         default=False,
         help="Reuse one HTTP/1.1 connection; --no-http-keep-alive restores urllib Connection: close.",
     )
+    parser.add_argument("--project-root", type=Path, default=project_root)
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=Path(checkpoint_default) if checkpoint_default else None,
+        help="In-process only: final .../global_step_N/hf_ckpt directory.",
+    )
+    parser.add_argument(
+        "--norm-stats",
+        type=Path,
+        default=Path(norm_stats_default),
+        help="In-process only: normalization statistics used by the checkpoint.",
+    )
+    parser.add_argument(
+        "--qwen-path",
+        type=Path,
+        default=Path(qwen_default),
+        help="In-process only: local Qwen3-VL model directory.",
+    )
+    parser.add_argument("--dtype", choices=["bf16", "fp32"], default="bf16")
+    parser.add_argument("--use-compile", action="store_true", help="In-process only: enable torch.compile.")
+    parser.add_argument(
+        "--warmup",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="In-process only: warm up once before cameras and robot hardware are opened.",
+    )
+    parser.add_argument("--inference-lock-timeout", type=float, default=5.0)
+
+
+def _build_inference_client(
+    args: argparse.Namespace,
+) -> LingBotV2HttpClient | LingBotV2InProcessClient:
+    if args.transport == "http":
+        if not args.server_url:
+            raise ValueError("--server-url is required when --transport=http")
+        return LingBotV2HttpClient(
+            args.server_url,
+            timeout_s=args.timeout,
+            jpeg_quality=args.jpeg_quality,
+            api_key=args.api_key,
+            keep_alive=args.http_keep_alive,
+        )
+
+    project_root = args.project_root.expanduser().resolve()
+    if args.checkpoint is None:
+        raise ValueError(
+            "--checkpoint or LINGBOT_V2_CHECKPOINT is required when --transport=inprocess"
+        )
+    checkpoint = _resolve_repo_path(project_root, args.checkpoint)
+    norm_stats = _resolve_repo_path(project_root, args.norm_stats)
+    qwen_path = _resolve_repo_path(project_root, args.qwen_path)
+    print(
+        "[lingbot-v2-client] loading in-process policy; HTTP/JPEG/JSON transport is disabled",
+        flush=True,
+    )
+    client = LingBotV2InProcessClient.from_checkpoint(
+        project_root=project_root,
+        checkpoint=checkpoint,
+        norm_stats=norm_stats,
+        qwen_path=qwen_path,
+        use_compile=args.use_compile,
+        dtype=args.dtype,
+        inference_lock_timeout_s=args.inference_lock_timeout,
+        warmup=args.warmup,
+    )
+    print(
+        f"[lingbot-v2-client] in-process policy ready warmup={args.warmup}",
+        flush=True,
+    )
+    return client
 
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    client = LingBotV2HttpClient(
-        args.server_url,
-        timeout_s=args.timeout,
-        jpeg_quality=args.jpeg_quality,
-        api_key=args.api_key,
-        keep_alive=args.http_keep_alive,
-    )
+    client = _build_inference_client(args)
     try:
         health = client.health()
         chunk_size = validate_server_health(health)
@@ -815,9 +1024,9 @@ def _tactile_contract_from_health(health: dict) -> dict[str, Any]:
         if not (use_rgb or use_markers):
             raise RuntimeError("Enabled tactile checkpoint has no active modality")
         if use_markers:
-            if marker_history_length != TACTILE_MARKER_HISTORY_LENGTH:
+            if marker_history_length <= 0:
                 raise RuntimeError(
-                    "Unsupported marker history length: "
+                    "Marker history length must be positive: "
                     f"{marker_history_length}"
                 )
             if not np.isclose(
@@ -870,7 +1079,7 @@ def _synthetic_tactile_inputs(contract: dict[str, Any]) -> dict[str, np.ndarray]
     if contract["use_markers"]:
         marker_shape = (
             TACTILE_SENSOR_COUNT,
-            TACTILE_MARKER_HISTORY_LENGTH,
+            int(contract["marker_history_length"]),
             TACTILE_MARKER_COUNT,
             2,
         )
@@ -888,7 +1097,7 @@ def _synthetic_tactile_inputs(contract: dict[str, Any]) -> dict[str, np.ndarray]
 
 def run_synthetic(
     args: argparse.Namespace,
-    client: LingBotV2HttpClient,
+    client: LingBotV2HttpClient | LingBotV2InProcessClient,
     chunk_size: int,
     health: dict,
 ) -> None:
@@ -928,7 +1137,7 @@ def run_synthetic(
 
 def run_realman(
     args: argparse.Namespace,
-    client: LingBotV2HttpClient,
+    client: LingBotV2HttpClient | LingBotV2InProcessClient,
     health: dict,
     chunk_size: int,
 ) -> None:
@@ -968,16 +1177,25 @@ def run_realman(
             "Real execution requires explicit --workspace-min-xyz X Y Z and "
             "--workspace-max-xyz X Y Z bounds in the Realman base frame"
         )
-    parsed_server_url = urlparse(args.server_url)
-    if args.execute and parsed_server_url.scheme != "https" and parsed_server_url.hostname not in {
-        "127.0.0.1",
-        "localhost",
-        "::1",
-    }:
-        raise RuntimeError(
-            "Real execution over plaintext HTTP is allowed only through a localhost SSH tunnel. "
-            "Use --server-url http://127.0.0.1:<port> or terminate TLS with HTTPS."
-        )
+    if args.execute and args.transport == "http":
+        parsed_server_url = urlparse(args.server_url)
+        if parsed_server_url.scheme != "https" and parsed_server_url.hostname not in {
+            "127.0.0.1",
+            "localhost",
+            "::1",
+        }:
+            raise RuntimeError(
+                "Real execution over plaintext HTTP is allowed only through a localhost SSH tunnel. "
+                "Use --server-url http://127.0.0.1:<port> or terminate TLS with HTTPS."
+            )
+    if args.preview:
+        _require_preview_gui()
+    reset_connection = getattr(client, "reset_connection", None)
+    if callable(reset_connection):
+        # The health request runs before camera/gripper setup and operator
+        # confirmation. Discard that socket so the first prediction cannot
+        # reuse a server-side keep-alive connection that expired meanwhile.
+        reset_connection()
     tacthru_repo = args.tacthru_repo.expanduser().resolve()
     camera_cfg = _resolve_repo_path(tacthru_repo, args.camera_cfg)
     tactile_sensor_cfg = _resolve_repo_path(tacthru_repo, args.tactile_sensor_cfg)
@@ -1156,7 +1374,11 @@ def run_realman(
                 },
             )
             if args.preview:
-                _show_preview(camera_frame.rgb, f"step={step_index} sending")
+                _show_preview(
+                    camera_frame.rgb,
+                    f"step={step_index} sending",
+                    tactile_frame=tactile_frame,
+                )
             request_started = time.perf_counter()
             response, latency = client.predict_timed(observation, expected_steps=chunk_size)
             roundtrip_s = time.perf_counter() - request_started
@@ -1219,6 +1441,7 @@ def run_realman(
                 wait_until,
                 preview_rgb=camera_frame.rgb if args.preview else None,
                 status=f"step={step_index} trajectory dispatched",
+                preview_tactile_frame=tactile_frame,
             )
             if args.execute and not args.stream_replan and execution and execution.get("dispatched"):
                 verification = runtime.verify_plan_completion(
@@ -1260,7 +1483,11 @@ def run_realman(
                 flush=True,
             )
             if args.preview:
-                _show_preview(camera_frame.rgb, f"step={step_index} done")
+                _show_preview(
+                    camera_frame.rgb,
+                    f"step={step_index} done",
+                    tactile_frame=tactile_frame,
+                )
     except KeyboardInterrupt as exc:
         error = repr(exc)
         if runtime.actuation_enabled:
@@ -1302,7 +1529,7 @@ def run_realman(
         camera.close()
         runtime.close()
         if args.preview:
-            cv2.destroyAllWindows()
+            _close_preview()
         if output_dir is not None:
             print(f"[lingbot-v2-client] logs: {output_dir}", flush=True)
 
@@ -1344,11 +1571,12 @@ def _wait_for_space(
         while True:
             if camera is not None:
                 frame = camera.capture()
-                bgr = np.ascontiguousarray(frame.rgb[..., ::-1])
                 cancel_text = " | Q/ESC: cancel" if allow_cancel else ""
-                cv2.putText(bgr, f"SPACE: {mode}{cancel_text}", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
-                cv2.imshow("LingBot V2 TacThru UMI", bgr)
-                key = cv2.waitKey(1) & 0xFF
+                key = _show_preview(
+                    frame.rgb,
+                    f"SPACE: {mode}{cancel_text}",
+                    return_key=True,
+                )
                 if key == ord(" "):
                     return
                 if allow_cancel and key in (ord("q"), ord("Q"), 27):
@@ -1409,19 +1637,309 @@ def _prepare_real_execution(
     return startup_result
 
 
-def _show_preview(rgb: np.ndarray, status: str) -> None:
-    bgr = np.ascontiguousarray(rgb[..., ::-1])
-    cv2.putText(bgr, status, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-    cv2.imshow("LingBot V2 TacThru UMI", bgr)
+def _require_preview_gui() -> None:
+    gui_backend = "unknown"
+    for line in cv2.getBuildInformation().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("GUI:"):
+            gui_backend = stripped.split(":", 1)[1].strip()
+            break
+    if gui_backend.upper() in {"", "NONE"}:
+        raise RuntimeError(
+            "--preview requires an OpenCV build with GUI support; the selected "
+            f"Python reports GUI={gui_backend!r}. Use the TacThru .venv Python "
+            "with QT5 support, or run without LINGBOT_V2_PREVIEW=1."
+        )
+    if sys.platform.startswith("linux") and not (
+        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    ):
+        raise RuntimeError(
+            "--preview requires a graphical desktop session. Run the client from "
+            "the 30.133 desktop terminal, or set DISPLAY and XAUTHORITY for that session."
+        )
+
+
+def _gate_preview_status(tactile_frame: TactileFrame | None) -> tuple[str, tuple[int, int, int]]:
+    if tactile_frame is None or tactile_frame.marker_contact_state is None:
+        return "GATE N/A", (170, 170, 170)
+    states = np.asarray(tactile_frame.marker_contact_state).reshape(-1)
+    if len(states) == 0:
+        return "GATE N/A", (170, 170, 170)
+    state = int(states[0])
+    labels = {
+        0: ("NO CONTACT", (70, 80, 235)),
+        1: ("CONTACT", (65, 205, 80)),
+        2: ("CONTACT HOLD", (40, 210, 235)),
+        3: ("NO CONTACT / TRACKING UNKNOWN", (70, 145, 235)),
+        4: ("CONTACT / TRACKING UNKNOWN", (70, 190, 235)),
+        5: ("CONTACT HOLD / TRACKING UNKNOWN", (70, 190, 235)),
+    }
+    return labels.get(state, (f"GATE STATE {state}", (170, 170, 170)))
+
+
+def _build_preview_canvas(
+    wrist_rgb: np.ndarray,
+    status: str,
+    *,
+    tactile_frame: TactileFrame | None = None,
+    arrow_scale: float = PREVIEW_ARROW_SCALE,
+) -> np.ndarray:
+    wrist = np.asarray(wrist_rgb, dtype=np.uint8)
+    if wrist.ndim != 3 or wrist.shape[-1] != 3:
+        raise ValueError(f"Preview wrist RGB must have shape [H,W,3], got {wrist.shape}")
+    if not np.isfinite(arrow_scale) or arrow_scale <= 0.0:
+        raise ValueError(f"Preview arrow_scale must be positive and finite, got {arrow_scale}")
+
+    panel_height = 480
+    tactile_width = 640
+    wrist_width = 480
+    header_height = 64
+    gap = 2
+    tactile_panel = np.full(
+        (panel_height, tactile_width, 3), (24, 24, 24), dtype=np.uint8
+    )
+    valid_count = 0
+    marker_count = 0
+    detected_count = None
+    mean_displacement = 0.0
+    max_displacement = 0.0
+
+    tactile_rgb = None if tactile_frame is None else tactile_frame.tactile_rgb
+    if tactile_rgb is not None:
+        tactile = np.asarray(tactile_rgb, dtype=np.uint8)
+        if tactile.ndim == 4 and tactile.shape[0] == 1:
+            tactile = tactile[0]
+        if tactile.ndim != 3 or tactile.shape[-1] != 3:
+            raise ValueError(
+                f"Preview TacThru RGB must have shape [1,H,W,3] or [H,W,3], got {tactile.shape}"
+            )
+        tactile_bgr = cv2.cvtColor(tactile, cv2.COLOR_RGB2BGR)
+
+        reference_value = tactile_frame.marker_reference_pixels
+        current_value = tactile_frame.marker_current_pixels
+        valid_value = tactile_frame.marker_valid_mask
+        displacement_value = tactile_frame.marker_displacement_history
+        if (
+            reference_value is not None
+            and current_value is not None
+            and valid_value is not None
+            and displacement_value is not None
+        ):
+            reference = np.asarray(reference_value, dtype=np.float32)
+            current = np.asarray(current_value, dtype=np.float32)
+            valid = np.asarray(valid_value, dtype=np.bool_)
+            displacement = np.asarray(displacement_value, dtype=np.float32)
+            if reference.ndim == 3 and reference.shape[0] == 1:
+                reference = reference[0]
+            if current.ndim == 3 and current.shape[0] == 1:
+                current = current[0]
+            if valid.ndim == 3 and valid.shape[0] == 1:
+                valid = valid[0, -1]
+            if displacement.ndim == 4 and displacement.shape[0] == 1:
+                displacement = displacement[0, -1]
+            expected_points = (TACTILE_MARKER_COUNT, 2)
+            if reference.shape != expected_points or current.shape != expected_points:
+                raise ValueError(
+                    "Preview marker coordinates must both have shape "
+                    f"{expected_points}, got {reference.shape} and {current.shape}"
+                )
+            if valid.shape != (TACTILE_MARKER_COUNT,):
+                raise ValueError(
+                    "Preview marker validity must have shape "
+                    f"{(TACTILE_MARKER_COUNT,)}, got {valid.shape}"
+                )
+            if displacement.shape != expected_points:
+                raise ValueError(
+                    "Preview marker displacement must have shape "
+                    f"{expected_points}, got {displacement.shape}"
+                )
+            finite_reference = np.isfinite(reference).all(axis=-1)
+            finite_current = np.isfinite(current).all(axis=-1)
+            display_valid = valid & finite_reference & finite_current
+            marker_count = int(len(valid))
+            valid_count = int(display_valid.sum())
+            finite_displacement = display_valid & np.isfinite(displacement).all(axis=-1)
+            norms = np.linalg.norm(displacement[finite_displacement], axis=-1)
+            if len(norms):
+                mean_displacement = float(norms.mean())
+                max_displacement = float(norms.max())
+
+            for reference_xy, current_xy, reference_is_finite, point_is_valid in zip(
+                reference, current, finite_reference, display_valid
+            ):
+                if not reference_is_finite:
+                    continue
+                reference_point = tuple(np.rint(reference_xy).astype(int))
+                if not point_is_valid:
+                    # Keep the point visible without implying a measured displacement.
+                    cv2.circle(
+                        tactile_bgr,
+                        reference_point,
+                        5,
+                        (145, 145, 145),
+                        1,
+                        cv2.LINE_AA,
+                    )
+                    continue
+                arrow_end = reference_xy + float(arrow_scale) * (current_xy - reference_xy)
+                cv2.arrowedLine(
+                    tactile_bgr,
+                    reference_point,
+                    tuple(np.rint(arrow_end).astype(int)),
+                    (0, 205, 255),
+                    2,
+                    cv2.LINE_AA,
+                    tipLength=0.22,
+                )
+                cv2.circle(
+                    tactile_bgr,
+                    reference_point,
+                    6,
+                    (30, 220, 70),
+                    2,
+                    cv2.LINE_AA,
+                )
+                cv2.circle(
+                    tactile_bgr,
+                    tuple(np.rint(current_xy).astype(int)),
+                    4,
+                    (30, 30, 235),
+                    -1,
+                    cv2.LINE_AA,
+                )
+
+        detected_count = tactile_frame.debug.get("detected_keypoint_count")
+        tactile_panel = cv2.resize(
+            tactile_bgr,
+            (tactile_width, panel_height),
+            interpolation=cv2.INTER_AREA,
+        )
+    else:
+        cv2.putText(
+            tactile_panel,
+            "TACTILE INPUT WAITING",
+            (155, panel_height // 2),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            (150, 150, 150),
+            2,
+            cv2.LINE_AA,
+        )
+
+    wrist_bgr = cv2.cvtColor(wrist, cv2.COLOR_RGB2BGR)
+    wrist_panel = cv2.resize(
+        wrist_bgr,
+        (wrist_width, panel_height),
+        interpolation=cv2.INTER_LINEAR,
+    )
+    cv2.putText(
+        tactile_panel,
+        "TACTILE RGB + MARKERS",
+        (10, 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        wrist_panel,
+        "WRIST RGB (MODEL INPUT)",
+        (10, 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+    canvas_width = tactile_width + gap + wrist_width
+    canvas = np.full(
+        (header_height + panel_height, canvas_width, 3),
+        (20, 20, 20),
+        dtype=np.uint8,
+    )
+    canvas[header_height:, :tactile_width] = tactile_panel
+    canvas[header_height:, tactile_width + gap :] = wrist_panel
+    gate_label, gate_color = _gate_preview_status(tactile_frame)
+    cv2.putText(
+        canvas,
+        status,
+        (12, 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    detected_text = "n/a" if detected_count is None else str(detected_count)
+    cv2.putText(
+        canvas,
+        (
+            f"{gate_label} | valid={valid_count}/{marker_count or TACTILE_MARKER_COUNT} "
+            f"detected={detected_text} mean|d|={mean_displacement:.5f} "
+            f"max|d|={max_displacement:.5f} arrows=x{arrow_scale:g}"
+        ),
+        (12, 51),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.51,
+        gate_color,
+        1,
+        cv2.LINE_AA,
+    )
+    return canvas
+
+
+def _show_preview(
+    rgb: np.ndarray,
+    status: str,
+    *,
+    tactile_frame: TactileFrame | None = None,
+    return_key: bool = False,
+) -> int | None:
+    global _PREVIEW_WINDOW_CREATED
+    canvas = _build_preview_canvas(rgb, status, tactile_frame=tactile_frame)
+    if not _PREVIEW_WINDOW_CREATED:
+        cv2.namedWindow(PREVIEW_WINDOW_NAME, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(PREVIEW_WINDOW_NAME, canvas.shape[1], canvas.shape[0])
+        _PREVIEW_WINDOW_CREATED = True
+    cv2.imshow(PREVIEW_WINDOW_NAME, canvas)
     key = cv2.waitKey(1) & 0xFF
-    if key in (ord("q"), ord("Q"), 27):
+    if not return_key and key in (ord("q"), ord("Q"), 27):
         raise KeyboardInterrupt
+    return key if return_key else None
 
 
-def _wait_until(deadline: float, *, preview_rgb: np.ndarray | None, status: str) -> None:
+def _close_preview() -> None:
+    global _PREVIEW_WINDOW_CREATED
+    if not _PREVIEW_WINDOW_CREATED:
+        return
+    try:
+        cv2.destroyWindow(PREVIEW_WINDOW_NAME)
+        cv2.waitKey(1)
+    except cv2.error as exc:
+        print(
+            f"[lingbot-v2-client] OpenCV preview cleanup skipped: {exc}",
+            flush=True,
+        )
+    finally:
+        _PREVIEW_WINDOW_CREATED = False
+
+
+def _wait_until(
+    deadline: float,
+    *,
+    preview_rgb: np.ndarray | None,
+    status: str,
+    preview_tactile_frame: TactileFrame | None = None,
+) -> None:
     while time.time() < deadline:
         if preview_rgb is not None:
-            _show_preview(preview_rgb, status + " | q/Esc: software stop request")
+            _show_preview(
+                preview_rgb,
+                status + " | q/Esc: software stop request",
+                tactile_frame=preview_tactile_frame,
+            )
         time.sleep(min(0.02, max(0.0, deadline - time.time())))
 
 

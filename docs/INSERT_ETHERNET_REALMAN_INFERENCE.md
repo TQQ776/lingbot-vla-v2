@@ -20,10 +20,14 @@ env -u LINGBOT_V2_API_KEY bash scripts/run_tacthru_umi_v2_server.sh \
   --host 127.0.0.1 \
   --port 18081 \
   --use-compile \
-  --warmup
+  --warmup \
+  --warmup-instruction "Insert the Ethernet cable."
 ```
 
 首次真机验证先不加 `--use-compile`。服务启动后保持终端运行。
+同一台机器运行 server 和真机 client 时，不需要 SSH 隧道。client 退出只会关闭
+本轮相机、触觉、夹爪、机械臂和 HTTP 连接，不会结束 server；下一轮重新运行 client
+即可复用已加载且已完成 warmup 的模型。
 若启动日志提示 `using checkpoint norm instead of the robot config default`，表示正在用该
 checkpoint 的训练 norm 覆盖共享 robot YAML 中的旧默认值，属于预期行为。
 
@@ -114,3 +118,7 @@ STEPS=20 \
 EXEC_END_STEP=8 \
 bash scripts/real_insert_ethernet.sh
 ```
+
+`real_insert_ethernet.sh` 默认固定执行半开区间 `[2, EXEC_END_STEP)`，不会根据网络延迟
+向后平移；因此上面的 `EXEC_END_STEP=8` 始终执行 `[2,8)`。如需恢复原来的在线延迟
+补偿，可设置 `LINGBOT_V2_FIXED_EXEC_WINDOW=0`。

@@ -210,11 +210,19 @@ def save_vtla_runtime_metadata(model: "torch.nn.Module", args_train) -> dict[str
     )
     region_names = []
     if settings.use_markers:
-        region_names = (
-            ["global"]
-            if settings.marker_tokenization.num_regions == 1
-            else ["left-top", "right-top", "left-bottom", "right-bottom"]
-        )
+        if settings.marker_tokenization.mode == "global":
+            region_names = ["global"]
+        elif settings.marker_tokenization.mode == "regional":
+            region_names = [
+                "left-top",
+                "right-top",
+                "left-bottom",
+                "right-bottom",
+            ]
+        else:
+            region_names = [
+                f"marker-{index:02d}" for index in range(settings.num_markers)
+            ]
     region_ids = encoder.marker_region_ids.detach().cpu()
     mapping = {
         "version": 1,

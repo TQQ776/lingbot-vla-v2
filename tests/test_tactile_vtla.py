@@ -46,6 +46,7 @@ TactileVTLAConfig = _tactile_model.TactileVTLAConfig
 concatenate_vtla_context = _tactile_model.concatenate_vtla_context
 load_marker_statistics = _tactile_model.load_marker_statistics
 load_vtla_checkpoint_state_dict = _tactile_model.load_vtla_checkpoint_state_dict
+migrate_legacy_tactile_config = _tactile_model.migrate_legacy_tactile_config
 validate_marker_displacement_history = _tactile_model.validate_marker_displacement_history
 left_pad_marker_history = _tactile_data.left_pad_marker_history
 prepare_tactile_sample = _tactile_data.prepare_tactile_sample
@@ -96,6 +97,46 @@ def test_saved_marker_stats_remain_portable_without_original_path(tmp_path):
     )
     assert settings.marker_mean == (1.0, 2.0)
     assert settings.marker_std == pytest.approx((0.5, 0.6))
+
+
+def test_legacy_four_channel_config_migration_is_explicit_and_global():
+    legacy = {
+        "enabled": True,
+        "num_sensors": 1,
+        "sensor_names": ["left"],
+        "num_markers": 48,
+        "use_rgb": True,
+        "use_markers": True,
+        "marker_input_features": 4,
+        "marker_tokens_per_sensor": 1,
+        "marker_flow_keys": ["observation.tactile.marker_flow_left"],
+        "marker_positions_keys": ["observation.tactile.marker_positions_left"],
+        "marker_reference_keys": ["observation.tactile.marker_reference_left"],
+        "marker_valid_mask_keys": ["observation.tactile.marker_valid_left"],
+        "marker_mean": [0.0, 0.0, 0.0, 0.0],
+        "marker_std": [1.0, 1.0, 1.0, 1.0],
+    }
+
+    strict, report = migrate_legacy_tactile_config(legacy)
+    assert strict == legacy
+    assert report is None
+    with pytest.raises(ValueError, match="marker_input_features"):
+        TactileVTLAConfig.from_mapping(strict)
+
+    migrated, report = migrate_legacy_tactile_config(
+        legacy, allow_legacy_marker_reinit=True
+    )
+    settings = TactileVTLAConfig.from_mapping(migrated)
+    assert report["requires_marker_module_reinitialization"] is True
+    assert settings.marker_input_features == 2
+    assert settings.marker_history_length == 8
+    assert settings.marker_tokens_per_sensor == 8
+    assert settings.marker_tokenization.mode == "global"
+    assert settings.marker_position_encoding.temporal_type == "learned"
+    assert settings.marker_displacement_keys == (
+        "observation.tactile.marker_displacement_left",
+    )
+    assert TactileVTLAConfig.from_mapping(settings.to_dict()) == settings
 
 
 def test_marker_history_uses_only_displacement_and_masks_invalid_markers():

@@ -20,6 +20,13 @@ rgb_marker_global_8_no_gate:
   marker_contact_gate: {enabled: false, mode: none, target: marker_only}
   gate_tactile_rgb: false
 
+rgb_marker_point_spatiotemporal_192_history4:
+  marker_history_length: 4
+  marker_tokenization: {mode: point_spatiotemporal, num_regions: 48, region_layout: points, aggregation: mean_max, include_reference_xy: true, point_hidden_dim: 128, region_hidden_dim: 512}
+  marker_position_encoding: {temporal_type: sincos, spatial_type: sincos, use_real_time: true, combination: additive}
+  marker_contact_gate: {enabled: true, mode: global_active_count_hysteresis_soft_region, target: marker_only, regional_soft_gate: false}
+  gate_tactile_rgb: false
+
 rgb_marker_regional_32_no_pos:
   marker_position_encoding: {temporal_type: none, spatial_type: none, use_real_time: true, combination: additive}
   marker_contact_gate: {enabled: false, mode: none, target: marker_only}

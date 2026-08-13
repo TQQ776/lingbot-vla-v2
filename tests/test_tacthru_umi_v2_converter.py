@@ -20,6 +20,7 @@ from tools.convert_tacthru_zarr_to_lerobot_v2 import (  # noqa: E402
     migrate_cloned_marker_feature,
     build_pose8,
     make_episode_plan,
+    resolve_marker_validity,
 )
 
 
@@ -63,7 +64,7 @@ def test_manifest_declares_v2_native_temporal_layout() -> None:
     )
 
     assert manifest["converter"] == "tacthru_umi_v2_native_30hz"
-    assert manifest["converter_version"] == CONVERTER_VERSION == 6
+    assert manifest["converter_version"] == CONVERTER_VERSION == 7
     assert manifest["source_fps"] == manifest["output_fps"] == DATASET_FPS == 30
     assert manifest["source_episodes"] == manifest["output_episodes"] == 2
     assert manifest["source_frames"] == manifest["output_frames"] == 115
@@ -106,6 +107,7 @@ def test_manifest_declares_vtla_tactile_contract_when_enabled() -> None:
     assert tactile["copied_to_lerobot"] is True
     assert tactile["num_markers"] == 48
     assert tactile["marker_representation"] == "normalized_displacement"
+    assert tactile["marker_valid_source"] == "finite_coordinates_fallback"
     assert tactile["formula"] == (
         "2 * (current_xy - reference_xy) / [image_width, image_height]"
     )
@@ -125,6 +127,23 @@ def test_marker_displacement_feature_has_exact_rank_two_schema() -> None:
     marker = features[MARKER_DISPLACEMENT_FEATURE]
     assert marker["shape"] == (48, 2)
     assert marker["names"] is None
+
+
+def test_marker_validity_combines_tracker_mask_with_finite_coordinates() -> None:
+    marker = np.asarray(
+        [[0.1, 0.2], [0.3, 0.4], [np.nan, 0.5]],
+        dtype=np.float32,
+    )
+    tracker_valid = np.asarray([True, False, True], dtype=bool)
+
+    np.testing.assert_array_equal(
+        resolve_marker_validity(marker, tracker_valid),
+        [True, False, False],
+    )
+    np.testing.assert_array_equal(
+        resolve_marker_validity(marker),
+        [True, True, False],
+    )
 
 
 def test_hardlinked_legacy_marker_migration_does_not_modify_source(tmp_path) -> None:

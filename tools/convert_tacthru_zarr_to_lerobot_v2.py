@@ -33,7 +33,7 @@ from tqdm import tqdm
 SOURCE_FPS = 30
 DATASET_FPS = SOURCE_FPS
 ACTION_CHUNK_SIZE = 50
-CONVERTER_VERSION = 6
+CONVERTER_VERSION = 7
 MANIFEST_NAME = "tacthru_umi_v2_conversion.json"
 ROBOT_TYPE = "realman_tacthru_umi_v2"
 
@@ -56,6 +56,8 @@ EXCLUDED_TACTILE_SOURCE_KEYS = (
     "tacthru_r_rgb",
     "tacthru_l_marker",
     "tacthru_r_marker",
+    "tacthru_l_marker_valid",
+    "tacthru_r_marker_valid",
 )
 
 
@@ -212,10 +214,46 @@ def inspect_tactile_source(root: Any) -> dict[str, Any]:
     total_frames = int(root["meta/episode_ends"][-1])
     if len(data["tacthru_l_rgb"]) != total_frames or marker_shape[0] != total_frames:
         raise ValueError("Left tactile RGB/marker timelines must match episode_ends")
+    marker_valid_source_key = None
+    if "tacthru_l_marker_valid" in data:
+        marker_valid_source_key = "tacthru_l_marker_valid"
+        marker_valid = data[marker_valid_source_key]
+        marker_valid_shape = tuple(int(value) for value in marker_valid.shape)
+        if marker_valid_shape != marker_shape[:-1]:
+            raise ValueError(
+                "tacthru_l_marker_valid must have shape "
+                f"{marker_shape[:-1]}, got {marker_valid_shape}"
+            )
+        if np.dtype(marker_valid.dtype) != np.dtype(np.bool_):
+            raise ValueError(
+                "tacthru_l_marker_valid must have dtype bool, "
+                f"got {marker_valid.dtype}"
+            )
     return {
         "tactile_rgb_shape": rgb_shape,
         "num_markers": marker_shape[1],
+        "marker_valid_source_key": marker_valid_source_key,
     }
+
+
+def resolve_marker_validity(
+    marker_displacement: Any,
+    stored_validity: Any | None = None,
+) -> np.ndarray:
+    """Combine tracker quality with finite-coordinate validity."""
+
+    marker = np.asarray(marker_displacement)
+    if marker.ndim != 2 or marker.shape[-1] != 2:
+        raise ValueError(f"marker displacement must have shape (M,2), got {marker.shape}")
+    finite = np.isfinite(marker).all(axis=-1)
+    if stored_validity is None:
+        return finite
+    stored = np.asarray(stored_validity, dtype=np.bool_)
+    if stored.shape != finite.shape:
+        raise ValueError(
+            f"stored marker validity must have shape {finite.shape}, got {stored.shape}"
+        )
+    return finite & stored
 
 
 def make_episode_plan(
@@ -597,6 +635,12 @@ def _requested_manifest(
             "rgb_feature": TACTILE_RGB_FEATURE if include_tactile else None,
             "marker_displacement_feature": MARKER_DISPLACEMENT_FEATURE if include_tactile else None,
             "marker_valid_feature": MARKER_VALID_FEATURE if include_tactile else None,
+            "marker_valid_source": (
+                None
+                if not include_tactile
+                else tactile_info.get("marker_valid_source_key")
+                or "finite_coordinates_fallback"
+            ),
             "num_markers": None if tactile_info is None else tactile_info["num_markers"],
             "marker_representation": "normalized_displacement" if include_tactile else None,
             "formula": (
@@ -765,6 +809,7 @@ def convert(args: argparse.Namespace) -> None:
             wrist_images = np.asarray(data["camera0_rgb"][source_slice], dtype=np.uint8)
             tactile_images = None
             marker_displacement = None
+            marker_validity = None
             if args.include_tactile:
                 tactile_images = np.asarray(
                     data["tacthru_l_rgb"][source_slice], dtype=np.uint8
@@ -772,11 +817,18 @@ def convert(args: argparse.Namespace) -> None:
                 marker_displacement = np.asarray(
                     data["tacthru_l_marker"][source_slice], dtype=np.float32
                 )
+                marker_valid_source_key = tactile_info["marker_valid_source_key"]
+                if marker_valid_source_key is not None:
+                    marker_validity = np.asarray(
+                        data[marker_valid_source_key][source_slice], dtype=np.bool_
+                    )
 
             expected_length = source_episode["length"]
             lengths = [len(poses), len(wrist_images)]
             if tactile_images is not None:
                 lengths.extend([len(tactile_images), len(marker_displacement)])
+                if marker_validity is not None:
+                    lengths.append(len(marker_validity))
             if any(length != expected_length for length in lengths):
                 raise RuntimeError(
                     "Contiguous slice length mismatch for "
@@ -795,7 +847,12 @@ def convert(args: argparse.Namespace) -> None:
                     }
                 if args.include_tactile:
                     marker = marker_displacement[frame_offset]
-                    valid = np.isfinite(marker).all(axis=-1)
+                    stored_valid = (
+                        None
+                        if marker_validity is None
+                        else marker_validity[frame_offset]
+                    )
+                    valid = resolve_marker_validity(marker, stored_valid)
                     if not valid.all():
                         marker = np.where(valid[:, None], marker, 0.0).astype(np.float32)
                     frame.update(
