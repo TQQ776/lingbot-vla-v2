@@ -305,6 +305,8 @@ class RealmanEpisodeRuntime:
         observation_timestamp: float,
         control_frequency_hz: float,
         now: float | None = None,
+        exec_start_step: int | None = None,
+        exec_end_step: int | None = None,
     ) -> ActionPlan:
         if self.base_start_pose is None:
             raise RuntimeError("Episode start pose is not initialized")
@@ -329,6 +331,8 @@ class RealmanEpisodeRuntime:
             observation_timestamp=float(observation_timestamp),
             control_frequency_hz=float(control_frequency_hz),
             now=now,
+            exec_start_step=exec_start_step,
+            exec_end_step=exec_end_step,
         )
         selected = actions[indices]
         if len(selected) == 0:
@@ -547,12 +551,20 @@ class RealmanEpisodeRuntime:
         observation_timestamp: float,
         control_frequency_hz: float,
         now: float,
+        exec_start_step: int | None = None,
+        exec_end_step: int | None = None,
     ) -> tuple[np.ndarray, dict[str, Any]]:
         dt = 1.0 / control_frequency_hz
         online_delay_s = max(0.0, now - observation_timestamp + self.cfg.robot_action_latency_s)
         delay_steps = max(0, math.ceil(online_delay_s / dt - 1e-9))
-        configured_start = max(0, int(self.cfg.exec_start_step))
-        configured_end = min(action_horizon, int(self.cfg.exec_end_step))
+        configured_start = max(
+            0,
+            int(self.cfg.exec_start_step if exec_start_step is None else exec_start_step),
+        )
+        configured_end = min(
+            action_horizon,
+            int(self.cfg.exec_end_step if exec_end_step is None else exec_end_step),
+        )
         if configured_end < configured_start:
             raise ValueError("exec_end_step must be >= exec_start_step")
         configured_count = configured_end - configured_start

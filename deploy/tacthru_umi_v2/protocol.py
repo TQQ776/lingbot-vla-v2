@@ -101,6 +101,35 @@ class FastPredictRequest:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class SlowActionPlanRequest:
+    state: np.ndarray
+    session_id: str
+    context_version: int
+    action_offset: int = 0
+    request_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    timestamp: float = field(default_factory=time.time)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class TactileRefineRequest:
+    state: np.ndarray
+    marker_displacement_history: np.ndarray
+    marker_valid_mask: np.ndarray
+    marker_history_valid_mask: np.ndarray
+    marker_contact_state: np.ndarray | None
+    tactile_sensor_mask: np.ndarray
+    session_id: str
+    context_version: int
+    plan_version: int
+    action_offset: int
+    request_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    marker_timestamp: float = field(default_factory=time.time)
+    control_frequency_hz: float = CONTROL_FREQUENCY_HZ
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
 def observation_to_payload(obs: Observation, *, jpeg_quality: int = 90) -> dict[str, Any]:
     instruction = _validate_instruction(obs.instruction)
     state = validate_state8(obs.state)
@@ -308,6 +337,104 @@ def fast_predict_to_json(request: FastPredictRequest) -> bytes:
 
 def fast_predict_from_json(data: bytes) -> FastPredictRequest:
     return fast_predict_from_payload(_strict_json_loads(data))
+
+
+def slow_action_plan_to_payload(request: SlowActionPlanRequest) -> dict[str, Any]:
+    return {
+        "protocol": PROTOCOL_NAME,
+        "protocol_version": PROTOCOL_VERSION,
+        "request_id": _validate_identifier(request.request_id, "request_id"),
+        "session_id": _validate_identifier(request.session_id, "session_id"),
+        "timestamp": _validate_timestamp(request.timestamp),
+        "context_version": _validate_positive_version(
+            request.context_version, "context_version"
+        ),
+        "action_offset": _validate_action_offset(request.action_offset),
+        "state": validate_state8(request.state).astype(float).tolist(),
+        "metadata": _validate_metadata(request.metadata),
+    }
+
+
+def slow_action_plan_from_payload(payload: dict[str, Any]) -> SlowActionPlanRequest:
+    _validate_protocol(payload)
+    return SlowActionPlanRequest(
+        state=validate_state8(np.asarray(payload.get("state"), dtype=np.float32)),
+        session_id=_validate_identifier(payload.get("session_id"), "session_id"),
+        context_version=_validate_positive_version(
+            payload.get("context_version"), "context_version"
+        ),
+        action_offset=_validate_action_offset(payload.get("action_offset")),
+        request_id=_validate_identifier(payload.get("request_id"), "request_id"),
+        timestamp=_validate_timestamp(payload.get("timestamp")),
+        metadata=dict(_validate_metadata(payload.get("metadata"))),
+    )
+
+
+def slow_action_plan_to_json(request: SlowActionPlanRequest) -> bytes:
+    return _json_bytes(slow_action_plan_to_payload(request))
+
+
+def slow_action_plan_from_json(data: bytes) -> SlowActionPlanRequest:
+    return slow_action_plan_from_payload(_strict_json_loads(data))
+
+
+def tactile_refine_to_payload(request: TactileRefineRequest) -> dict[str, Any]:
+    marker_payload = fast_predict_to_payload(
+        FastPredictRequest(
+            state=request.state,
+            marker_displacement_history=request.marker_displacement_history,
+            marker_valid_mask=request.marker_valid_mask,
+            marker_history_valid_mask=request.marker_history_valid_mask,
+            marker_contact_state=request.marker_contact_state,
+            tactile_sensor_mask=request.tactile_sensor_mask,
+            session_id=request.session_id,
+            context_version=request.context_version,
+            request_id=request.request_id,
+            marker_timestamp=request.marker_timestamp,
+            control_frequency_hz=request.control_frequency_hz,
+            metadata=request.metadata,
+        )
+    )
+    marker_payload["context_version"] = _validate_positive_version(
+        request.context_version, "context_version"
+    )
+    marker_payload["plan_version"] = _validate_positive_version(
+        request.plan_version, "plan_version"
+    )
+    marker_payload["action_offset"] = _validate_action_offset(request.action_offset)
+    return marker_payload
+
+
+def tactile_refine_from_payload(payload: dict[str, Any]) -> TactileRefineRequest:
+    fast = fast_predict_from_payload(payload)
+    return TactileRefineRequest(
+        state=fast.state,
+        marker_displacement_history=fast.marker_displacement_history,
+        marker_valid_mask=fast.marker_valid_mask,
+        marker_history_valid_mask=fast.marker_history_valid_mask,
+        marker_contact_state=fast.marker_contact_state,
+        tactile_sensor_mask=fast.tactile_sensor_mask,
+        session_id=fast.session_id,
+        context_version=_validate_positive_version(
+            payload.get("context_version"), "context_version"
+        ),
+        plan_version=_validate_positive_version(
+            payload.get("plan_version"), "plan_version"
+        ),
+        action_offset=_validate_action_offset(payload.get("action_offset")),
+        request_id=fast.request_id,
+        marker_timestamp=fast.marker_timestamp,
+        control_frequency_hz=fast.control_frequency_hz,
+        metadata=fast.metadata,
+    )
+
+
+def tactile_refine_to_json(request: TactileRefineRequest) -> bytes:
+    return _json_bytes(tactile_refine_to_payload(request))
+
+
+def tactile_refine_from_json(data: bytes) -> TactileRefineRequest:
+    return tactile_refine_from_payload(_strict_json_loads(data))
 
 
 def action_response_to_payload(
@@ -698,6 +825,18 @@ def _validate_tactile_sensor_mask(value: Any) -> np.ndarray:
             f"got {mask.dtype} {mask.shape}"
         )
     return np.ascontiguousarray(mask)
+
+
+def _validate_positive_version(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return int(value)
+
+
+def _validate_action_offset(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 50:
+        raise ValueError("action_offset must be an integer in [0,50]")
+    return int(value)
 
 
 def _validate_rgb_image(

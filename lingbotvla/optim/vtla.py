@@ -54,7 +54,18 @@ def build_vtla_param_groups(
         if identifier in seen:
             raise ValueError(f"Trainable parameter {name} appears more than once")
         seen.add(identifier)
-        if "tactile_encoder." in name:
+        if "tactile_encoder." in name or any(
+            fragment in name
+            for fragment in (
+                "tactile_action_expert.",
+                "tactile_state_proj.",
+                "tactile_action_in_proj.",
+                "tactile_action_out_proj.",
+                "tactile_context_proj.",
+                "tactile_marker_proj.",
+                "tactile_time_mlp.",
+            )
+        ):
             target = "tactile"
         elif any(fragment in name for fragment in ACTION_PARAMETER_FRAGMENTS):
             target = "action_expert"

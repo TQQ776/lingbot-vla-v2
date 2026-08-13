@@ -42,12 +42,16 @@ from .protocol import (
     ActionResponse,
     FastPredictRequest,
     Observation,
+    SlowActionPlanRequest,
     SlowContextRequest,
+    TactileRefineRequest,
     action_response_to_payload,
     action_spec,
     fast_predict_from_json,
     observation_from_json,
+    slow_action_plan_from_json,
     slow_context_from_json,
+    tactile_refine_from_json,
 )
 from .transforms import ACTION_DIM, STATE_DIM, validate_action_chunk
 
@@ -66,6 +70,16 @@ class ServerSlowContext:
     scene_timestamp: float
     tactile_rgb_timestamp: float
     instruction: str
+    profile_ms: dict[str, float]
+
+
+@dataclass(frozen=True)
+class ServerSlowActionPlan:
+    policy_plan: Any
+    session_id: str
+    context_version: int
+    version: int
+    action_offset: int
     profile_ms: dict[str, float]
 
 
@@ -104,7 +118,9 @@ class LingBotV2Backend:
         self._lock = threading.Lock()
         self._active_session_id: str | None = None
         self._active_slow_context: ServerSlowContext | None = None
+        self._active_slow_action_plan: ServerSlowActionPlan | None = None
         self._slow_cache_version = 0
+        self._slow_action_plan_version = 0
         self._request_count = 0
         self.started_at = time.time()
 
@@ -209,6 +225,16 @@ class LingBotV2Backend:
                     else self._active_slow_context.version
                 ),
             },
+            "cascaded_tactile_flow": {
+                "supported": self._cascaded_supported(),
+                "active_plan": self._active_slow_action_plan is not None,
+                "plan_version": (
+                    None
+                    if self._active_slow_action_plan is None
+                    else self._active_slow_action_plan.version
+                ),
+                "endpoints": ["/action/plan", "/action/refine"],
+            },
             "contract": self.contract,
             "request_count": self._request_count,
             "uptime_s": time.time() - self.started_at,
@@ -230,6 +256,17 @@ class LingBotV2Backend:
             and hasattr(self.policy, "infer_fast")
         )
 
+    def _cascaded_supported(self) -> bool:
+        config = getattr(self.policy, "config", None)
+        refinement = dict(getattr(config, "tactile_refinement", {}) or {})
+        return bool(
+            self._slow_fast_supported()
+            and refinement.get("enabled")
+            and refinement.get("mode") == "cascaded_flow"
+            and hasattr(self.policy, "build_slow_action_plan")
+            and hasattr(self.policy, "refine_action_with_tactile")
+        )
+
     def refresh_slow_context(self, request: SlowContextRequest) -> dict[str, Any]:
         if not self._slow_fast_supported():
             raise RuntimeError("Loaded checkpoint does not support VTLA slow/fast caching")
@@ -244,6 +281,7 @@ class LingBotV2Backend:
                 self.policy.reset(robo_name=ROBOT_CONFIG)
                 self._active_session_id = request.session_id
                 self._active_slow_context = None
+                self._active_slow_action_plan = None
             raw = {
                 "observation.state": np.asarray(
                     [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float32
@@ -278,6 +316,7 @@ class LingBotV2Backend:
                 profile_ms=dict(pending.profile_ms),
             )
             self._active_slow_context = active
+            self._active_slow_action_plan = None
             return {
                 "protocol": PROTOCOL_NAME,
                 "protocol_version": PROTOCOL_VERSION,
@@ -296,6 +335,138 @@ class LingBotV2Backend:
         finally:
             self._lock.release()
 
+    def build_slow_action_plan(
+        self, request: SlowActionPlanRequest
+    ) -> dict[str, Any]:
+        if not self._cascaded_supported():
+            raise RuntimeError("Loaded checkpoint does not support cascaded tactile flow")
+        acquired = self._lock.acquire(timeout=self.inference_lock_timeout_s)
+        if not acquired:
+            raise BackendBusy("Inference backend is busy")
+        started = time.perf_counter()
+        try:
+            active = self._active_slow_context
+            if active is None:
+                raise ValueError("No active slow context; call /context/refresh first")
+            if request.session_id != active.session_id:
+                self._active_slow_context = None
+                self._active_slow_action_plan = None
+                self._active_session_id = request.session_id
+                raise ValueError("Plan request session does not match active slow context")
+            if request.context_version != active.version:
+                raise ValueError(
+                    f"Plan context_version={request.context_version} does not match "
+                    f"active={active.version}"
+                )
+            raw = {"observation.state": request.state}
+            policy_plan = self.policy.build_slow_action_plan(
+                active.policy_context,
+                raw,
+                action_offset=request.action_offset,
+            )
+            self._slow_action_plan_version += 1
+            plan = ServerSlowActionPlan(
+                policy_plan=policy_plan,
+                session_id=request.session_id,
+                context_version=active.version,
+                version=self._slow_action_plan_version,
+                action_offset=request.action_offset,
+                profile_ms=dict(policy_plan.profile_ms),
+            )
+            self._active_slow_action_plan = plan
+            total_s = time.perf_counter() - started
+            return {
+                "protocol": PROTOCOL_NAME,
+                "protocol_version": PROTOCOL_VERSION,
+                "request_id": request.request_id,
+                "session_id": request.session_id,
+                "context_version": active.version,
+                "plan_version": plan.version,
+                "action_offset": plan.action_offset,
+                "metadata": {
+                    "slow_action_plan_latency_s": total_s,
+                    "profile_ms": plan.profile_ms,
+                },
+            }
+        finally:
+            self._lock.release()
+
+    def refine_action_with_tactile(
+        self, request: TactileRefineRequest
+    ) -> dict[str, Any]:
+        if not np.isclose(request.control_frequency_hz, CONTROL_FREQUENCY_HZ, atol=1e-6):
+            raise ValueError("Tactile refine control frequency does not match checkpoint")
+        if not self._cascaded_supported():
+            raise RuntimeError("Loaded checkpoint does not support cascaded tactile flow")
+        acquired = self._lock.acquire(timeout=self.inference_lock_timeout_s)
+        if not acquired:
+            raise BackendBusy("Inference backend is busy")
+        started = time.perf_counter()
+        try:
+            active = self._active_slow_context
+            plan = self._active_slow_action_plan
+            if active is None or plan is None:
+                raise ValueError("No active slow action plan; call /action/plan first")
+            if request.session_id != active.session_id or request.session_id != plan.session_id:
+                self._active_slow_context = None
+                self._active_slow_action_plan = None
+                self._active_session_id = request.session_id
+                raise ValueError("Refine request session does not match active plan")
+            if request.context_version != active.version or plan.context_version != active.version:
+                raise ValueError("Refine request context_version does not match active plan")
+            if request.plan_version != plan.version:
+                raise ValueError(
+                    f"Refine plan_version={request.plan_version} does not match "
+                    f"active={plan.version}"
+                )
+            if request.action_offset < plan.action_offset:
+                raise ValueError(
+                    "action_offset cannot move backward before the plan's initial offset"
+                )
+            marker_observation = Observation(
+                instruction=active.instruction,
+                state=request.state,
+                wrist_rgb=np.zeros((224, 224, 3), dtype=np.uint8),
+                marker_displacement_history=request.marker_displacement_history,
+                marker_valid_mask=request.marker_valid_mask,
+                marker_history_valid_mask=request.marker_history_valid_mask,
+                marker_contact_state=request.marker_contact_state,
+                tactile_sensor_mask=request.tactile_sensor_mask,
+            )
+            marker_inputs = _model_tactile_observation(
+                marker_observation,
+                {**self.tactile_contract, "use_rgb": False},
+            )
+            raw = {"observation.state": request.state, **marker_inputs}
+            result, profile = self.policy.refine_action_with_tactile(
+                plan.policy_plan,
+                raw,
+                action_offset=request.action_offset,
+            )
+            action = np.asarray(result["action"], dtype=np.float32)
+            if action.ndim == 3 and action.shape[0] == 1:
+                action = action[0]
+            action = validate_action_chunk(action, expected_steps=self.chunk_size)
+            total_s = time.perf_counter() - started
+            return action_response_to_payload(
+                action_chunk=action,
+                request_id=request.request_id,
+                session_id=request.session_id,
+                expected_steps=self.chunk_size,
+                metadata={
+                    "backend": "lingbot-vla-v2-tacthru-umi-cascaded",
+                    "context_version_used": active.version,
+                    "plan_version_used": plan.version,
+                    "action_offset": request.action_offset,
+                    "marker_timestamp": request.marker_timestamp,
+                    "tactile_refinement_latency_s": total_s,
+                    "server_total_ms": total_s * 1000.0,
+                    "profile_ms": profile,
+                },
+            )
+        finally:
+            self._lock.release()
+
     def predict_fast(self, request: FastPredictRequest) -> dict[str, Any]:
         if not np.isclose(request.control_frequency_hz, CONTROL_FREQUENCY_HZ, atol=1e-6):
             raise ValueError("Fast request control frequency does not match checkpoint")
@@ -309,6 +480,7 @@ class LingBotV2Backend:
                 raise ValueError("No active slow context; call /context/refresh first")
             if request.session_id != active.session_id:
                 self._active_slow_context = None
+                self._active_slow_action_plan = None
                 self._active_session_id = request.session_id
                 raise ValueError("Fast request session does not match active slow context")
             if (
@@ -398,6 +570,7 @@ class LingBotV2Backend:
                 self.policy.reset(robo_name=ROBOT_CONFIG)
                 self._active_session_id = observation.session_id
                 self._active_slow_context = None
+                self._active_slow_action_plan = None
             reset_s = time.perf_counter() - reset_started
 
             model_observation = {
@@ -464,9 +637,61 @@ class LingBotV2Backend:
             metadata={"synthetic": True, "episode_reset": True},
         )
         started = time.time()
-        response = self.predict(observation)
+        if self._cascaded_supported():
+            assert observation.tactile_rgb is not None
+            assert observation.marker_displacement_history is not None
+            assert observation.marker_valid_mask is not None
+            assert observation.marker_history_valid_mask is not None
+            assert observation.tactile_sensor_mask is not None
+            refresh = self.refresh_slow_context(
+                SlowContextRequest(
+                    instruction=instruction,
+                    wrist_rgb=observation.wrist_rgb,
+                    tactile_rgb=observation.tactile_rgb,
+                    tactile_sensor_mask=observation.tactile_sensor_mask,
+                    session_id=observation.session_id,
+                    scene_timestamp=observation.timestamp,
+                    tactile_rgb_timestamp=observation.timestamp,
+                    metadata={"synthetic": True, "episode_reset": True},
+                )
+            )
+            plan = self.build_slow_action_plan(
+                SlowActionPlanRequest(
+                    state=observation.state,
+                    session_id=observation.session_id,
+                    context_version=int(refresh["context_version"]),
+                    action_offset=0,
+                    timestamp=observation.timestamp,
+                    metadata={"synthetic": True},
+                )
+            )
+            response = self.refine_action_with_tactile(
+                TactileRefineRequest(
+                    state=observation.state,
+                    marker_displacement_history=(
+                        observation.marker_displacement_history
+                    ),
+                    marker_valid_mask=observation.marker_valid_mask,
+                    marker_history_valid_mask=(
+                        observation.marker_history_valid_mask
+                    ),
+                    marker_contact_state=observation.marker_contact_state,
+                    tactile_sensor_mask=observation.tactile_sensor_mask,
+                    session_id=observation.session_id,
+                    context_version=int(refresh["context_version"]),
+                    plan_version=int(plan["plan_version"]),
+                    action_offset=0,
+                    marker_timestamp=observation.timestamp,
+                    metadata={"synthetic": True},
+                )
+            )
+            warmup_mode = "cascaded_flow"
+        else:
+            response = self.predict(observation)
+            warmup_mode = "full_predict"
         return {
             "warmup_s": time.time() - started,
+            "warmup_mode": warmup_mode,
             "instruction": instruction,
             "action_shape": list(np.asarray(response["action_chunk"]).shape),
         }
@@ -567,7 +792,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.connection.settimeout(self.server.request_timeout_s)
             endpoint = self.path.rstrip("/")
-            if endpoint not in {"/predict", "/context/refresh", "/predict_fast"}:
+            if endpoint not in {
+                "/predict",
+                "/context/refresh",
+                "/predict_fast",
+                "/action/plan",
+                "/action/refine",
+            }:
                 self._send_error_json(
                     "not found",
                     status=404,
@@ -619,15 +850,23 @@ class Handler(BaseHTTPRequestHandler):
                 request_value = observation_from_json(raw_body)
             elif endpoint == "/context/refresh":
                 request_value = slow_context_from_json(raw_body)
-            else:
+            elif endpoint == "/predict_fast":
                 request_value = fast_predict_from_json(raw_body)
+            elif endpoint == "/action/plan":
+                request_value = slow_action_plan_from_json(raw_body)
+            else:
+                request_value = tactile_refine_from_json(raw_body)
             timing_s["request_decode_s"] = time.perf_counter() - decode_started
             if endpoint == "/predict":
                 payload = self.server.backend.predict(request_value)
             elif endpoint == "/context/refresh":
                 payload = self.server.backend.refresh_slow_context(request_value)
-            else:
+            elif endpoint == "/predict_fast":
                 payload = self.server.backend.predict_fast(request_value)
+            elif endpoint == "/action/plan":
+                payload = self.server.backend.build_slow_action_plan(request_value)
+            else:
+                payload = self.server.backend.refine_action_with_tactile(request_value)
             metadata = payload.setdefault("metadata", {})
             server_timing_s = metadata.setdefault("server_timing_s", {})
             server_timing_s.update(timing_s)

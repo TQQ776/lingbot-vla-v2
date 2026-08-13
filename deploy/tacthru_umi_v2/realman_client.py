@@ -39,11 +39,15 @@ from .protocol import (
     ActionResponse,
     FastPredictRequest,
     Observation,
+    SlowActionPlanRequest,
     SlowContextRequest,
+    TactileRefineRequest,
     action_response_from_json,
     fast_predict_to_json,
     observation_to_json,
+    slow_action_plan_to_json,
     slow_context_to_json,
+    tactile_refine_to_json,
     validate_action_spec,
 )
 from .realman_runtime import RealmanConfig, RealmanEpisodeRuntime, SafetyViolation
@@ -423,6 +427,54 @@ class LingBotV2HttpClient:
         self.last_request_timing = timing
         return response, timing
 
+    def build_slow_action_plan(self, request: SlowActionPlanRequest) -> dict[str, Any]:
+        body = slow_action_plan_to_json(request)
+        data, timing = self._request_bytes(
+            "POST",
+            "/action/plan",
+            body=body,
+            headers={**self._headers(), "Content-Type": "application/json"},
+            retry_safe=False,
+        )
+        payload = json.loads(data.decode("utf-8"))
+        if payload.get("request_id") != request.request_id:
+            raise ValueError("Slow action plan response request_id mismatch")
+        if payload.get("session_id") != request.session_id:
+            raise ValueError("Slow action plan response session_id mismatch")
+        self.last_request_timing = timing
+        return payload
+
+    def refine_action_timed(
+        self,
+        request: TactileRefineRequest,
+        *,
+        expected_steps: int,
+    ) -> tuple[ActionResponse, dict[str, Any]]:
+        total_started = time.perf_counter()
+        encode_started = time.perf_counter()
+        body = tactile_refine_to_json(request)
+        encode_s = time.perf_counter() - encode_started
+        data, transport_timing = self._request_bytes(
+            "POST",
+            "/action/refine",
+            body=body,
+            headers={**self._headers(), "Content-Type": "application/json"},
+            retry_safe=False,
+        )
+        response = action_response_from_json(
+            data,
+            expected_request_id=request.request_id,
+            expected_session_id=request.session_id,
+            expected_steps=expected_steps,
+        )
+        timing = {
+            "http_encode_ms": encode_s * 1000.0,
+            **transport_timing,
+            "total_s": time.perf_counter() - total_started,
+        }
+        self.last_request_timing = timing
+        return response, timing
+
     def _headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json"}
         if self.api_key:
@@ -736,6 +788,36 @@ class LingBotV2InProcessClient:
             raise RuntimeError("LingBot V2 in-process client is closed")
         started = time.perf_counter()
         payload = self.backend.predict_fast(request)
+        response = action_response_from_json(
+            json.dumps(payload, allow_nan=False).encode("utf-8"),
+            expected_request_id=request.request_id,
+            expected_session_id=request.session_id,
+            expected_steps=expected_steps,
+        )
+        timing = {
+            "transport": "inprocess",
+            "http_encode_ms": 0.0,
+            "network_ms": 0.0,
+            "total_s": time.perf_counter() - started,
+        }
+        self.last_request_timing = timing
+        return response, timing
+
+    def build_slow_action_plan(self, request: SlowActionPlanRequest) -> dict[str, Any]:
+        if self._closed:
+            raise RuntimeError("LingBot V2 in-process client is closed")
+        return self.backend.build_slow_action_plan(request)
+
+    def refine_action_timed(
+        self,
+        request: TactileRefineRequest,
+        *,
+        expected_steps: int,
+    ) -> tuple[ActionResponse, dict[str, Any]]:
+        if self._closed:
+            raise RuntimeError("LingBot V2 in-process client is closed")
+        started = time.perf_counter()
+        payload = self.backend.refine_action_with_tactile(request)
         response = action_response_from_json(
             json.dumps(payload, allow_nan=False).encode("utf-8"),
             expected_request_id=request.request_id,
@@ -1266,6 +1348,12 @@ def run_realman(
         and isinstance(cache_health, dict)
         and cache_health.get("supported") is True
     )
+    cascaded_health = health.get("cascaded_tactile_flow", {})
+    use_cascaded = bool(
+        use_slow_fast
+        and isinstance(cascaded_health, dict)
+        and cascaded_health.get("supported") is True
+    )
     if args.slow_fast_cache and not use_slow_fast:
         print(
             "[lingbot-v2-client] slow/fast cache is unavailable; falling back to /predict",
@@ -1274,6 +1362,15 @@ def run_realman(
     effective_exec_end = args.exec_end_step
     if effective_exec_end is None:
         effective_exec_end = 4 if use_slow_fast else 8
+    exec_window_size = int(effective_exec_end) - int(args.exec_start_step)
+    if exec_window_size <= 0:
+        raise ValueError("Execution window must contain at least one action")
+    if use_cascaded:
+        print(
+            "[lingbot-v2-client] cascaded tactile flow enabled: "
+            "one immutable slow plan will be refined across advancing action windows",
+            flush=True,
+        )
     if not 0 <= args.min_valid_markers <= TACTILE_MARKER_COUNT:
         raise ValueError(
             f"--min-valid-markers must be in [0,{TACTILE_MARKER_COUNT}], "
@@ -1374,6 +1471,8 @@ def run_realman(
     )
     session_id = uuid.uuid4().hex
     context_version: int | None = None
+    slow_plan_version: int | None = None
+    action_offset = int(args.exec_start_step)
     error: str | None = None
     try:
         if tactile_contract["enabled"]:
@@ -1519,6 +1618,8 @@ def run_realman(
                     )
                     refresh_response = client.refresh_slow_context(refresh)
                     context_version = int(refresh_response["context_version"])
+                    slow_plan_version = None
+                    action_offset = int(args.exec_start_step)
                     _append_log(
                         log_path,
                         {
@@ -1529,22 +1630,72 @@ def run_realman(
                         },
                     )
                 request_started = time.perf_counter()
-                fast_request = FastPredictRequest(
-                    state=snapshot.state,
-                    marker_displacement_history=tactile_frame.marker_displacement_history,
-                    marker_valid_mask=tactile_frame.marker_valid_mask,
-                    marker_history_valid_mask=tactile_frame.marker_history_valid_mask,
-                    marker_contact_state=tactile_frame.marker_contact_state,
-                    tactile_sensor_mask=tactile_frame.tactile_sensor_mask,
-                    session_id=session_id,
-                    context_version=context_version,
-                    marker_timestamp=tactile_frame.capture_timestamp,
-                    control_frequency_hz=args.control_frequency,
-                    metadata={"client_step": step_index},
-                )
-                response, latency = client.predict_fast_timed(
-                    fast_request, expected_steps=chunk_size
-                )
+                if use_cascaded:
+                    if slow_plan_version is None or action_offset >= chunk_size:
+                        action_offset = int(args.exec_start_step)
+                        plan_response = client.build_slow_action_plan(
+                            SlowActionPlanRequest(
+                                state=snapshot.state,
+                                session_id=session_id,
+                                context_version=int(context_version),
+                                action_offset=action_offset,
+                                timestamp=snapshot.timestamp,
+                                metadata={"client_step": step_index},
+                            )
+                        )
+                        slow_plan_version = int(plan_response["plan_version"])
+                        _append_log(
+                            log_path,
+                            {
+                                "event": "slow_action_plan_built",
+                                "timestamp": time.time(),
+                                "step": step_index,
+                                **plan_response,
+                            },
+                        )
+                    refine_request = TactileRefineRequest(
+                        state=snapshot.state,
+                        marker_displacement_history=(
+                            tactile_frame.marker_displacement_history
+                        ),
+                        marker_valid_mask=tactile_frame.marker_valid_mask,
+                        marker_history_valid_mask=(
+                            tactile_frame.marker_history_valid_mask
+                        ),
+                        marker_contact_state=tactile_frame.marker_contact_state,
+                        tactile_sensor_mask=tactile_frame.tactile_sensor_mask,
+                        session_id=session_id,
+                        context_version=int(context_version),
+                        plan_version=int(slow_plan_version),
+                        action_offset=action_offset,
+                        marker_timestamp=tactile_frame.capture_timestamp,
+                        control_frequency_hz=args.control_frequency,
+                        metadata={"client_step": step_index},
+                    )
+                    response, latency = client.refine_action_timed(
+                        refine_request, expected_steps=chunk_size
+                    )
+                else:
+                    fast_request = FastPredictRequest(
+                        state=snapshot.state,
+                        marker_displacement_history=(
+                            tactile_frame.marker_displacement_history
+                        ),
+                        marker_valid_mask=tactile_frame.marker_valid_mask,
+                        marker_history_valid_mask=(
+                            tactile_frame.marker_history_valid_mask
+                        ),
+                        marker_contact_state=tactile_frame.marker_contact_state,
+                        tactile_sensor_mask=tactile_frame.tactile_sensor_mask,
+                        session_id=session_id,
+                        context_version=context_version,
+                        marker_timestamp=tactile_frame.capture_timestamp,
+                        control_frequency_hz=args.control_frequency,
+                        metadata={"client_step": step_index},
+                    )
+                    response, latency = client.predict_fast_timed(
+                        fast_request, expected_steps=chunk_size
+                    )
             else:
                 request_started = time.perf_counter()
                 response, latency = client.predict_timed(
@@ -1599,7 +1750,15 @@ def run_realman(
                 observation_state=snapshot.state,
                 observation_timestamp=observation_timestamp,
                 control_frequency_hz=args.control_frequency,
+                exec_start_step=action_offset if use_cascaded else None,
+                exec_end_step=(
+                    min(action_offset + exec_window_size, chunk_size)
+                    if use_cascaded
+                    else None
+                ),
             )
+            if use_cascaded and len(plan.selected_indices):
+                action_offset = int(plan.selected_indices[-1]) + 1
             execution_started = time.perf_counter()
             execution = runtime.execute_plan(plan) if args.execute else None
             verification = None

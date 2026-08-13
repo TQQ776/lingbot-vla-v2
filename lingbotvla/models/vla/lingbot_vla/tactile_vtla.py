@@ -1537,6 +1537,16 @@ _CONFIG_DERIVED_MARKER_SUFFIXES = (
     "marker_gate_soft_thresholds",
 )
 
+_TACTILE_REFINEMENT_PREFIXES = (
+    "tactile_action_expert.",
+    "tactile_state_proj.",
+    "tactile_action_in_proj.",
+    "tactile_action_out_proj.",
+    "tactile_context_proj.",
+    "tactile_marker_proj.",
+    "tactile_time_mlp.",
+)
+
 
 def load_vtla_checkpoint_state_dict(
     model: nn.Module,
@@ -1564,6 +1574,18 @@ def load_vtla_checkpoint_state_dict(
         for name in target
         if any(name.endswith(suffix) for suffix in _CONFIG_DERIVED_MARKER_SUFFIXES)
     }
+    refinement_target = {
+        name
+        for name in target
+        if any(prefix in name for prefix in _TACTILE_REFINEMENT_PREFIXES)
+    }
+    supplied_has_refinement = any(
+        any(prefix in name for prefix in _TACTILE_REFINEMENT_PREFIXES)
+        for name in supplied
+    )
+    refinement_initialized = (
+        refinement_target if refinement_target and not supplied_has_refinement else set()
+    )
     intentionally_ignored: list[str] = []
     reinitialized: list[str] = []
     config_incompatibilities: list[str] = []
@@ -1659,7 +1681,7 @@ def load_vtla_checkpoint_state_dict(
     incompatible = model.load_state_dict(supplied, strict=False)
     missing = sorted(incompatible.missing_keys)
     unexpected = sorted(set(unexpected) | set(incompatible.unexpected_keys))
-    allowed_missing = set(reinitialized) | config_initialized
+    allowed_missing = set(reinitialized) | config_initialized | refinement_initialized
     missing_config_initialized = set(missing) & config_initialized
     forbidden_missing = sorted(set(missing) - allowed_missing)
     if forbidden_missing or unexpected:
@@ -1682,6 +1704,9 @@ def load_vtla_checkpoint_state_dict(
         "unexpected_keys": unexpected,
         "shape_mismatches": shape_mismatches,
         "config_incompatibilities": sorted(set(config_incompatibilities)),
+        "tactile_refinement_initialized_keys": sorted(
+            set(missing) & refinement_initialized
+        ),
     }
 
 
