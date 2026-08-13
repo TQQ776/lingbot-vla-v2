@@ -1,5 +1,18 @@
 # VTLA slow/fast inference cache
 
+![LingBot-VLA VTLA Slow/Fast architecture](./VTLA_SLOW_FAST_ARCHITECTURE.svg)
+
+Editable Graphviz source: `VTLA_SLOW_FAST_ARCHITECTURE.dot`.
+
+Regenerate the rendered files with:
+
+```bash
+dot -Tsvg docs/VTLA_SLOW_FAST_ARCHITECTURE.dot \
+  -o docs/VTLA_SLOW_FAST_ARCHITECTURE.svg
+dot -Tpng -Gdpi=180 docs/VTLA_SLOW_FAST_ARCHITECTURE.dot \
+  -o docs/VTLA_SLOW_FAST_ARCHITECTURE.png
+```
+
 This inference-only path is based on the `marker_token_192` contract:
 
 - one TacThru sensor;

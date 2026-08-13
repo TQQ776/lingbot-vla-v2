@@ -1,0 +1,237 @@
+digraph VTLASlowFastArchitecture {
+  graph [
+    rankdir=TB,
+    bgcolor="#F7F9FC",
+    pad=0.30,
+    nodesep=0.26,
+    ranksep=0.42,
+    splines=ortho,
+    compound=true,
+    newrank=true,
+    fontname="Noto Sans CJK SC",
+    fontsize=25,
+    labelloc=t,
+    label="当前 LingBot-VLA 2.0 + TacThru VTLA Slow/Fast 架构（192 Marker Tokens）"
+  ];
+
+  node [
+    shape=rect,
+    style="rounded,filled",
+    fontname="Noto Sans CJK SC",
+    fontsize=10.5,
+    penwidth=1.4,
+    margin="0.13,0.09",
+    color="#64748B",
+    fillcolor="#FFFFFF",
+    fontcolor="#172033"
+  ];
+  edge [
+    fontname="Noto Sans CJK SC",
+    fontsize=8.5,
+    color="#64748B",
+    fontcolor="#475569",
+    penwidth=1.4,
+    arrowsize=0.70
+  ];
+
+  subgraph cluster_inputs {
+    label="1  在线输入";
+    color="#CBD5E1";
+    fillcolor="#FFFFFF";
+    style="rounded,filled";
+    penwidth=1.4;
+
+    scene_rgb [label="腕部场景 RGB\n当前帧", fillcolor="#E6F0FF", color="#4C78A8"];
+    language [label="语言指令\n例如：插入网线", fillcolor="#FFE8D6", color="#E07A5F"];
+    tactile_rgb [label="TacThru RGB\n单传感器当前帧", fillcolor="#DFF7F2", color="#2A9D8F"];
+    marker_history [label="Marker 位移历史\n[B,1,4,48,2]\n4 帧 × 48 点 × (dx,dy)", fillcolor="#E8F6E8", color="#4C9F70", penwidth=2.0];
+    contact_state [label="全局 Contact Gate 状态\n最新帧触发 + hysteresis/hold", fillcolor="#FFF0E5", color="#F28E2B"];
+    robot_state [label="机器人状态\nEEF pose 7D + gripper 1D\npad 到 55D", fillcolor="#FFF2CC", color="#D9A321"];
+    flow_input [label="Flow 输入\nnoisy action xₜ [50,55]\n+ timestep t", fillcolor="#FFF2CC", color="#D9A321"];
+    {rank=same; scene_rgb; language; tactile_rgb; marker_history; contact_state; robot_state; flow_input;}
+  }
+
+  subgraph cluster_tokenization {
+    label="2  Token 构造";
+    color="#CBD5E1";
+    fillcolor="#FFFFFF";
+    style="rounded,filled";
+    penwidth=1.4;
+
+    shared_vit [
+      label="共享且冻结的 Qwen3-VL ViT\nScene RGB 与 TacThru RGB 同批编码",
+      fillcolor="#DDEBFF",
+      color="#4C78A8",
+      penwidth=2.0
+    ];
+    language_embed [label="Qwen3-VL\n语言 Embedding", fillcolor="#FFE8D6", color="#E07A5F"];
+    scene_tokens [label="Scene visual tokens\n+mRoPE / DeepStack", fillcolor="#E6F0FF", color="#4C78A8"];
+    tactile_tokens [label="TacThru RGB tokens\n+ modality / sensor embedding\n不受 marker gate 屏蔽", fillcolor="#DFF7F2", color="#2A9D8F"];
+    point_encoder [
+      label="Point-Spatiotemporal Marker Encoder\n① (dx,dy) 按训练统计量归一化\n② 拼接标定 reference (x,y)\n③ 每个点独立 Point MLP → VLM hidden\n④ temporal sincos + spatial sincos\n⑤ modality + sensor embedding",
+      fillcolor="#E8F6E8",
+      color="#4C9F70",
+      penwidth=2.0
+    ];
+    marker_tokens [
+      label="192 个 Marker tokens\n4 个时间步 × 48 个物理点\n顺序：time-major, point-minor",
+      fillcolor="#DDF2E2",
+      color="#4C9F70",
+      penwidth=2.0
+    ];
+    gate_mask [
+      label="全局 marker_only Gate\nOFF/无效：mask 全部 192 tokens\nON/HOLD：保留有效 marker tokens\nregional soft gate = false",
+      fillcolor="#FFF0E5",
+      color="#F28E2B",
+      penwidth=1.8
+    ];
+    task_query [label="Learned Task Query tokens\nCurrent / Future auxiliary queries", fillcolor="#F1EAFE", color="#8F63C7"];
+    suffix_embed [label="Action suffix embedding\nstate_proj + action_in_proj\nflow-time MLP + AdaNorm", fillcolor="#FFF2CC", color="#D9A321"];
+
+    {rank=same; shared_vit; language_embed; point_encoder; gate_mask; suffix_embed;}
+    {rank=same; scene_tokens; tactile_tokens; marker_tokens; task_query;}
+  }
+
+  subgraph cluster_slow {
+    label="3A  Slow Refresh：低频场景上下文（POST /context/refresh）";
+    color="#7EA6D8";
+    fillcolor="#F1F7FF";
+    style="rounded,filled";
+    penwidth=2.0;
+
+    slow_prefix [
+      label="固定因果前缀\n[ Scene | Language | TacThru RGB ]",
+      fillcolor="#E6F0FF",
+      color="#4C78A8",
+      penwidth=2.0
+    ];
+    slow_vlm [
+      label="冻结的 Qwen3-VL Understanding Stream\n36 层 causal Transformer\n一次完整 Slow 前向",
+      fillcolor="#DDEBFF",
+      color="#4C78A8",
+      penwidth=2.2
+    ];
+    slow_cache [
+      label="不可变 Slow KV Cache\n每层 K/V + mask + input IDs\n+mRoPE position + visual grid\n按 session/version 原子替换",
+      shape=cylinder,
+      fillcolor="#CFE2FA",
+      color="#356EAD",
+      penwidth=2.2
+    ];
+    {rank=same; slow_prefix; slow_vlm; slow_cache;}
+  }
+
+  subgraph cluster_fast {
+    label="3B  Fast Replan：高频触觉与动作（POST /predict_fast）";
+    color="#72B08A";
+    fillcolor="#F1FAF4";
+    style="rounded,filled";
+    penwidth=2.0;
+
+    fast_tail [
+      label="动态因果尾部\n[ 192 Marker | Task Query ]\n沿用完整前缀的 mRoPE 位置",
+      fillcolor="#E8F6E8",
+      color="#4C9F70",
+      penwidth=2.0
+    ];
+    vlm_continuation [
+      label="Qwen3-VL 36 层 continuation\n读取 Slow KV，只计算 Marker/Query\n得到本次重规划的完整 Prefix KV",
+      fillcolor="#DDF2E2",
+      color="#4C9F70",
+      penwidth=2.2
+    ];
+    working_cache [
+      label="一次性 Working KV\nSlow + Marker + Query\n仅供本次 Flow Matching 使用\n完成后丢弃，绝不写回 Slow KV",
+      shape=cylinder,
+      fillcolor="#D8F0DF",
+      color="#3F8B5D",
+      penwidth=2.2
+    ];
+    {rank=same; fast_tail; vlm_continuation; working_cache;}
+  }
+
+  subgraph cluster_action {
+    label="4  Action Expert 与 Flow Matching";
+    color="#D8B34D";
+    fillcolor="#FFFBED";
+    style="rounded,filled";
+    penwidth=1.8;
+
+    coupled_action [
+      label="36 × Coupled Transformer / Action Stream\nAction Q 读取 Working Prefix K/V\nhidden 768 + AdaNorm(time)\n32 routed experts, Top-4 + shared expert",
+      fillcolor="#FFF2CC",
+      color="#D9A321",
+      penwidth=2.2
+    ];
+    velocity [label="速度场 vθ(xₜ,t | context,state)\nAction suffix output [50,55]", fillcolor="#FFF2CC", color="#D9A321"];
+    euler [label="Euler 去噪 × 10\n每一步更新 noisy action\nWorking KV 全程复用", fillcolor="#FFE9A8", color="#C99313", penwidth=2.0];
+    action_chunk [label="动作 chunk\n50 steps × 55D", fillcolor="#FFF2CC", color="#D9A321"];
+    physical_action [label="Unpad + Unnormalize\n物理动作 8D\nEEF pose 7D + gripper 1D", fillcolor="#E8F6E8", color="#4C9F70"];
+    realman [label="RealMan 真机执行\nSlow/Fast 默认 action[2:4)\n执行 2 个 waypoint 后重新采样", fillcolor="#DFF7F2", color="#2A9D8F", penwidth=2.0];
+    {rank=same; coupled_action; velocity; euler; action_chunk; physical_action; realman;}
+  }
+
+  subgraph cluster_training {
+    label="5  训练路径（保持原样，Slow/Fast 仅是推理优化）";
+    color="#D9A6C2";
+    fillcolor="#FFF7FB";
+    style="rounded,dashed,filled";
+    penwidth=1.6;
+
+    full_train_prefix [
+      label="完整前缀一次构造并联合训练\n[ Scene | Language | TacThru RGB | 192 Marker | Task Query ]",
+      fillcolor="#FCE7F3",
+      color="#DB7093",
+      style="rounded,dashed,filled"
+    ];
+    train_model [
+      label="同一 36 层 VLM + Action Expert\nVLM/ViT 冻结，Marker Encoder 与 Action Expert 可训练",
+      fillcolor="#FCE7F3",
+      color="#DB7093",
+      style="rounded,dashed,filled"
+    ];
+    train_loss [
+      label="Flow Matching loss\n+ Current/Future depth/video 辅助 loss\n未来图像是监督目标，不是推理输入",
+      fillcolor="#FCE7F3",
+      color="#DB7093",
+      style="rounded,dashed,filled"
+    ];
+    {rank=same; full_train_prefix; train_model; train_loss;}
+  }
+
+  scene_rgb -> shared_vit [color="#4C78A8"];
+  tactile_rgb -> shared_vit [color="#2A9D8F"];
+  language -> language_embed [color="#E07A5F"];
+  shared_vit -> scene_tokens [color="#4C78A8"];
+  shared_vit -> tactile_tokens [color="#2A9D8F"];
+  marker_history -> point_encoder [color="#4C9F70"];
+  point_encoder -> marker_tokens [color="#4C9F70"];
+  contact_state -> gate_mask [color="#F28E2B"];
+  gate_mask -> marker_tokens [label="attention mask", style=dashed, color="#F28E2B"];
+  robot_state -> suffix_embed [color="#D9A321"];
+  flow_input -> suffix_embed [color="#D9A321"];
+
+  scene_tokens -> slow_prefix [color="#4C78A8"];
+  language_embed -> slow_prefix [color="#E07A5F"];
+  tactile_tokens -> slow_prefix [color="#2A9D8F"];
+  slow_prefix -> slow_vlm [color="#4C78A8"];
+  slow_vlm -> slow_cache [label="构建/刷新", color="#356EAD"];
+
+  marker_tokens -> fast_tail [color="#4C9F70"];
+  task_query -> fast_tail [color="#8F63C7"];
+  slow_cache -> vlm_continuation [label="只读", color="#356EAD", penwidth=2.0];
+  fast_tail -> vlm_continuation [color="#4C9F70"];
+  vlm_continuation -> working_cache [label="本次请求", color="#3F8B5D"];
+
+  suffix_embed -> coupled_action [label="每个去噪步重算", color="#D9A321"];
+  working_cache -> coupled_action [label="10 步复用", color="#3F8B5D", penwidth=2.0];
+  coupled_action -> velocity [color="#D9A321"];
+  velocity -> euler [color="#D9A321"];
+  euler -> coupled_action [label="更新 xₜ", color="#C99313", style=dashed, constraint=false];
+  euler -> action_chunk [label="t → 0", color="#D9A321"];
+  action_chunk -> physical_action;
+  physical_action -> realman;
+  action_chunk -> full_train_prefix [style=invis, weight=80];
+  full_train_prefix -> train_model [style=dashed, color="#DB7093", label="完整前向"];
+  train_model -> train_loss [style=dashed, color="#DB7093"];
+}
