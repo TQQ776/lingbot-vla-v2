@@ -6,11 +6,17 @@ import pytest
 from deploy.tacthru_umi_v2.protocol import (
     PROTOCOL_VERSION,
     ActionResponse,
+    FastPredictRequest,
     Observation,
+    SlowContextRequest,
     action_response_from_payload,
     action_response_to_payload,
+    fast_predict_from_payload,
+    fast_predict_to_payload,
     observation_from_payload,
     observation_to_payload,
+    slow_context_from_payload,
+    slow_context_to_payload,
 )
 
 
@@ -224,3 +230,49 @@ def test_response_spec_cannot_claim_more_steps_than_payload() -> None:
     payload["action_chunk"] = payload["action_chunk"][:5]
     with pytest.raises(ValueError, match="Expected 50 action steps"):
         action_response_from_payload(payload)
+
+
+def test_slow_context_roundtrip_contains_both_rgb_images_and_timestamps() -> None:
+    request = SlowContextRequest(
+        instruction="Insert the Ethernet cable",
+        wrist_rgb=np.zeros((224, 224, 3), dtype=np.uint8),
+        tactile_rgb=np.zeros((1, 480, 640, 3), dtype=np.uint8),
+        tactile_sensor_mask=np.ones((1,), dtype=np.bool_),
+        session_id="session-cache",
+        request_id="refresh-1",
+        scene_timestamp=10.0,
+        tactile_rgb_timestamp=10.1,
+    )
+
+    payload = slow_context_to_payload(request, jpeg_quality=100)
+    decoded = slow_context_from_payload(payload)
+
+    assert "scene_rgb" in payload
+    assert "tactile_rgb" in payload
+    assert decoded.session_id == "session-cache"
+    assert decoded.scene_timestamp == pytest.approx(10.0)
+    assert decoded.tactile_rgb_timestamp == pytest.approx(10.1)
+
+
+def test_fast_payload_is_marker_only_and_contains_no_rgb_data() -> None:
+    tactile = tactile_observation(history_length=4)
+    request = FastPredictRequest(
+        state=tactile.state,
+        marker_displacement_history=tactile.marker_displacement_history,
+        marker_valid_mask=tactile.marker_valid_mask,
+        marker_history_valid_mask=tactile.marker_history_valid_mask,
+        marker_contact_state=tactile.marker_contact_state,
+        tactile_sensor_mask=tactile.tactile_sensor_mask,
+        session_id="session-cache",
+        context_version=2,
+        request_id="fast-1",
+        marker_timestamp=10.2,
+    )
+
+    payload = fast_predict_to_payload(request)
+    decoded = fast_predict_from_payload(payload)
+
+    assert "images" not in payload
+    assert "rgb" not in payload["tactile"]
+    assert decoded.context_version == 2
+    assert decoded.marker_displacement_history.shape == (1, 4, 48, 2)

@@ -37,9 +37,13 @@ from .protocol import (
     TACTILE_MARKER_SAMPLE_HZ,
     TACTILE_SENSOR_COUNT,
     ActionResponse,
+    FastPredictRequest,
     Observation,
+    SlowContextRequest,
     action_response_from_json,
+    fast_predict_to_json,
     observation_to_json,
+    slow_context_to_json,
     validate_action_spec,
 )
 from .realman_runtime import RealmanConfig, RealmanEpisodeRuntime, SafetyViolation
@@ -366,6 +370,59 @@ class LingBotV2HttpClient:
         self.last_request_timing = timing
         return response, timing
 
+    def refresh_slow_context(self, request: SlowContextRequest) -> dict[str, Any]:
+        body = slow_context_to_json(request, jpeg_quality=self.jpeg_quality)
+        data, timing = self._request_bytes(
+            "POST",
+            "/context/refresh",
+            body=body,
+            headers={**self._headers(), "Content-Type": "application/json"},
+            retry_safe=False,
+        )
+        payload = json.loads(data.decode("utf-8"))
+        if payload.get("request_id") != request.request_id:
+            raise ValueError("Slow context response request_id mismatch")
+        if payload.get("session_id") != request.session_id:
+            raise ValueError("Slow context response session_id mismatch")
+        self.last_request_timing = timing
+        return payload
+
+    def predict_fast_timed(
+        self,
+        request: FastPredictRequest,
+        *,
+        expected_steps: int,
+    ) -> tuple[ActionResponse, dict[str, Any]]:
+        total_started = time.perf_counter()
+        encode_started = time.perf_counter()
+        body = fast_predict_to_json(request)
+        encode_s = time.perf_counter() - encode_started
+        network_started = time.perf_counter()
+        data, transport_timing = self._request_bytes(
+            "POST",
+            "/predict_fast",
+            body=body,
+            headers={**self._headers(), "Content-Type": "application/json"},
+            retry_safe=False,
+        )
+        request_response_ms = (time.perf_counter() - network_started) * 1000.0
+        response = action_response_from_json(
+            data,
+            expected_request_id=request.request_id,
+            expected_session_id=request.session_id,
+            expected_steps=expected_steps,
+        )
+        server_total_ms = float(response.metadata.get("server_total_ms", 0.0))
+        network_ms = max(0.0, request_response_ms - server_total_ms)
+        timing = {
+            "http_encode_ms": encode_s * 1000.0,
+            **transport_timing,
+            "network_ms": network_ms,
+            "total_s": time.perf_counter() - total_started,
+        }
+        self.last_request_timing = timing
+        return response, timing
+
     def _headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json"}
         if self.api_key:
@@ -664,6 +721,36 @@ class LingBotV2InProcessClient:
         self.last_request_timing = timing
         return response, timing
 
+    def refresh_slow_context(self, request: SlowContextRequest) -> dict[str, Any]:
+        if self._closed:
+            raise RuntimeError("LingBot V2 in-process client is closed")
+        return self.backend.refresh_slow_context(request)
+
+    def predict_fast_timed(
+        self,
+        request: FastPredictRequest,
+        *,
+        expected_steps: int,
+    ) -> tuple[ActionResponse, dict[str, Any]]:
+        if self._closed:
+            raise RuntimeError("LingBot V2 in-process client is closed")
+        started = time.perf_counter()
+        payload = self.backend.predict_fast(request)
+        response = action_response_from_json(
+            json.dumps(payload, allow_nan=False).encode("utf-8"),
+            expected_request_id=request.request_id,
+            expected_session_id=request.session_id,
+            expected_steps=expected_steps,
+        )
+        timing = {
+            "transport": "inprocess",
+            "http_encode_ms": 0.0,
+            "network_ms": 0.0,
+            "total_s": time.perf_counter() - started,
+        }
+        self.last_request_timing = timing
+        return response, timing
+
     def reset_connection(self) -> None:
         """Match the HTTP client's recovery interface; there is no connection to reset."""
 
@@ -805,7 +892,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Closed target width in metres.",
     )
     run.add_argument("--exec-start-step", type=int, default=2)
-    run.add_argument("--exec-end-step", type=int, default=8)
+    run.add_argument("--exec-end-step", type=int, default=None)
+    run.add_argument(
+        "--slow-fast-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use server-side RGB slow context plus marker-only fast replanning when supported.",
+    )
+    run.add_argument(
+        "--slow-refresh-every",
+        type=int,
+        default=0,
+        help="Refresh RGB slow context every N replans; 0 means episode start only.",
+    )
     run.add_argument(
         "--fixed-exec-window",
         action="store_true",
@@ -1143,6 +1242,8 @@ def run_realman(
 ) -> None:
     if args.steps <= 0:
         raise ValueError("--steps must be positive")
+    if args.slow_refresh_every < 0:
+        raise ValueError("--slow-refresh-every must be non-negative")
     for name in (
         "control_frequency",
         "rate_hz",
@@ -1159,6 +1260,20 @@ def run_realman(
     ):
         _require_positive_cli(getattr(args, name), f"--{name.replace('_', '-')}")
     tactile_contract = _tactile_contract_from_health(health)
+    cache_health = health.get("slow_fast_cache", {})
+    use_slow_fast = bool(
+        args.slow_fast_cache
+        and isinstance(cache_health, dict)
+        and cache_health.get("supported") is True
+    )
+    if args.slow_fast_cache and not use_slow_fast:
+        print(
+            "[lingbot-v2-client] slow/fast cache is unavailable; falling back to /predict",
+            flush=True,
+        )
+    effective_exec_end = args.exec_end_step
+    if effective_exec_end is None:
+        effective_exec_end = 4 if use_slow_fast else 8
     if not 0 <= args.min_valid_markers <= TACTILE_MARKER_COUNT:
         raise ValueError(
             f"--min-valid-markers must be in [0,{TACTILE_MARKER_COUNT}], "
@@ -1227,7 +1342,7 @@ def run_realman(
             gripper_hold_closed_below_m=args.gripper_hold_closed_below_m,
             gripper_hold_closed_target_m=args.gripper_hold_closed_target_m,
             exec_start_step=args.exec_start_step,
-            exec_end_step=args.exec_end_step,
+            exec_end_step=effective_exec_end,
             fixed_exec_window=args.fixed_exec_window,
             preserve_exec_window_length=not args.no_preserve_exec_window_length,
             robot_action_latency_s=args.robot_action_latency,
@@ -1258,6 +1373,7 @@ def run_realman(
         health=health,
     )
     session_id = uuid.uuid4().hex
+    context_version: int | None = None
     error: str | None = None
     try:
         if tactile_contract["enabled"]:
@@ -1379,8 +1495,61 @@ def run_realman(
                     f"step={step_index} sending",
                     tactile_frame=tactile_frame,
                 )
-            request_started = time.perf_counter()
-            response, latency = client.predict_timed(observation, expected_steps=chunk_size)
+            if use_slow_fast:
+                if tactile_frame is None or tactile_frame.tactile_rgb is None:
+                    raise SafetyViolation("Slow/fast VTLA cache requires current tactile RGB")
+                refresh_due = bool(
+                    context_version is None
+                    or (
+                        args.slow_refresh_every > 0
+                        and step_index > 0
+                        and step_index % args.slow_refresh_every == 0
+                    )
+                )
+                if refresh_due:
+                    refresh = SlowContextRequest(
+                        instruction=args.instruction,
+                        wrist_rgb=camera_frame.rgb,
+                        tactile_rgb=tactile_frame.tactile_rgb,
+                        tactile_sensor_mask=tactile_frame.tactile_sensor_mask,
+                        session_id=session_id,
+                        scene_timestamp=camera_frame.capture_timestamp,
+                        tactile_rgb_timestamp=tactile_frame.capture_timestamp,
+                        metadata={"episode_reset": step_index == 0},
+                    )
+                    refresh_response = client.refresh_slow_context(refresh)
+                    context_version = int(refresh_response["context_version"])
+                    _append_log(
+                        log_path,
+                        {
+                            "event": "slow_context_refreshed",
+                            "timestamp": time.time(),
+                            "step": step_index,
+                            **refresh_response,
+                        },
+                    )
+                request_started = time.perf_counter()
+                fast_request = FastPredictRequest(
+                    state=snapshot.state,
+                    marker_displacement_history=tactile_frame.marker_displacement_history,
+                    marker_valid_mask=tactile_frame.marker_valid_mask,
+                    marker_history_valid_mask=tactile_frame.marker_history_valid_mask,
+                    marker_contact_state=tactile_frame.marker_contact_state,
+                    tactile_sensor_mask=tactile_frame.tactile_sensor_mask,
+                    session_id=session_id,
+                    context_version=context_version,
+                    marker_timestamp=tactile_frame.capture_timestamp,
+                    control_frequency_hz=args.control_frequency,
+                    metadata={"client_step": step_index},
+                )
+                response, latency = client.predict_fast_timed(
+                    fast_request, expected_steps=chunk_size
+                )
+            else:
+                request_started = time.perf_counter()
+                response, latency = client.predict_timed(
+                    observation, expected_steps=chunk_size
+                )
             roundtrip_s = time.perf_counter() - request_started
             latency = dict(latency)
             latency["outer_roundtrip_s"] = roundtrip_s
@@ -1395,7 +1564,7 @@ def run_realman(
                         "event": "roundtrip_rejected",
                         "timestamp": time.time(),
                         "step": step_index,
-                        "request_id": observation.request_id,
+                        "request_id": response.request_id,
                         "session_id": session_id,
                         "execute": bool(args.execute),
                         "roundtrip_s": roundtrip_s,
@@ -1431,6 +1600,7 @@ def run_realman(
                 observation_timestamp=observation_timestamp,
                 control_frequency_hz=args.control_frequency,
             )
+            execution_started = time.perf_counter()
             execution = runtime.execute_plan(plan) if args.execute else None
             verification = None
             if args.execute and not args.stream_replan and len(plan.timestamps):
@@ -1452,11 +1622,12 @@ def run_realman(
                     gripper_tolerance_m=args.verify_gripper_tolerance_m,
                     timeout_s=args.verification_timeout_s,
                 )
+            robot_execution_ms = (time.perf_counter() - execution_started) * 1000.0
             record = {
                 "event": "step",
                 "timestamp": time.time(),
                 "step": step_index,
-                "request_id": observation.request_id,
+                "request_id": response.request_id,
                 "session_id": session_id,
                 "execute": bool(args.execute),
                 "roundtrip_s": roundtrip_s,
@@ -1474,6 +1645,7 @@ def run_realman(
                 "action_shape": list(response.action_chunk.shape),
                 "plan": plan.debug,
                 "execution": execution,
+                "robot_execution_ms": robot_execution_ms,
                 "verification": verification,
             }
             _append_log(log_path, record)

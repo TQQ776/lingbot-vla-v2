@@ -1,3 +1,6 @@
+import time
+from dataclasses import dataclass, field
+
 import einops
 import torch
 from torch import Tensor, nn
@@ -49,6 +52,38 @@ except Exception:
 
 
 logger = logging.get_logger(__name__)
+
+
+KVCache = dict[int, dict[str, Tensor]]
+
+
+@dataclass(frozen=True)
+class VTLASlowCache:
+    """Immutable VLM cache for Scene -> Language -> tactile RGB."""
+
+    past_key_values: KVCache
+    pad_masks: Tensor
+    att_masks: Tensor
+    input_ids: Tensor
+    position_ids: Tensor
+    rope_grid_thw: Tensor
+    prefix_len: int
+    version: int = 0
+    scene_timestamp: float | None = None
+    tactile_rgb_timestamp: float | None = None
+    profile_ms: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class VTLAFastPrefix:
+    """One-replan working prefix; it must never replace the slow cache."""
+
+    past_key_values: KVCache
+    pad_masks: Tensor
+    position_ids: Tensor
+    marker_token_count: int
+    query_token_count: int
+    profile_ms: dict[str, float] = field(default_factory=dict)
 
 
 class QwenvlWithExpertV2Config(PretrainedConfig):
@@ -301,15 +336,28 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
         past_key_values: Optional[Union[List[torch.FloatTensor], Cache]] = None,
         use_cache: Optional[bool] = None,
         fill_kv_cache: Optional[bool] = None,
+        append_kv_cache: bool = False,
     ):
         if use_cache:
             if past_key_values is None:
                 past_key_values = {}
+            if fill_kv_cache and append_kv_cache:
+                raise ValueError("fill_kv_cache and append_kv_cache are mutually exclusive")
             if fill_kv_cache:
                 past_key_values[layer_idx] = {"key_states": key_states, "value_states": value_states}
             else:
+                if layer_idx not in past_key_values:
+                    raise ValueError(f"Missing cached VLM layer {layer_idx}")
                 key_states = torch.cat([past_key_values[layer_idx]["key_states"], key_states], dim=1)
                 value_states = torch.cat([past_key_values[layer_idx]["value_states"], value_states], dim=1)
+                if append_kv_cache:
+                    # The caller provides a fresh working dict. Cached tensor
+                    # storage is shared, while the permanent slow dict remains
+                    # structurally and numerically unchanged.
+                    past_key_values[layer_idx] = {
+                        "key_states": key_states,
+                        "value_states": value_states,
+                    }
         return key_states, value_states, past_key_values
 
     def _apply_deepstack(self, hidden_states, layer_idx, visual_pos_masks, deepstack_visual_embeds):
@@ -334,6 +382,7 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
         inputs_embeds: List[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         fill_kv_cache: Optional[bool] = None,
+        append_kv_cache: bool = False,
         ada_cond: List[torch.FloatTensor] = None,
         visual_pos_masks: Optional[torch.Tensor] = None,
         deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
@@ -376,15 +425,15 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 fill_kv_cache=fill_kv_cache,
+                append_kv_cache=append_kv_cache,
             )
             if self.config.attention_implementation == "flex_cached":
                 if layer_idx == 0:
-                    _full_len = query_states.shape[1]
                     _full_block_mask = build_block_mask(
                         attention_mask,
                         self.qwenvl.config.text_config.num_attention_heads,
-                        _full_len,
-                        _full_len,
+                        query_states.shape[1],
+                        key_states.shape[1],
                     )
                 att_output = flex_attention_with_block_mask(
                     query_states, key_states, value_states, _full_block_mask, query_states.shape[1]
@@ -827,6 +876,9 @@ class FlowMatchingV2(FlowMatchingV1):
         marker_contact_state,
         tactile_sensor_mask,
         tactile_rgb_mask,
+        _slow_only: bool = False,
+        _return_cache_metadata: bool = False,
+        _profile_ms: dict[str, float] | None = None,
     ):
         """Build the Qwen3-VL prefix with RGB and marker tactile tokens.
 
@@ -945,10 +997,23 @@ class FlowMatchingV2(FlowMatchingV1):
 
         flat_images = einops.rearrange(all_images, "b n ... -> (b n) ...")
         flat_grid = einops.rearrange(all_grid, "b n d -> (b n) d")
-        all_img_emb, all_deepstack = self.qwenvl_with_expert.embed_image(
-            flat_images,
-            flat_grid,
-        )
+        if _profile_ms is not None:
+            if flat_images.is_cuda:
+                vit_start = torch.cuda.Event(enable_timing=True)
+                vit_end = torch.cuda.Event(enable_timing=True)
+                vit_start.record()
+            else:
+                vit_started = time.perf_counter()
+        all_img_emb, all_deepstack = self.qwenvl_with_expert.embed_image(flat_images, flat_grid)
+        if _profile_ms is not None:
+            if flat_images.is_cuda:
+                vit_end.record()
+                vit_end.synchronize()
+                _profile_ms["scene_tacrgb_vit_ms"] = float(vit_start.elapsed_time(vit_end))
+            else:
+                _profile_ms["scene_tacrgb_vit_ms"] = (
+                    time.perf_counter() - vit_started
+                ) * 1000.0
         embed_dtype = all_img_emb.dtype
         num_patch = all_img_emb.shape[1]
         total_views = all_images.shape[1]
@@ -1103,7 +1168,7 @@ class FlowMatchingV2(FlowMatchingV1):
             tactile_patch_visual_mask = rgb_patch_mask
 
         marker_token_mask = None
-        if self.tactile_settings.use_markers:
+        if self.tactile_settings.use_markers and not _slow_only:
             if marker_displacement_history is None:
                 marker_displacement_history = torch.zeros(
                     bsize,
@@ -1249,6 +1314,8 @@ class FlowMatchingV2(FlowMatchingV1):
                     _append(lang_emb, lang_masks, lang_tokens.to(device))
                     for block in tactile_blocks:
                         _append(*block)
+                elif _slow_only:
+                    continue
                 elif segment_name == "current_depth":
                     _append(align_embs, align_pad_masks, fake_align_ids)
                 elif segment_name == "future_video_cls":
@@ -1364,13 +1431,217 @@ class FlowMatchingV2(FlowMatchingV1):
             )
             self._tactile_debug_logged = True
 
-        return (
+        result = (
             embs,
             pad_masks,
             att_masks,
             prefix_position_ids,
             full_visual_pos_masks,
             filtered_deepstack,
+        )
+        if _return_cache_metadata:
+            return result + (prefix_input_ids, rope_grid_thw)
+        return result
+
+    def _require_vtla_slow_cache_contract(self) -> None:
+        settings = self.tactile_settings
+        if self.tactile_encoder is None or not settings.enabled:
+            raise RuntimeError("VTLA slow-cache inference requires tactile encoding")
+        if not settings.use_rgb or not settings.use_markers:
+            raise RuntimeError("VTLA slow-cache inference requires tactile RGB and markers")
+        if (
+            settings.num_sensors != 1
+            or settings.marker_history_length != 4
+            or settings.num_markers != 48
+            or settings.marker_tokenization.mode != "point_spatiotemporal"
+        ):
+            raise RuntimeError(
+                "VTLA slow-cache inference is scoped to one sensor and 4x48 "
+                "point-spatiotemporal marker tokens"
+            )
+        if settings.marker_contact_gate.target != "marker_only":
+            raise RuntimeError("VTLA slow-cache inference requires gate target marker_only")
+        if not getattr(self.config, "vlm_causal", False):
+            raise RuntimeError("VTLA slow-cache inference requires vlm_causal=true")
+        if not getattr(self.config, "use_cache", False):
+            raise RuntimeError("VTLA slow-cache inference requires use_cache=true")
+
+    def _build_task_query_tokens(self, batch_size, device, dtype):
+        if not (self.use_depth_align and self.align_type == "query"):
+            hidden_size = self.qwenvl_with_expert.qwenvl.config.text_config.hidden_size
+            return (
+                torch.empty(batch_size, 0, hidden_size, device=device, dtype=dtype),
+                torch.empty(batch_size, 0, device=device, dtype=torch.bool),
+                torch.empty(batch_size, 0, device=device, dtype=torch.long),
+            )
+
+        def _get_align_tokens(tokens):
+            weights = tokens.view(
+                self.num_task_tokens,
+                tokens.shape[0] // self.num_task_tokens,
+                tokens.shape[1],
+            )
+            return weights.mean(dim=1)
+
+        cfg = self.qwenvl_with_expert.qwenvl.config
+        standard_mask = torch.ones(
+            batch_size, self.num_task_tokens, device=device, dtype=torch.bool
+        )
+        standard_ids = torch.full(
+            (batch_size, self.num_task_tokens),
+            cfg.text_config.eos_token_id,
+            device=device,
+            dtype=torch.long,
+        )
+        current_task = _get_align_tokens(self.depth_align_embs)
+        if (
+            getattr(self, "use_future_video", False)
+            and getattr(self, "use_current_video_patch", False)
+            and getattr(self, "use_current_shared_task_proj", False)
+        ):
+            current_task = self.current_shared_task_proj(
+                torch.cat(
+                    [current_task, _get_align_tokens(self.current_video_align_embs)], dim=-1
+                )
+            )
+        future_task = None
+        if self.use_future_depth:
+            future_task = _get_align_tokens(self.future_depth_align_embs)
+            if (
+                getattr(self, "use_future_video", False)
+                and getattr(self, "use_future_video_patch", True)
+                and getattr(self, "future_video_share_future_depth_query", False)
+                and getattr(self, "use_shared_future_task_proj", False)
+            ):
+                future_task = self.future_shared_task_proj(
+                    torch.cat(
+                        [future_task, _get_align_tokens(self.future_video_align_embs)], dim=-1
+                    )
+                )
+
+        parts = []
+        masks = []
+        ids = []
+        for name in prefix_query_segments(
+            use_depth_align=True,
+            use_future_depth=self.use_future_depth,
+            use_future_video=getattr(self, "use_future_video", False),
+            use_future_video_cls=getattr(self, "use_future_video_cls", False),
+            use_future_video_patch=getattr(self, "use_future_video_patch", True),
+            future_video_share_future_depth_query=getattr(
+                self, "future_video_share_future_depth_query", False
+            ),
+        ):
+            if name == "language":
+                continue
+            if name == "current_depth":
+                value, mask, token_ids = current_task, standard_mask, standard_ids
+            elif name == "future_video_cls":
+                value = self.future_video_cls_align_emb.weight
+                mask = torch.ones(batch_size, 1, device=device, dtype=torch.bool)
+                token_ids = torch.full(
+                    (batch_size, 1),
+                    cfg.text_config.eos_token_id,
+                    device=device,
+                    dtype=torch.long,
+                )
+            elif name == "future_video":
+                value = _get_align_tokens(self.future_video_align_embs)
+                mask, token_ids = standard_mask, standard_ids
+            elif name == "future_depth":
+                value, mask, token_ids = future_task, standard_mask, standard_ids
+            else:
+                raise ValueError(f"Unsupported prefix query segment: {name}")
+            parts.append(value.repeat(batch_size, 1, 1).to(device=device, dtype=dtype))
+            masks.append(mask)
+            ids.append(token_ids)
+        return torch.cat(parts, dim=1), torch.cat(masks, dim=1), torch.cat(ids, dim=1)
+
+    def _build_fast_vtla_tail(
+        self,
+        *,
+        marker_displacement_history,
+        marker_valid_mask,
+        marker_history_valid_mask,
+        marker_contact_state,
+        tactile_sensor_mask,
+        batch_size,
+        device,
+        dtype,
+    ):
+        self._require_vtla_slow_cache_contract()
+        if marker_displacement_history is None:
+            raise ValueError("Fast VTLA inference requires marker_displacement_history")
+        if tactile_sensor_mask is None:
+            tactile_sensor_mask = torch.ones(
+                batch_size, 1, device=device, dtype=torch.bool
+            )
+        elif tactile_sensor_mask.ndim == 1 and batch_size == 1:
+            tactile_sensor_mask = tactile_sensor_mask.unsqueeze(0)
+        tactile_sensor_mask = tactile_sensor_mask.to(device=device, dtype=torch.bool)
+        marker_displacement_history = marker_displacement_history.to(
+            device=device, dtype=self.tactile_encoder.marker_dtype
+        )
+        marker_valid_mask = marker_valid_mask.to(device=device, dtype=torch.bool)
+        marker_history_valid_mask = marker_history_valid_mask.to(
+            device=device, dtype=torch.bool
+        )
+        if marker_contact_state is not None:
+            marker_contact_state = marker_contact_state.to(device=device)
+
+        if device.type == "cuda":
+            marker_start = torch.cuda.Event(enable_timing=True)
+            marker_end = torch.cuda.Event(enable_timing=True)
+            marker_start.record()
+        else:
+            marker_started = time.perf_counter()
+        marker_tokens, marker_mask = self.tactile_encoder.encode_markers(
+            marker_displacement_history,
+            marker_valid_mask,
+            marker_history_valid_mask,
+            tactile_sensor_mask,
+            marker_contact_state,
+        )
+        if device.type == "cuda":
+            marker_end.record()
+            marker_end.synchronize()
+            marker_ms = float(marker_start.elapsed_time(marker_end))
+        else:
+            marker_ms = (time.perf_counter() - marker_started) * 1000.0
+        marker_tokens = marker_tokens.to(dtype=dtype).flatten(1, 2)
+        marker_mask = marker_mask.flatten(1, 2)
+        expected_markers = 4 * 48
+        if marker_tokens.shape[1] != expected_markers:
+            raise RuntimeError(
+                f"Expected {expected_markers} marker tokens, got {marker_tokens.shape[1]}"
+            )
+        cfg = self.qwenvl_with_expert.qwenvl.config
+        marker_ids = torch.full(
+            marker_mask.shape,
+            cfg.text_config.eos_token_id,
+            device=device,
+            dtype=torch.long,
+        )
+
+        query_started = time.perf_counter()
+        query_tokens, query_mask, query_ids = self._build_task_query_tokens(
+            batch_size, device, dtype
+        )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        query_ms = (time.perf_counter() - query_started) * 1000.0
+        embs = torch.cat([marker_tokens, query_tokens], dim=1)
+        pad_masks = torch.cat([marker_mask, query_mask], dim=1).bool()
+        input_ids = torch.cat([marker_ids, query_ids], dim=1)
+        att_masks = torch.ones_like(pad_masks)
+        return (
+            embs,
+            pad_masks,
+            att_masks,
+            input_ids,
+            expected_markers,
+            int(query_tokens.shape[1]),
+            {"marker_mlp_ms": marker_ms, "task_query_ms": query_ms},
         )
 
     def _build_full_position_ids(self, prefix_position_ids, prefix_pad_masks, suffix_pad_masks):
@@ -1688,6 +1959,264 @@ class FlowMatchingV2(FlowMatchingV1):
             time += dt
         print(f"Denoise {count} steps")
         return x_t
+
+    @torch.no_grad()
+    def build_slow_cache(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        *,
+        image_grid_thw,
+        tactile_rgb,
+        tactile_rgb_grid_thw,
+        tactile_sensor_mask=None,
+        tactile_rgb_mask=None,
+        scene_timestamp: float | None = None,
+        tactile_rgb_timestamp: float | None = None,
+    ) -> VTLASlowCache:
+        """Build the reusable Scene -> Language -> tactile RGB VLM cache."""
+
+        self._require_vtla_slow_cache_contract()
+        profile: dict[str, float] = {}
+        total_started = time.perf_counter()
+        (
+            slow_embs,
+            slow_pad_masks,
+            slow_att_masks,
+            slow_position_ids,
+            slow_visual_masks,
+            slow_deepstack,
+            slow_input_ids,
+            rope_grid_thw,
+        ) = self._embed_prefix_vtla(
+            images=images,
+            img_masks=img_masks,
+            lang_tokens=lang_tokens,
+            lang_masks=lang_masks,
+            image_grid_thw=image_grid_thw,
+            tactile_rgb=tactile_rgb,
+            tactile_rgb_grid_thw=tactile_rgb_grid_thw,
+            marker_displacement_history=None,
+            marker_valid_mask=None,
+            marker_history_valid_mask=None,
+            marker_contact_state=None,
+            tactile_sensor_mask=tactile_sensor_mask,
+            tactile_rgb_mask=tactile_rgb_mask,
+            _slow_only=True,
+            _return_cache_metadata=True,
+            _profile_ms=profile,
+        )
+        slow_attention = make_att_2d_masks(slow_pad_masks, slow_att_masks)
+        if slow_embs.is_cuda:
+            vlm_start = torch.cuda.Event(enable_timing=True)
+            vlm_end = torch.cuda.Event(enable_timing=True)
+            vlm_start.record()
+        else:
+            vlm_started = time.perf_counter()
+        _, slow_kv, _ = self.qwenvl_with_expert.forward(
+            attention_mask=slow_attention,
+            position_ids=slow_position_ids,
+            vlm_position_ids=slow_position_ids,
+            past_key_values=None,
+            inputs_embeds=[slow_embs, None],
+            use_cache=True,
+            fill_kv_cache=True,
+            visual_pos_masks=slow_visual_masks,
+            deepstack_visual_embeds=slow_deepstack,
+        )
+        if slow_embs.is_cuda:
+            vlm_end.record()
+            vlm_end.synchronize()
+            profile["slow_vlm_ms"] = float(vlm_start.elapsed_time(vlm_end))
+        else:
+            profile["slow_vlm_ms"] = (time.perf_counter() - vlm_started) * 1000.0
+        profile["slow_cache_build_ms"] = (time.perf_counter() - total_started) * 1000.0
+        version = int(getattr(self, "_vtla_slow_cache_version", 0)) + 1
+        self._vtla_slow_cache_version = version
+        return VTLASlowCache(
+            past_key_values=slow_kv,
+            pad_masks=slow_pad_masks,
+            att_masks=slow_att_masks,
+            input_ids=slow_input_ids,
+            position_ids=slow_position_ids,
+            rope_grid_thw=rope_grid_thw,
+            prefix_len=int(slow_embs.shape[1]),
+            version=version,
+            scene_timestamp=scene_timestamp,
+            tactile_rgb_timestamp=tactile_rgb_timestamp,
+            profile_ms=profile,
+        )
+
+    @torch.no_grad()
+    def extend_slow_cache(
+        self,
+        slow_cache: VTLASlowCache,
+        *,
+        marker_displacement_history,
+        marker_valid_mask,
+        marker_history_valid_mask,
+        marker_contact_state,
+        tactile_sensor_mask=None,
+        dtype=None,
+    ) -> VTLAFastPrefix:
+        """Append Marker/Query into a disposable working cache."""
+
+        self._require_vtla_slow_cache_contract()
+        device = slow_cache.pad_masks.device
+        if dtype is None:
+            dtype = next(self.parameters()).dtype
+        (
+            tail_embs,
+            tail_pad_masks,
+            tail_att_masks,
+            tail_input_ids,
+            marker_count,
+            query_count,
+            profile,
+        ) = self._build_fast_vtla_tail(
+            marker_displacement_history=marker_displacement_history,
+            marker_valid_mask=marker_valid_mask,
+            marker_history_valid_mask=marker_history_valid_mask,
+            marker_contact_state=marker_contact_state,
+            tactile_sensor_mask=tactile_sensor_mask,
+            batch_size=slow_cache.pad_masks.shape[0],
+            device=device,
+            dtype=dtype,
+        )
+        full_pad = torch.cat([slow_cache.pad_masks, tail_pad_masks], dim=1)
+        full_att = torch.cat([slow_cache.att_masks, tail_att_masks], dim=1)
+        full_ids = torch.cat([slow_cache.input_ids, tail_input_ids], dim=1)
+        full_position_ids = self.qwenvl_with_expert.build_prefix_position_ids(
+            full_ids,
+            full_pad.long(),
+            image_grid_thw=slow_cache.rope_grid_thw,
+            video_grid_thw=None,
+        )
+        full_attention = make_att_2d_masks(full_pad, full_att)
+        tail_length = tail_embs.shape[1]
+        continuation_attention = full_attention[:, -tail_length:, :]
+        working_kv = {
+            layer: {
+                "key_states": values["key_states"],
+                "value_states": values["value_states"],
+            }
+            for layer, values in slow_cache.past_key_values.items()
+        }
+        if tail_embs.is_cuda:
+            continuation_start = torch.cuda.Event(enable_timing=True)
+            continuation_end = torch.cuda.Event(enable_timing=True)
+            continuation_start.record()
+        else:
+            continuation_started = time.perf_counter()
+        _, full_kv, _ = self.qwenvl_with_expert.forward(
+            attention_mask=continuation_attention,
+            position_ids=full_position_ids[:, :, -tail_length:],
+            vlm_position_ids=full_position_ids[:, :, -tail_length:],
+            past_key_values=working_kv,
+            inputs_embeds=[tail_embs, None],
+            use_cache=True,
+            fill_kv_cache=False,
+            append_kv_cache=True,
+            visual_pos_masks=None,
+            deepstack_visual_embeds=None,
+        )
+        if tail_embs.is_cuda:
+            continuation_end.record()
+            continuation_end.synchronize()
+            profile["marker_query_continuation_ms"] = float(
+                continuation_start.elapsed_time(continuation_end)
+            )
+        else:
+            profile["marker_query_continuation_ms"] = (
+                time.perf_counter() - continuation_started
+            ) * 1000.0
+        if any(
+            values["key_states"].shape[1] != slow_cache.prefix_len
+            for values in slow_cache.past_key_values.values()
+        ):
+            raise RuntimeError("Permanent VTLA slow cache was mutated during continuation")
+        return VTLAFastPrefix(
+            past_key_values=full_kv,
+            pad_masks=full_pad,
+            position_ids=full_position_ids,
+            marker_token_count=marker_count,
+            query_token_count=query_count,
+            profile_ms=profile,
+        )
+
+    @torch.no_grad()
+    def sample_actions_fast(
+        self,
+        slow_cache: VTLASlowCache,
+        state,
+        *,
+        marker_displacement_history,
+        marker_valid_mask,
+        marker_history_valid_mask,
+        marker_contact_state,
+        tactile_sensor_mask=None,
+        noise=None,
+        return_profile: bool = False,
+    ):
+        """Replan from the current marker/state snapshot without any RGB ViT."""
+
+        total_started = time.perf_counter()
+        bsize, device, dtype = state.shape[0], state.device, state.dtype
+        if noise is None:
+            noise = torch.randn(
+                bsize,
+                self.config.n_action_steps,
+                self.config.max_action_dim,
+                device=device,
+                dtype=dtype,
+            )
+        fast_prefix = self.extend_slow_cache(
+            slow_cache,
+            marker_displacement_history=marker_displacement_history,
+            marker_valid_mask=marker_valid_mask,
+            marker_history_valid_mask=marker_history_valid_mask,
+            marker_contact_state=marker_contact_state,
+            tactile_sensor_mask=tactile_sensor_mask,
+            dtype=dtype,
+        )
+        dt = torch.tensor(-1.0 / self.config.num_steps, dtype=dtype, device=device)
+        x_t = noise
+        flow_time = torch.tensor(1.0, dtype=dtype, device=device)
+        fm_started = time.perf_counter()
+        predict_velocity_fn = self.predict_velocity
+        if getattr(self, "_use_compile_predict_velocity", False):
+            predict_velocity_fn = getattr(self, "_compiled_predict_velocity", None)
+            if predict_velocity_fn is None:
+                predict_velocity_fn = torch.compile(
+                    self.predict_velocity,
+                    fullgraph=False,
+                    dynamic=False,
+                    options={"triton.cudagraphs": False},
+                )
+                self._compiled_predict_velocity = predict_velocity_fn
+        count = 0
+        while flow_time >= -dt / 2:
+            count += 1
+            velocity = predict_velocity_fn(
+                state,
+                fast_prefix.pad_masks,
+                fast_prefix.past_key_values,
+                x_t,
+                flow_time.expand(bsize),
+                prefix_position_ids=fast_prefix.position_ids,
+            )
+            x_t += dt * velocity
+            flow_time += dt
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        profile = dict(fast_prefix.profile_ms)
+        profile["fm_sampling_ms"] = (time.perf_counter() - fm_started) * 1000.0
+        profile["fast_replan_total_ms"] = (time.perf_counter() - total_started) * 1000.0
+        self.last_vtla_fast_profile_ms = profile
+        print(f"Denoise {count} steps")
+        return (x_t, profile) if return_profile else x_t
 
     def predict_velocity(
         self,
@@ -2078,11 +2607,19 @@ class LingbotVlaV2Policy(PreTrainedModel):
             tactile_rgb_mask=tactile_rgb_mask,
         )
 
+    def build_slow_cache(self, *args, **kwargs) -> VTLASlowCache:
+        return self.model.build_slow_cache(*args, **kwargs)
+
+    def sample_actions_fast(self, *args, **kwargs):
+        return self.model.sample_actions_fast(*args, **kwargs)
+
 
 ModelClass = LingbotVlaV2Policy
 
 __all__ = [
     "LingbotVlaV2Policy",
+    "VTLASlowCache",
+    "VTLAFastPrefix",
     "Qwen3VLForConditionalGeneration",
     "Qwen3VLTextModel",
     "Qwen3VLPreTrainedModel",

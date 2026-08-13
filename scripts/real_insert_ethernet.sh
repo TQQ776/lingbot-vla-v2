@@ -9,6 +9,7 @@ SERVER_URL="${LINGBOT_V2_SERVER_URL:-http://127.0.0.1:18081}"
 STEPS="${STEPS:-1}"
 MOTION_PROFILE="${LINGBOT_V2_MOTION_PROFILE:-legacy}"
 EXECUTE_REAL="${LINGBOT_V2_EXECUTE:-1}"
+SLOW_FAST_CACHE="${LINGBOT_V2_SLOW_FAST_CACHE:-1}"
 
 # The conservative profile keeps blocking completion verification and every
 # existing safety bound. It only lengthens each interpolated chunk and raises
@@ -30,7 +31,21 @@ case "${MOTION_PROFILE}" in
     ;;
 esac
 
-EXEC_END_STEP="${EXEC_END_STEP:-${DEFAULT_EXEC_END_STEP}}"
+case "${SLOW_FAST_CACHE}" in
+  1|true|TRUE|yes|YES)
+    SLOW_FAST_FLAGS=(--slow-fast-cache)
+    DEFAULT_CACHE_EXEC_END_STEP=4
+    ;;
+  0|false|FALSE|no|NO)
+    SLOW_FAST_FLAGS=(--no-slow-fast-cache)
+    DEFAULT_CACHE_EXEC_END_STEP="${DEFAULT_EXEC_END_STEP}"
+    ;;
+  *)
+    echo "LINGBOT_V2_SLOW_FAST_CACHE must be 0/1 or true/false, got: ${SLOW_FAST_CACHE}" >&2
+    exit 2
+    ;;
+esac
+EXEC_END_STEP="${EXEC_END_STEP:-${DEFAULT_CACHE_EXEC_END_STEP}}"
 MAX_POS_SPEED="${LINGBOT_V2_MAX_POS_SPEED:-${DEFAULT_MAX_POS_SPEED}}"
 MAX_ROT_SPEED="${LINGBOT_V2_MAX_ROT_SPEED:-${DEFAULT_MAX_ROT_SPEED}}"
 GRIPPER_STARTUP_WIDTH_M="${GRIPPER_STARTUP_WIDTH_M:-0.004}"
@@ -110,7 +125,7 @@ export TACTHRU_REPO
 export REALMAN_PYTHON
 cd "$PROJECT_ROOT"
 
-echo "[lingbot-v2-client] motion_profile=${MOTION_PROFILE} exec_window=[2,${EXEC_END_STEP}) fixed_exec_window=${FIXED_EXEC_WINDOW} preview=${PREVIEW} max_pos_speed=${MAX_POS_SPEED}m/s max_rot_speed=${MAX_ROT_SPEED}rad/s"
+echo "[lingbot-v2-client] slow_fast_cache=${SLOW_FAST_CACHE} motion_profile=${MOTION_PROFILE} exec_window=[2,${EXEC_END_STEP}) fixed_exec_window=${FIXED_EXEC_WINDOW} preview=${PREVIEW} max_pos_speed=${MAX_POS_SPEED}m/s max_rot_speed=${MAX_ROT_SPEED}rad/s"
 if [[ ${#EXECUTE_FLAGS[@]} -eq 0 ]]; then
   echo "[lingbot-v2-client] dry-run mode: no arm trajectory or gripper command will be sent"
 fi
@@ -119,6 +134,7 @@ bash scripts/run_tacthru_umi_v2_client.sh run \
   --transport http \
   --server-url "$SERVER_URL" \
   --timeout "${REQUEST_TIMEOUT_S}" \
+  "${SLOW_FAST_FLAGS[@]}" \
   "${HTTP_KEEP_ALIVE_FLAG}" \
   --instruction "Insert the Ethernet cable." \
   --tacthru-repo "$TACTHRU_REPO" \

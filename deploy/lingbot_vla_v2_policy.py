@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import yaml
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 from glob import glob
@@ -56,6 +57,13 @@ BASE_MODEL_PATH = {
         'Qwen/Qwen3-VL-4B-Instruct/',
     ),
 }
+
+
+@dataclass
+class PolicySlowContext:
+    cache: object
+    raw_observation: dict
+    profile_ms: dict[str, float]
 
 class PolicyPreprocessMixin:
     @staticmethod
@@ -236,6 +244,97 @@ class PolicyPreprocessMixin:
         if use_bf16:
             observation["state"] = observation["state"].to(dtype=torch.float32)
         return actions.to(dtype=torch.float32, device="cpu")
+
+    @torch.no_grad()
+    def build_slow_context(
+        self,
+        observation: dict,
+        *,
+        scene_timestamp: float | None,
+        tactile_rgb_timestamp: float | None,
+        use_bf16: bool,
+    ) -> PolicySlowContext:
+        applied = observation
+        profile: dict[str, float] = {}
+        dtype = torch.bfloat16 if use_bf16 else torch.float32
+        device = "cuda"
+        images = applied["images"]
+        img_masks = applied["img_masks"]
+        lang_tokens = applied["lang_tokens"]
+        lang_masks = applied["lang_masks"]
+        if img_masks.ndim == 1:
+            images = images.unsqueeze(0)
+            img_masks = img_masks.unsqueeze(0)
+        if lang_tokens.ndim == 1:
+            lang_tokens = lang_tokens.unsqueeze(0)
+            lang_masks = lang_masks.unsqueeze(0)
+        tactile = self._tactile_model_kwargs(
+            applied, device=device, dtype=dtype, batched=False
+        )
+        cache = self.build_slow_cache(
+            images.to(device=device, dtype=dtype),
+            img_masks.to(device=device),
+            lang_tokens.to(device=device),
+            lang_masks.to(device=device),
+            image_grid_thw=self._to_device_image_grid_thw(
+                applied.get("image_grid_thw"), device
+            ),
+            tactile_rgb=tactile.get("tactile_rgb"),
+            tactile_rgb_grid_thw=tactile.get("tactile_rgb_grid_thw"),
+            tactile_sensor_mask=tactile.get("tactile_sensor_mask"),
+            tactile_rgb_mask=tactile.get("tactile_rgb_mask"),
+            scene_timestamp=scene_timestamp,
+            tactile_rgb_timestamp=tactile_rgb_timestamp,
+        )
+        profile.update(cache.profile_ms)
+        return PolicySlowContext(
+            cache=cache,
+            raw_observation=dict(observation),
+            profile_ms=profile,
+        )
+
+    @torch.no_grad()
+    def infer_fast(
+        self,
+        context: PolicySlowContext,
+        observation: dict,
+        *,
+        use_bf16: bool,
+    ) -> tuple[dict, dict[str, float]]:
+        applied = observation
+        profile: dict[str, float] = {}
+        dtype = torch.bfloat16 if use_bf16 else torch.float32
+        device = "cuda"
+        state = applied["state"]
+        if state.ndim == 1:
+            state = state.unsqueeze(0)
+        dynamic_tactile = {
+            key: applied.get(key)
+            for key in (
+                "marker_displacement_history",
+                "marker_valid_mask",
+                "marker_history_valid_mask",
+                "marker_contact_state",
+                "tactile_sensor_mask",
+            )
+            if applied.get(key) is not None
+        }
+        tactile = self._tactile_model_kwargs(
+            dynamic_tactile, device=device, dtype=dtype, batched=False
+        )
+        actions, model_profile = self.sample_actions_fast(
+            context.cache,
+            state.to(device=device, dtype=dtype),
+            marker_displacement_history=tactile.get("marker_displacement_history"),
+            marker_valid_mask=tactile.get("marker_valid_mask"),
+            marker_history_valid_mask=tactile.get("marker_history_valid_mask"),
+            marker_contact_state=tactile.get("marker_contact_state"),
+            tactile_sensor_mask=tactile.get("tactile_sensor_mask"),
+            return_profile=True,
+        )
+        profile.update(model_profile)
+        actions = actions.to(dtype=torch.float32, device="cpu")
+        return actions, profile
 
 class LingBotVlaV2InferencePolicy(PolicyPreprocessMixin, LingbotVlaV2Policy):
     pass # Only combine necessary functions
@@ -498,6 +597,62 @@ class LingbotVLAv2Server:
         if self.use_bf16:
             observation['state'] = observation['state'].to(torch.bfloat16)
         return observation
+
+    def build_slow_context(
+        self,
+        observation: dict,
+        *,
+        scene_timestamp: float | None,
+        tactile_rgb_timestamp: float | None,
+    ) -> PolicySlowContext:
+        preprocess_started = time.perf_counter()
+        applied = self._prepare_model_input(observation)
+        preprocess_ms = (time.perf_counter() - preprocess_started) * 1000.0
+        context = self.vla.build_slow_context(
+            applied,
+            scene_timestamp=scene_timestamp,
+            tactile_rgb_timestamp=tactile_rgb_timestamp,
+            use_bf16=self.use_bf16,
+        )
+        context.profile_ms["rgb_preprocess_ms"] = preprocess_ms
+        return context
+
+    def infer_fast(self, context: PolicySlowContext, observation: dict):
+        preprocess_started = time.perf_counter()
+        raw_state = {"observation.state": torch.as_tensor(observation["observation.state"])}
+        converted = self.vla.feature_transform.convert_features(raw_state, w_action=False)
+        converted = self.vla.feature_transform.normalizer.normalize(converted)
+        state_parts = []
+        for joint in self.vla.feature_transform.feature_config.joints:
+            key = f"observation.state.{joint}"
+            width = self.vla.feature_transform.feature_config.joints_max_dim[joint]
+            if key in self.vla.feature_transform.states:
+                value = torch.as_tensor(converted[key], dtype=torch.float32)
+                state_parts.append(F.pad(value, (0, width - value.shape[-1])))
+            else:
+                state_parts.append(torch.zeros(width, dtype=torch.float32))
+        state = torch.cat(state_parts, dim=-1)
+        state = F.pad(state, (0, self.config.max_state_dim - state.shape[-1]))
+        applied = dict(context.raw_observation)
+        applied["state"] = state.to(torch.bfloat16 if self.use_bf16 else torch.float32)
+        for key in (
+            "marker_displacement_history",
+            "marker_valid_mask",
+            "marker_history_valid_mask",
+            "marker_contact_state",
+            "tactile_sensor_mask",
+        ):
+            value = observation.get(key)
+            if value is not None:
+                applied[key] = torch.as_tensor(value)
+        preprocess_ms = (time.perf_counter() - preprocess_started) * 1000.0
+        normalized_actions, profile = self.vla.infer_fast(
+            context,
+            applied,
+            use_bf16=self.use_bf16,
+        )
+        profile["fast_preprocess_ms"] = preprocess_ms
+        return self._unapply_batched_actions([applied], normalized_actions), profile
 
     @staticmethod
     def _pad_and_stack_tensors(values):

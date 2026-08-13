@@ -62,6 +62,45 @@ class ActionResponse:
     server_timestamp: float | None = None
 
 
+@dataclass(frozen=True)
+class SlowContextRequest:
+    instruction: str
+    wrist_rgb: np.ndarray
+    tactile_rgb: np.ndarray
+    tactile_sensor_mask: np.ndarray
+    session_id: str
+    request_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    scene_timestamp: float = field(default_factory=time.time)
+    tactile_rgb_timestamp: float = field(default_factory=time.time)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class SlowContextResponse:
+    request_id: str
+    session_id: str
+    context_version: int
+    scene_timestamp: float
+    tactile_rgb_timestamp: float
+    metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class FastPredictRequest:
+    state: np.ndarray
+    marker_displacement_history: np.ndarray
+    marker_valid_mask: np.ndarray
+    marker_history_valid_mask: np.ndarray
+    marker_contact_state: np.ndarray | None
+    tactile_sensor_mask: np.ndarray
+    session_id: str
+    context_version: int | None = None
+    request_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    marker_timestamp: float = field(default_factory=time.time)
+    control_frequency_hz: float = CONTROL_FREQUENCY_HZ
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
 def observation_to_payload(obs: Observation, *, jpeg_quality: int = 90) -> dict[str, Any]:
     instruction = _validate_instruction(obs.instruction)
     state = validate_state8(obs.state)
@@ -124,6 +163,151 @@ def observation_from_payload(payload: dict[str, Any]) -> Observation:
 
 def observation_from_json(data: bytes) -> Observation:
     return observation_from_payload(_strict_json_loads(data))
+
+
+def slow_context_to_payload(
+    request: SlowContextRequest, *, jpeg_quality: int = 90
+) -> dict[str, Any]:
+    sensor_mask = _validate_tactile_sensor_mask(request.tactile_sensor_mask)
+    tactile_rgb = np.asarray(request.tactile_rgb)
+    if (
+        tactile_rgb.dtype != np.uint8
+        or tactile_rgb.ndim != 4
+        or tactile_rgb.shape[0] != TACTILE_SENSOR_COUNT
+        or tactile_rgb.shape[-1] != 3
+    ):
+        raise ValueError("Slow context tactile_rgb must be uint8 [S,H,W,3]")
+    return {
+        "protocol": PROTOCOL_NAME,
+        "protocol_version": PROTOCOL_VERSION,
+        "request_id": _validate_identifier(request.request_id, "request_id"),
+        "session_id": _validate_identifier(request.session_id, "session_id"),
+        "instruction": _validate_instruction(request.instruction),
+        "scene_timestamp": _validate_timestamp(request.scene_timestamp),
+        "tactile_rgb_timestamp": _validate_timestamp(request.tactile_rgb_timestamp),
+        "scene_rgb": encode_rgb_image(
+            request.wrist_rgb,
+            jpeg_quality=jpeg_quality,
+            expected_shape=(WIRE_IMAGE_HEIGHT, WIRE_IMAGE_WIDTH, 3),
+        ),
+        "tactile_rgb": [
+            encode_rgb_image(frame, jpeg_quality=jpeg_quality) for frame in tactile_rgb
+        ],
+        "tactile_sensor_mask": sensor_mask.astype(bool).tolist(),
+        "metadata": _validate_metadata(request.metadata),
+    }
+
+
+def slow_context_from_payload(payload: dict[str, Any]) -> SlowContextRequest:
+    _validate_protocol(payload)
+    rgb = payload.get("tactile_rgb")
+    if not isinstance(rgb, list) or len(rgb) != TACTILE_SENSOR_COUNT:
+        raise ValueError(f"tactile_rgb must contain {TACTILE_SENSOR_COUNT} image")
+    return SlowContextRequest(
+        instruction=_validate_instruction(payload.get("instruction")),
+        wrist_rgb=decode_rgb_image(
+            payload.get("scene_rgb"),
+            expected_shape=(WIRE_IMAGE_HEIGHT, WIRE_IMAGE_WIDTH, 3),
+        ),
+        tactile_rgb=np.stack([decode_rgb_image(frame) for frame in rgb], axis=0),
+        tactile_sensor_mask=_validate_tactile_sensor_mask(
+            payload.get("tactile_sensor_mask")
+        ),
+        session_id=_validate_identifier(payload.get("session_id"), "session_id"),
+        request_id=_validate_identifier(payload.get("request_id"), "request_id"),
+        scene_timestamp=_validate_timestamp(payload.get("scene_timestamp")),
+        tactile_rgb_timestamp=_validate_timestamp(
+            payload.get("tactile_rgb_timestamp")
+        ),
+        metadata=dict(_validate_metadata(payload.get("metadata"))),
+    )
+
+
+def slow_context_to_json(request: SlowContextRequest, *, jpeg_quality: int = 90) -> bytes:
+    return _json_bytes(slow_context_to_payload(request, jpeg_quality=jpeg_quality))
+
+
+def slow_context_from_json(data: bytes) -> SlowContextRequest:
+    return slow_context_from_payload(_strict_json_loads(data))
+
+
+def fast_predict_to_payload(request: FastPredictRequest) -> dict[str, Any]:
+    marker_observation = Observation(
+        instruction="fast-marker-only",
+        state=request.state,
+        wrist_rgb=np.zeros((WIRE_IMAGE_HEIGHT, WIRE_IMAGE_WIDTH, 3), dtype=np.uint8),
+        marker_displacement_history=request.marker_displacement_history,
+        marker_valid_mask=request.marker_valid_mask,
+        marker_history_valid_mask=request.marker_history_valid_mask,
+        marker_contact_state=request.marker_contact_state,
+        tactile_sensor_mask=request.tactile_sensor_mask,
+    )
+    tactile = _tactile_to_payload(marker_observation, jpeg_quality=90)
+    assert tactile is not None and "rgb" not in tactile
+    context_version = request.context_version
+    if context_version is not None and (
+        isinstance(context_version, bool)
+        or not isinstance(context_version, int)
+        or context_version <= 0
+    ):
+        raise ValueError("context_version must be a positive integer or null")
+    return {
+        "protocol": PROTOCOL_NAME,
+        "protocol_version": PROTOCOL_VERSION,
+        "request_id": _validate_identifier(request.request_id, "request_id"),
+        "session_id": _validate_identifier(request.session_id, "session_id"),
+        "marker_timestamp": _validate_timestamp(request.marker_timestamp),
+        "control_frequency_hz": _validate_frequency(request.control_frequency_hz),
+        "context_version": context_version,
+        "state": validate_state8(request.state).astype(float).tolist(),
+        "tactile": tactile,
+        "metadata": _validate_metadata(request.metadata),
+    }
+
+
+def fast_predict_from_payload(payload: dict[str, Any]) -> FastPredictRequest:
+    _validate_protocol(payload)
+    tactile = _tactile_from_payload(payload.get("tactile"))
+    if tactile["tactile_rgb"] is not None:
+        raise ValueError("Fast prediction must not contain tactile RGB")
+    required = (
+        "marker_displacement_history",
+        "marker_valid_mask",
+        "marker_history_valid_mask",
+        "tactile_sensor_mask",
+    )
+    missing = [name for name in required if tactile[name] is None]
+    if missing:
+        raise ValueError(f"Fast prediction is missing marker fields: {missing}")
+    context_version = payload.get("context_version")
+    if context_version is not None and (
+        isinstance(context_version, bool)
+        or not isinstance(context_version, int)
+        or context_version <= 0
+    ):
+        raise ValueError("context_version must be a positive integer or null")
+    return FastPredictRequest(
+        state=validate_state8(np.asarray(payload.get("state"), dtype=np.float32)),
+        marker_displacement_history=tactile["marker_displacement_history"],
+        marker_valid_mask=tactile["marker_valid_mask"],
+        marker_history_valid_mask=tactile["marker_history_valid_mask"],
+        marker_contact_state=tactile["marker_contact_state"],
+        tactile_sensor_mask=tactile["tactile_sensor_mask"],
+        session_id=_validate_identifier(payload.get("session_id"), "session_id"),
+        context_version=context_version,
+        request_id=_validate_identifier(payload.get("request_id"), "request_id"),
+        marker_timestamp=_validate_timestamp(payload.get("marker_timestamp")),
+        control_frequency_hz=_validate_frequency(payload.get("control_frequency_hz")),
+        metadata=dict(_validate_metadata(payload.get("metadata"))),
+    )
+
+
+def fast_predict_to_json(request: FastPredictRequest) -> bytes:
+    return _json_bytes(fast_predict_to_payload(request))
+
+
+def fast_predict_from_json(data: bytes) -> FastPredictRequest:
+    return fast_predict_from_payload(_strict_json_loads(data))
 
 
 def action_response_to_payload(

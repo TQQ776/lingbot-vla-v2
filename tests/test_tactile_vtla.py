@@ -680,6 +680,30 @@ def test_full_vtla_prefix_path_preserves_order_masks_rope_and_deepstack():
     assert int(visual_mask.sum()) == expected_visual_tokens
     assert deepstack[0].shape == (expected_visual_tokens, 8)
 
+    slow_result = harness._embed_prefix_vtla(
+        images=images,
+        img_masks=image_mask,
+        lang_tokens=language,
+        lang_masks=language_mask,
+        image_grid_thw=scene_grid,
+        tactile_rgb=tactile_rgb,
+        tactile_rgb_grid_thw=tactile_grid,
+        marker_displacement_history=None,
+        marker_valid_mask=None,
+        marker_history_valid_mask=None,
+        marker_contact_state=None,
+        tactile_sensor_mask=sensor_mask,
+        tactile_rgb_mask=sensor_mask,
+        _slow_only=True,
+    )
+    slow_length = scene_length + language_length + rgb_length
+    torch.testing.assert_close(slow_result[0], context[:, :slow_length])
+    torch.testing.assert_close(slow_result[1], pad_mask[:, :slow_length])
+    torch.testing.assert_close(slow_result[2], attention_mask[:, :slow_length])
+    torch.testing.assert_close(slow_result[3], position_ids[:, :, :slow_length])
+    torch.testing.assert_close(slow_result[4], visual_mask[:, :slow_length])
+    assert slow_result[0].shape[1] == slow_length
+
 
 def test_flow_matching_and_euler_math_remain_the_original_expressions():
     source = (

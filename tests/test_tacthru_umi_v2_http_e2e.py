@@ -12,7 +12,11 @@ from deploy.tacthru_umi_v2.http_server import (
     _resolve_training_project_path,
     create_http_server,
 )
-from deploy.tacthru_umi_v2.protocol import Observation
+from deploy.tacthru_umi_v2.protocol import (
+    FastPredictRequest,
+    Observation,
+    SlowContextRequest,
+)
 from deploy.tacthru_umi_v2.realman_client import LingBotV2HttpClient, validate_server_health
 
 
@@ -45,6 +49,71 @@ class FakePolicy:
         finally:
             with self.guard:
                 self.active -= 1
+
+
+class FakeCachePolicy(FakePolicy):
+    def __init__(self):
+        tactile = tactile_contract(gated=True, history_length=4)
+        tactile["marker_tokenization"] = {
+            "mode": "point_spatiotemporal",
+            "num_regions": 48,
+        }
+        tactile["marker_reference_xy"] = [
+            [[float(index % 8), float(index // 8)] for index in range(48)]
+        ]
+        super().__init__(tactile=tactile)
+        self.slow_contexts = []
+        self.fast_inputs = []
+
+    def build_slow_context(
+        self, observation, *, scene_timestamp, tactile_rgb_timestamp
+    ):
+        context = SimpleNamespace(
+            raw_observation=dict(observation),
+            profile_ms={"slow_cache_build_ms": 4.0},
+            scene_timestamp=scene_timestamp,
+            tactile_rgb_timestamp=tactile_rgb_timestamp,
+        )
+        self.slow_contexts.append(context)
+        return context
+
+    def infer_fast(self, context, observation):
+        self.fast_inputs.append((context, dict(observation)))
+        actions = np.tile(
+            np.asarray(
+                [0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.03],
+                dtype=np.float32,
+            ),
+            (50, 1),
+        )
+        return {"action": actions}, {"fast_replan_total_ms": 2.0}
+
+
+def _slow_request(session_id: str = "session-cache", value: int = 10):
+    return SlowContextRequest(
+        instruction="Insert the Ethernet cable",
+        wrist_rgb=np.full((224, 224, 3), value, dtype=np.uint8),
+        tactile_rgb=np.full((1, 480, 640, 3), value, dtype=np.uint8),
+        tactile_sensor_mask=np.ones((1,), dtype=np.bool_),
+        session_id=session_id,
+        scene_timestamp=float(value),
+        tactile_rgb_timestamp=float(value) + 0.1,
+    )
+
+
+def _fast_request(session_id: str = "session-cache", context_version: int | None = None):
+    marker = np.zeros((1, 4, 48, 2), dtype=np.float32)
+    return FastPredictRequest(
+        state=np.asarray([0, 0, 0, 0, 0, 0, 1, 0.04], dtype=np.float32),
+        marker_displacement_history=marker,
+        marker_valid_mask=np.ones((1, 4, 48), dtype=np.bool_),
+        marker_history_valid_mask=np.ones((1, 4), dtype=np.bool_),
+        marker_contact_state=np.asarray([1], dtype=np.int8),
+        tactile_sensor_mask=np.ones((1,), dtype=np.bool_),
+        session_id=session_id,
+        context_version=context_version,
+        marker_timestamp=10.2,
+    )
 
 
 def make_backend(policy: FakePolicy) -> LingBotV2Backend:
@@ -270,6 +339,72 @@ def test_backend_accepts_four_frame_history_and_rejects_wrong_length() -> None:
     )
     with pytest.raises(ValueError, match="does not match checkpoint"):
         backend.predict(make_tactile_observation(history_length=8))
+
+
+def test_slow_context_refresh_replaces_cache_and_fast_uses_marker_only_input() -> None:
+    policy = FakeCachePolicy()
+    backend = make_backend(policy)
+
+    first = backend.refresh_slow_context(_slow_request(value=10))
+    second = backend.refresh_slow_context(_slow_request(value=11))
+    response = backend.predict_fast(
+        _fast_request(context_version=second["context_version"])
+    )
+
+    assert first["context_version"] == 1
+    assert second["context_version"] == 2
+    assert backend._active_slow_context.policy_context is policy.slow_contexts[-1]
+    assert len(policy.slow_contexts) == 2
+    fast_context, fast_input = policy.fast_inputs[-1]
+    assert fast_context is policy.slow_contexts[-1]
+    assert "tactile_rgb" not in fast_input
+    assert "observation.images.camera_wrist_left" not in fast_input
+    assert fast_input["marker_displacement_history"].shape == (1, 4, 48, 2)
+    assert response["metadata"]["context_version_used"] == 2
+
+
+def test_fast_context_version_and_session_mismatches_are_rejected_and_session_clears() -> None:
+    backend = make_backend(FakeCachePolicy())
+    refresh = backend.refresh_slow_context(_slow_request())
+
+    with pytest.raises(ValueError, match="context_version"):
+        backend.predict_fast(
+            _fast_request(context_version=refresh["context_version"] + 1)
+        )
+    with pytest.raises(ValueError, match="session"):
+        backend.predict_fast(
+            _fast_request(session_id="other-session", context_version=None)
+        )
+    assert backend._active_slow_context is None
+
+
+def test_http_slow_refresh_then_marker_only_fast_predict_roundtrip() -> None:
+    policy = FakeCachePolicy()
+    server = create_http_server(make_backend(policy), host="127.0.0.1", port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    client = LingBotV2HttpClient(
+        f"http://{host}:{port}", timeout_s=5.0, jpeg_quality=100
+    )
+    try:
+        health = client.health()
+        assert health["slow_fast_cache"]["supported"] is True
+        refresh = client.refresh_slow_context(_slow_request())
+        response, timing = client.predict_fast_timed(
+            _fast_request(context_version=refresh["context_version"]),
+            expected_steps=50,
+        )
+
+        assert response.action_chunk.shape == (50, 8)
+        assert response.metadata["context_version_used"] == refresh["context_version"]
+        assert timing["http_encode_ms"] >= 0.0
+        assert len(policy.fast_inputs) == 1
+    finally:
+        client.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
 
 
 def test_vtla_backend_rejects_request_that_omits_checkpoint_modalities() -> None:

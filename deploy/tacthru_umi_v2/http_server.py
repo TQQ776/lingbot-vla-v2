@@ -10,6 +10,7 @@ import threading
 import time
 import traceback
 import uuid
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -39,10 +40,14 @@ from .protocol import (
     TACTILE_RGB_KEY,
     TACTILE_SENSOR_COUNT,
     ActionResponse,
+    FastPredictRequest,
     Observation,
+    SlowContextRequest,
     action_response_to_payload,
     action_spec,
+    fast_predict_from_json,
     observation_from_json,
+    slow_context_from_json,
 )
 from .transforms import ACTION_DIM, STATE_DIM, validate_action_chunk
 
@@ -53,8 +58,19 @@ class BackendBusy(RuntimeError):
         self.timing_s = dict(timing_s or {})
 
 
+@dataclass(frozen=True)
+class ServerSlowContext:
+    policy_context: Any
+    session_id: str
+    version: int
+    scene_timestamp: float
+    tactile_rgb_timestamp: float
+    instruction: str
+    profile_ms: dict[str, float]
+
+
 class LingBotV2Backend:
-    """Serialized, stateless-request facade around ``LingbotVLAv2Server``."""
+    """Serialized policy facade with an optional session-scoped slow context."""
 
     def __init__(
         self,
@@ -87,6 +103,8 @@ class LingBotV2Backend:
         self.inference_lock_timeout_s = float(inference_lock_timeout_s)
         self._lock = threading.Lock()
         self._active_session_id: str | None = None
+        self._active_slow_context: ServerSlowContext | None = None
+        self._slow_cache_version = 0
         self._request_count = 0
         self.started_at = time.time()
 
@@ -181,11 +199,166 @@ class LingBotV2Backend:
             "dtype": self.dtype,
             "use_compile": self.use_compile,
             "max_concurrent_inference": 1,
-            "requests_are_stateless": True,
+            "requests_are_stateless": not self._slow_fast_supported(),
+            "slow_fast_cache": {
+                "supported": self._slow_fast_supported(),
+                "active": self._active_slow_context is not None,
+                "context_version": (
+                    None
+                    if self._active_slow_context is None
+                    else self._active_slow_context.version
+                ),
+            },
             "contract": self.contract,
             "request_count": self._request_count,
             "uptime_s": time.time() - self.started_at,
         }
+
+    def _slow_fast_supported(self) -> bool:
+        contract = self.tactile_contract
+        return bool(
+            contract.get("enabled")
+            and contract.get("use_rgb")
+            and contract.get("use_markers")
+            and contract.get("num_sensors") == 1
+            and contract.get("num_markers") == 48
+            and contract.get("marker_history_length") == 4
+            and contract.get("marker_tokenization", {}).get("mode")
+            == "point_spatiotemporal"
+            and contract.get("marker_contact_gate", {}).get("target") == "marker_only"
+            and hasattr(self.policy, "build_slow_context")
+            and hasattr(self.policy, "infer_fast")
+        )
+
+    def refresh_slow_context(self, request: SlowContextRequest) -> dict[str, Any]:
+        if not self._slow_fast_supported():
+            raise RuntimeError("Loaded checkpoint does not support VTLA slow/fast caching")
+        started = time.perf_counter()
+        acquired = self._lock.acquire(timeout=self.inference_lock_timeout_s)
+        if not acquired:
+            raise BackendBusy("Inference backend is busy")
+        try:
+            episode_reset = bool(request.metadata.get("episode_reset"))
+            session_changed = request.session_id != self._active_session_id
+            if episode_reset or session_changed:
+                self.policy.reset(robo_name=ROBOT_CONFIG)
+                self._active_session_id = request.session_id
+                self._active_slow_context = None
+            raw = {
+                "observation.state": np.asarray(
+                    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float32
+                ),
+                CAMERA_KEY: request.wrist_rgb,
+                "task": request.instruction,
+                "tactile_rgb": request.tactile_rgb,
+                "tactile_sensor_mask": request.tactile_sensor_mask,
+            }
+            marker_shape = (1, 4, 48, 2)
+            raw.update(
+                marker_displacement_history=np.zeros(marker_shape, dtype=np.float32),
+                marker_valid_mask=np.zeros(marker_shape[:-1], dtype=np.bool_),
+                marker_history_valid_mask=np.zeros(marker_shape[:2], dtype=np.bool_),
+                marker_contact_state=np.full((1,), CONTACT_OFF, dtype=np.int8),
+            )
+            pending = self.policy.build_slow_context(
+                raw,
+                scene_timestamp=request.scene_timestamp,
+                tactile_rgb_timestamp=request.tactile_rgb_timestamp,
+            )
+            # Atomic replacement: fast inference sees either the complete old
+            # context or this complete new context, never a partially built KV.
+            self._slow_cache_version += 1
+            active = ServerSlowContext(
+                policy_context=pending,
+                session_id=request.session_id,
+                version=self._slow_cache_version,
+                scene_timestamp=request.scene_timestamp,
+                tactile_rgb_timestamp=request.tactile_rgb_timestamp,
+                instruction=request.instruction,
+                profile_ms=dict(pending.profile_ms),
+            )
+            self._active_slow_context = active
+            return {
+                "protocol": PROTOCOL_NAME,
+                "protocol_version": PROTOCOL_VERSION,
+                "request_id": request.request_id,
+                "session_id": request.session_id,
+                "context_version": active.version,
+                "scene_timestamp": active.scene_timestamp,
+                "tactile_rgb_timestamp": active.tactile_rgb_timestamp,
+                "metadata": {
+                    "session_changed": session_changed,
+                    "episode_reset": episode_reset,
+                    "slow_cache_build_latency_s": time.perf_counter() - started,
+                    "profile_ms": active.profile_ms,
+                },
+            }
+        finally:
+            self._lock.release()
+
+    def predict_fast(self, request: FastPredictRequest) -> dict[str, Any]:
+        if not np.isclose(request.control_frequency_hz, CONTROL_FREQUENCY_HZ, atol=1e-6):
+            raise ValueError("Fast request control frequency does not match checkpoint")
+        acquired = self._lock.acquire(timeout=self.inference_lock_timeout_s)
+        if not acquired:
+            raise BackendBusy("Inference backend is busy")
+        started = time.perf_counter()
+        try:
+            active = self._active_slow_context
+            if active is None:
+                raise ValueError("No active slow context; call /context/refresh first")
+            if request.session_id != active.session_id:
+                self._active_slow_context = None
+                self._active_session_id = request.session_id
+                raise ValueError("Fast request session does not match active slow context")
+            if (
+                request.context_version is not None
+                and request.context_version != active.version
+            ):
+                raise ValueError(
+                    f"Fast request context_version={request.context_version} does not match "
+                    f"active={active.version}"
+                )
+            marker_observation = Observation(
+                instruction=active.instruction,
+                state=request.state,
+                wrist_rgb=np.zeros((224, 224, 3), dtype=np.uint8),
+                marker_displacement_history=request.marker_displacement_history,
+                marker_valid_mask=request.marker_valid_mask,
+                marker_history_valid_mask=request.marker_history_valid_mask,
+                marker_contact_state=request.marker_contact_state,
+                tactile_sensor_mask=request.tactile_sensor_mask,
+            )
+            marker_inputs = _model_tactile_observation(
+                marker_observation,
+                {**self.tactile_contract, "use_rgb": False},
+            )
+            raw = {"observation.state": request.state, **marker_inputs}
+            result, profile = self.policy.infer_fast(active.policy_context, raw)
+            action = np.asarray(result["action"], dtype=np.float32)
+            if action.ndim == 3 and action.shape[0] == 1:
+                action = action[0]
+            action = validate_action_chunk(action, expected_steps=self.chunk_size)
+            age_s = request.marker_timestamp - active.tactile_rgb_timestamp
+            total_s = time.perf_counter() - started
+            return action_response_to_payload(
+                action_chunk=action,
+                request_id=request.request_id,
+                session_id=request.session_id,
+                expected_steps=self.chunk_size,
+                metadata={
+                    "backend": "lingbot-vla-v2-tacthru-umi-fast",
+                    "context_version_used": active.version,
+                    "slow_context_age_s": age_s,
+                    "slow_context_age_ms": age_s * 1000.0,
+                    "marker_timestamp": request.marker_timestamp,
+                    "fast_replan_latency_s": total_s,
+                    "server_total_ms": total_s * 1000.0,
+                    "profile_ms": profile,
+                },
+            )
+        finally:
+            self._lock.release()
 
     def predict(self, observation: Observation) -> dict[str, Any]:
         """Run inference and return the existing HTTP protocol payload."""
@@ -224,6 +397,7 @@ class LingBotV2Backend:
             if episode_reset or session_changed:
                 self.policy.reset(robo_name=ROBOT_CONFIG)
                 self._active_session_id = observation.session_id
+                self._active_slow_context = None
             reset_s = time.perf_counter() - reset_started
 
             model_observation = {
@@ -392,7 +566,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             self.connection.settimeout(self.server.request_timeout_s)
-            if self.path.rstrip("/") != "/predict":
+            endpoint = self.path.rstrip("/")
+            if endpoint not in {"/predict", "/context/refresh", "/predict_fast"}:
                 self._send_error_json(
                     "not found",
                     status=404,
@@ -440,9 +615,19 @@ class Handler(BaseHTTPRequestHandler):
             if len(raw_body) != length:
                 raise ValueError(f"Request body ended early: expected {length} bytes, got {len(raw_body)}")
             decode_started = time.perf_counter()
-            observation = observation_from_json(raw_body)
+            if endpoint == "/predict":
+                request_value = observation_from_json(raw_body)
+            elif endpoint == "/context/refresh":
+                request_value = slow_context_from_json(raw_body)
+            else:
+                request_value = fast_predict_from_json(raw_body)
             timing_s["request_decode_s"] = time.perf_counter() - decode_started
-            payload = self.server.backend.predict(observation)
+            if endpoint == "/predict":
+                payload = self.server.backend.predict(request_value)
+            elif endpoint == "/context/refresh":
+                payload = self.server.backend.refresh_slow_context(request_value)
+            else:
+                payload = self.server.backend.predict_fast(request_value)
             metadata = payload.setdefault("metadata", {})
             server_timing_s = metadata.setdefault("server_timing_s", {})
             server_timing_s.update(timing_s)
