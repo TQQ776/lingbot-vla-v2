@@ -95,8 +95,8 @@ class TactileSequenceSettings:
 @dataclass(frozen=True)
 class TactileInferenceSettings:
     total_steps: int = 10
-    slow_steps: int = 4
-    tactile_steps: int = 6
+    slow_steps: int = 6
+    tactile_steps: int = 4
     gate_off_behavior: str = "action_fallback"
     clone_slow_cache_each_fast_tick: bool = True
 
@@ -105,8 +105,8 @@ class TactileInferenceSettings:
         values = dict(value or {})
         result = cls(
             total_steps=int(values.get("total_steps", 10)),
-            slow_steps=int(values.get("slow_steps", 4)),
-            tactile_steps=int(values.get("tactile_steps", 6)),
+            slow_steps=int(values.get("slow_steps", 6)),
+            tactile_steps=int(values.get("tactile_steps", 4)),
             gate_off_behavior=str(
                 values.get("gate_off_behavior", "action_fallback")
             ),
@@ -187,7 +187,7 @@ class TactileRefinementConfig:
     enabled: bool = False
     architecture: str = "three_stream_mot"
     mode: str = "cascaded_flow"
-    tau_split: float = 0.6
+    tau_split: float = 0.4
     expert: TactileExpertSettings = field(default_factory=TactileExpertSettings)
     sequence: TactileSequenceSettings = field(default_factory=TactileSequenceSettings)
     inference: TactileInferenceSettings = field(default_factory=TactileInferenceSettings)
@@ -200,7 +200,7 @@ class TactileRefinementConfig:
             enabled=_as_bool(values.get("enabled"), False),
             architecture=str(values.get("architecture", "three_stream_mot")),
             mode=str(values.get("mode", "cascaded_flow")),
-            tau_split=float(values.get("tau_split", 0.6)),
+            tau_split=float(values.get("tau_split", 0.4)),
             expert=TactileExpertSettings.from_mapping(values.get("expert")),
             sequence=TactileSequenceSettings.from_mapping(values.get("sequence")),
             inference=TactileInferenceSettings.from_mapping(values.get("inference")),

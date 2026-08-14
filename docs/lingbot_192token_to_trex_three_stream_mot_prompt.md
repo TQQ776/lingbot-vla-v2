@@ -39,17 +39,17 @@ VLM layer 35   ↔ Action layer 35   ↔ Tactile layer 35
 目标 Cascaded Flow：
 
 \[
-X_1 \xrightarrow[\tau\in[0.6,1]]{Action} X_{0.6}
-\xrightarrow[\tau\in[0,0.6]]{Tactile} X_0
+X_1 \xrightarrow[\tau\in[0.4,1]]{Action} X_{0.4}
+\xrightarrow[\tau\in[0,0.4]]{Tactile} X_0
 \]
 
 默认：
 
 ```yaml
-tau_split: 0.6
+tau_split: 0.4
 total_steps: 10
-slow_steps: 4
-tactile_steps: 6
+slow_steps: 6
+tactile_steps: 4
 ```
 
 ---
@@ -147,7 +147,7 @@ X_tau: [B,50,55]
 Action Expert 负责：
 
 \[
-1 \rightarrow 0.6
+1 \rightarrow 0.4
 \]
 
 不要重写已有 Action MoE。
@@ -428,7 +428,7 @@ Marker已有的 temporal/spatial sincos encoding属于“Marker内容位置”�
 
 ---
 
-## 11. Slow Action Flow：X1 → X0.6
+## 11. Slow Action Flow：X1 → X0.4
 
 新增 slow-plan/cache结构，例如：
 
@@ -454,7 +454,7 @@ build_cascaded_slow_plan(...)
 
 ```text
 total_steps=10
-slow_steps=4
+slow_steps=6
 dt=-0.1
 ```
 
@@ -465,30 +465,32 @@ Action velocity evaluation的 tau：
 0.9
 0.8
 0.7
+0.6
+0.5
 ```
 
-4次 Euler update后得到：
+6次 Euler update后得到：
 
 ```text
-X0.6
+X0.4
 ```
 
 Slow plan需保存：
-- immutable `x_split = X0.6`
+- immutable `x_split = X0.4`
 - Prefix per-layer KV
 - Action per-layer KV
 - position/meta信息
 
-### 必须刷新 Action KV @ X0.6
+### 必须刷新 Action KV @ X0.4
 
-最后一个 Euler update后，当前 cache可能还是对应更新前的 X0.7。
+最后一个 Euler update后，当前 cache可能还是对应更新前的 X0.5。
 
 所以必须：
 
 ```text
-得到 X0.6
+得到 X0.4
 ↓
-重新构造 Action sequence (state + tau=0.6 + X0.6)
+重新构造 Action sequence (state + tau=0.4 + X0.4)
 ↓
 只重新跑 Action stream
 ↓
@@ -498,12 +500,12 @@ Slow plan需保存：
 最终 Fast读取的必须是：
 
 \[
-KV_{A@X_{0.6}}
+KV_{A@X_{0.4}}
 \]
 
 ---
 
-## 12. Fast Tactile Flow：X0.6 → X0
+## 12. Fast Tactile Flow：X0.4 → X0
 
 新增：
 
@@ -516,7 +518,7 @@ refine_action_with_tactile(...)
 1. clone slow cache；
 2. 从同一个 immutable `slow_plan.x_split` 开始；
 3. 编码最新 Marker → 192 tokens；
-4. 从 tau=0.6 开始；
+4. 从 tau=0.4 开始；
 5. 每个 Euler step 都重新构造：
 
 \[
@@ -555,9 +557,9 @@ X \leftarrow X + dt\cdot v_T
 同一 slow plan 下：
 
 ```text
-Marker(t1) → 从同一个 X0.6 开始 → X0(t1)
-Marker(t2) → 从同一个 X0.6 开始 → X0(t2)
-Marker(t3) → 从同一个 X0.6 开始 → X0(t3)
+Marker(t1) → 从同一个 X0.4 开始 → X0(t1)
+Marker(t2) → 从同一个 X0.4 开始 → X0(t2)
+Marker(t3) → 从同一个 X0.4 开始 → X0(t3)
 ```
 
 每次：
@@ -569,7 +571,7 @@ Marker(t3) → 从同一个 X0.6 开始 → X0(t3)
 Fast tick 禁止重新跑：
 - ViT
 - Prefix Qwen
-- Slow Action `1→0.6`
+- Slow Action `1→0.4`
 
 ---
 
@@ -597,10 +599,10 @@ tactile_refinement:
 无接触时：
 
 ```text
-Action: X1 → X0.6 → X0
+Action: X1 → X0.4 → X0
 ```
 
-即 Action Expert接管剩余 `[0,0.6]` flow。
+即 Action Expert接管剩余 `[0,0.4]` flow。
 
 这要求 Action Expert仍保留全区间 `[0,1]` 能力。
 
@@ -625,7 +627,7 @@ u=\epsilon-A
 随机：
 
 \[
-\tau_A\sim U(0.6,1)
+\tau_A\sim U(0.4,1)
 \]
 
 直接解析构造：
@@ -655,7 +657,7 @@ L_{A,cascade}=\|v_A-u\|^2
 随机：
 
 \[
-\tau_T\sim U(0,0.6)
+\tau_T\sim U(0,0.4)
 \]
 
 解析构造：
@@ -701,16 +703,16 @@ L_T=\|v_T-u\|^2
 第一版建议为 tactile branch 构建 slow context时：
 
 1. Prefix正常forward；
-2. 在 boundary `tau=0.6` 解析构造：
+2. 在 boundary `tau=0.4` 解析构造：
    \[
-   X_{0.6}^{analytic}=0.6\epsilon+0.4A
+   X_{0.4}^{analytic}=0.4\epsilon+0.6A
    \]
 3. 用：
    ```text
-   state + tau=0.6 + X0.6_analytic
+   state + tau=0.4 + X0.4_analytic
    ```
    构造 Action KV；
-4. tactile branch再随机采 `tau_T∈[0,0.6]`。
+4. tactile branch再随机采 `tau_T∈[0,0.4]`。
 
 ---
 
@@ -719,13 +721,13 @@ L_T=\|v_T-u\|^2
 训练常见：
 
 \[
-X_{0.6}^{train}=0.6\epsilon+0.4A
+X_{0.4}^{train}=0.4\epsilon+0.6A
 \]
 
 推理实际：
 
 \[
-\hat X_{0.6}^{infer}=ActionRollout(X_1)
+\hat X_{0.4}^{infer}=ActionRollout(X_1)
 \]
 
 两者存在 distribution gap。
@@ -740,12 +742,12 @@ rollout_boundary_exposure_prob: 0.25
 
 ```text
 no_grad:
-X1 → Slow Action rollout → X0.6_hat
+X1 → Slow Action rollout → X0.4_hat
 → refresh Action KV
-→ 至少用 X0.6_hat 做一次 tau=0.6 tactile boundary loss
+→ 至少用 X0.4_hat 做一次 tau=0.4 tactile boundary loss
 ```
 
-注意：这只能声称改善 boundary exposure，不要声称已经解决整个 `[0,0.6]` 的 rollout mismatch。
+注意：这只能声称改善 boundary exposure，不要声称已经解决整个 `[0,0.4]` 的 rollout mismatch。
 
 ---
 
@@ -795,7 +797,7 @@ train:
     enabled: true
     architecture: three_stream_mot
     mode: cascaded_flow
-    tau_split: 0.6
+    tau_split: 0.4
 
     expert:
       hidden_size: 768
@@ -814,8 +816,8 @@ train:
 
     inference:
       total_steps: 10
-      slow_steps: 4
-      tactile_steps: 6
+      slow_steps: 6
+      tactile_steps: 4
       gate_off_behavior: action_fallback
       clone_slow_cache_each_fast_tick: true
 
@@ -926,10 +928,10 @@ validate：
    `[B,50,55]`，且head明确读取最后50个hidden。
 
 10. **Split schedule**
-    `10 total / 4 slow / 6 tactile → tau_split=0.6`
+    `10 total / 6 slow / 4 tactile → tau_split=0.4`
 
 11. **Action KV refresh**
-    cache必须对应 `tau=0.6, X0.6`。
+    cache必须对应 `tau=0.4, X0.4`。
 
 12. **Gate OFF**
     无NaN，默认Action fallback，输出 `[B,50,55]`。
@@ -970,7 +972,7 @@ validate：
 - 让Prefix或Action读取Tactile。
 - 每个fast tick重新跑ViT/VLM/Action upper flow。
 - 把fast输出定义成 `slow_action + delta_action`。
-- 训练时强制完整 rollout `1→0.6→0` 才能构造每个样本。
+- 训练时强制完整 rollout `1→0.4→0` 才能构造每个样本。
 - 重复增加Marker temporal/spatial position encoding。
 - 硬编码所有联合序列绝对index。
 - 不经测试就改变原flex-attention同流mask语义。
@@ -984,8 +986,8 @@ validate：
 Commit 1: 配置 + 36L Tactile Expert实例化
 Commit 2: 三流 Joint Attention + mask tests
 Commit 3: Marker从Prefix切到Tactile；实现243-token序列和velocity head
-Commit 4: Slow Action 1→0.6 + cache + boundary KV refresh
-Commit 5: Fast Tactile 0.6→0 + cache reuse + immutable xsplit
+Commit 4: Slow Action 1→0.4 + cache + boundary KV refresh
+Commit 5: Fast Tactile 0.4→0 + cache reuse + immutable xsplit
 Commit 6: Cascaded training + analytic tau sampling + boundary exposure
 Commit 7: Gate fallback + legacy/checkpoint兼容
 Commit 8: 全测试 + profiling + 文档
@@ -1012,11 +1014,11 @@ State + tau + X_tau
         ↓
 Action Expert, 36L
         ↓
-Flow: X1 → X0.6
+Flow: X1 → X0.4
         ↓
-refresh Action KV exactly at X0.6
+refresh Action KV exactly at X0.4
         ↓
-cache KV_A + immutable X0.6
+cache KV_A + immutable X0.4
 
 
                          FAST
@@ -1056,7 +1058,7 @@ v_tactile [B,50,55]
         ↓
 Euler
         ↓
-X0.6 → X0
+X0.4 → X0
 ```
 
 每层跨流可见性：
@@ -1087,7 +1089,7 @@ P/A/T\ JointAttention
 +
 [Marker_{192}|\tau|X_{\tau,50}]
 +
-X_1\xrightarrow{Action}X_{0.6}
+X_1\xrightarrow{Action}X_{0.4}
 \xrightarrow{Tactile}X_0
 }
 \]
@@ -1134,8 +1136,8 @@ Fast tactile tick 不重新跑 ViT / Prefix-Qwen / Action upper-flow。
 - 36 层独立 Tactile Expert；
 - P/A/T Joint Attention 与单向可缓存 mask；
 - `[Marker192 | tau1 | X_tau50]`；
-- Action `1 -> 0.6`、边界 Action KV 刷新；
-- Tactile `0.6 -> 0`、不可变 `X0.6` 与缓存复用；
+- Action `1 -> 0.4`、边界 Action KV 刷新；
+- Tactile `0.4 -> 0`、不可变 `X0.4` 与缓存复用；
 - gate-off Action fallback；
 - Marker/Gate在Fast Euler循环前只计算一次，Gate OFF跳过Tactile Expert；
 - cascaded tau 训练和 rollout boundary exposure；

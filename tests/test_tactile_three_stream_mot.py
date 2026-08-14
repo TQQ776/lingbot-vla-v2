@@ -87,10 +87,21 @@ def _method_harness(*names: str):
 def test_three_stream_config_and_split_schedule():
     config = TactileRefinementConfig.from_mapping({"enabled": True})
     assert config.expert.num_layers == 36
-    assert config.tau_split == pytest.approx(0.6)
+    assert config.tau_split == pytest.approx(0.4)
     assert config.inference.total_steps == 10
-    assert config.inference.slow_steps == 4
-    assert config.inference.tactile_steps == 6
+    assert config.inference.slow_steps == 6
+    assert config.inference.tactile_steps == 4
+    slow_dt = -1.0 / config.inference.total_steps
+    slow_taus = [
+        1.0 + index * slow_dt for index in range(config.inference.slow_steps)
+    ]
+    tactile_dt = -config.tau_split / config.inference.tactile_steps
+    tactile_taus = [
+        config.tau_split + index * tactile_dt
+        for index in range(config.inference.tactile_steps)
+    ]
+    assert slow_taus == pytest.approx([1.0, 0.9, 0.8, 0.7, 0.6, 0.5])
+    assert tactile_taus == pytest.approx([0.4, 0.3, 0.2, 0.1])
 
     with pytest.raises(ValueError, match="tau_split"):
         TactileRefinementConfig.from_mapping(
@@ -189,7 +200,7 @@ def test_tactile_sequence_layout_is_marker192_time1_action50():
     harness._encode_tactile_marker_tokens = MethodType(encode, harness)
     sequence, mask, active = harness.build_tactile_sequence(
         torch.zeros(2, 50, 55),
-        torch.tensor([0.6, 0.2]),
+        torch.tensor([0.4, 0.2]),
         marker_displacement_history=None,
         marker_valid_mask=None,
         marker_history_valid_mask=None,
@@ -341,7 +352,7 @@ def test_slow_plan_is_frozen_and_cache_clone_does_not_replace_source():
     assert cache[0]["key_states"].item() == 1
     plan = CascadedSlowPlan(
         x_split=torch.zeros(1, 50, 55),
-        tau_split=0.6,
+        tau_split=0.4,
         noise=torch.zeros(1, 50, 55),
         prefix_past_key_values=cache,
         past_key_values=cache,
@@ -445,8 +456,8 @@ def test_fast_refinement_is_deterministic_marker_sensitive_and_does_not_run_slow
     Harness = _method_harness("refine_action_with_tactile")
     harness = Harness()
     harness.tactile_refinement_settings = SimpleNamespace(
-        tau_split=0.6,
-        inference=SimpleNamespace(tactile_steps=6),
+        tau_split=0.4,
+        inference=SimpleNamespace(tactile_steps=4),
     )
     calls = {"encode": 0, "tactile": 0, "fallback": 0}
 
@@ -475,7 +486,7 @@ def test_fast_refinement_is_deterministic_marker_sensitive_and_does_not_run_slow
     harness._action_fallback_from_boundary = MethodType(fallback, harness)
     plan = CascadedSlowPlan(
         x_split=torch.zeros(1, 50, 55),
-        tau_split=0.6,
+        tau_split=0.4,
         noise=torch.zeros(1, 50, 55),
         prefix_past_key_values={},
         past_key_values={},
@@ -517,7 +528,7 @@ def test_fast_refinement_is_deterministic_marker_sensitive_and_does_not_run_slow
     )
     assert torch.equal(result_a1, result_a2)
     assert not torch.equal(result_a1, result_b)
-    assert calls == {"encode": 3, "tactile": 18, "fallback": 0}
+    assert calls == {"encode": 3, "tactile": 12, "fallback": 0}
     assert torch.equal(plan.x_split, torch.zeros_like(plan.x_split))
 
 
@@ -525,8 +536,8 @@ def test_gate_off_routes_before_tactile_expert_and_encodes_marker_once():
     Harness = _method_harness("refine_action_with_tactile")
     harness = Harness()
     harness.tactile_refinement_settings = SimpleNamespace(
-        tau_split=0.6,
-        inference=SimpleNamespace(tactile_steps=6),
+        tau_split=0.4,
+        inference=SimpleNamespace(tactile_steps=4),
     )
     calls = {"encode": 0, "tactile": 0, "fallback": 0}
 
@@ -552,7 +563,7 @@ def test_gate_off_routes_before_tactile_expert_and_encodes_marker_once():
     harness._action_fallback_from_boundary = MethodType(fallback, harness)
     plan = CascadedSlowPlan(
         x_split=torch.zeros(1, 50, 55),
-        tau_split=0.6,
+        tau_split=0.4,
         noise=torch.zeros(1, 50, 55),
         prefix_past_key_values={},
         past_key_values={},

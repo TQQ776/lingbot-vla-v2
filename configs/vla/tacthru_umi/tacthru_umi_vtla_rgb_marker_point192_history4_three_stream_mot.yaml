@@ -112,7 +112,7 @@ train:
     enabled: true
     architecture: three_stream_mot
     mode: cascaded_flow
-    tau_split: 0.6
+    tau_split: 0.4
     expert:
       hidden_size: 768
       intermediate_size: 1536
@@ -128,8 +128,8 @@ train:
       include_latest_state: false
     inference:
       total_steps: 10
-      slow_steps: 4
-      tactile_steps: 6
+      slow_steps: 6
+      tactile_steps: 4
       gate_off_behavior: action_fallback
       clone_slow_cache_each_fast_tick: true
     training:

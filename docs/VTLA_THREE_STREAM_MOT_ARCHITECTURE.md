@@ -17,8 +17,8 @@ flowchart TD
     STATE[State] --> A[Action Expert stream, 36 layers]
     NOISE[X1] --> A
     KVP --> A
-    A -->|Euler at 1.0, 0.9, 0.8, 0.7| XS[X0.6]
-    XS --> REFRESH[Re-run Action at tau=0.6 and X0.6]
+    A -->|Euler at 1.0, 0.9, ..., 0.5| XS[X0.4]
+    XS --> REFRESH[Re-run Action at tau=0.4 and X0.4]
     STATE --> REFRESH
     KVP --> REFRESH
     REFRESH --> KVA[Cache Action K/V at boundary]
@@ -32,7 +32,7 @@ flowchart TD
     TS --> T
     T --> LAST[Last 50 tactile hidden states]
     LAST --> HEAD[Linear 768 to 55]
-    HEAD -->|Euler at 0.6, 0.5, ..., 0.1| X0[X0 action chunk]
+    HEAD -->|Euler at 0.4, 0.3, 0.2, 0.1| X0[X0 action chunk]
 ```
 
 The per-layer cross-stream visibility is:
@@ -72,19 +72,19 @@ Action, Tactile and do not replace Marker content positions.
 Slow Action Euler evaluations:
 
 ```text
-tau = 1.0, 0.9, 0.8, 0.7
-X1 -> X0.9 -> X0.8 -> X0.7 -> X0.6
+tau = 1.0, 0.9, 0.8, 0.7, 0.6, 0.5
+X1 -> X0.9 -> X0.8 -> X0.7 -> X0.6 -> X0.5 -> X0.4
 ```
 
 After the final update, Action is evaluated again using exactly
-`state + tau=0.6 + X0.6`. Its per-layer K/V is appended to the immutable Prefix
+`state + tau=0.4 + X0.4`. Its per-layer K/V is appended to the immutable Prefix
 cache. Therefore Fast never reads stale Action K/V from `X0.7`.
 
 Fast Tactile Euler evaluations:
 
 ```text
-tau = 0.6, 0.5, 0.4, 0.3, 0.2, 0.1
-X0.6 -> X0.5 -> ... -> X0
+tau = 0.4, 0.3, 0.2, 0.1
+X0.4 -> X0.3 -> X0.2 -> X0.1 -> X0
 ```
 
 Every Fast call clones the cache containers and starts from a clone of the same
@@ -99,13 +99,13 @@ per-sample selection; the real-robot batch-one path never pays for both.
 
 ## Training
 
-Action cascade training samples `tau_A ~ U(0.6, 1)` and constructs
+Action cascade training samples `tau_A ~ U(0.4, 1)` and constructs
 `X_tau = tau * noise + (1 - tau) * action` analytically. Tactile training samples
-`tau_T ~ U(0, 0.6)` and uses the same Flow Matching target `noise - action`.
+`tau_T ~ U(0, 0.4)` and uses the same Flow Matching target `noise - action`.
 
-The Tactile branch builds Action K/V at the analytic `X0.6`. With probability
+The Tactile branch builds Action K/V at the analytic `X0.4`. With probability
 `0.25`, a no-gradient Slow Action rollout supplies the boundary and a tactile
-loss is evaluated at `tau=0.6`. This improves boundary exposure but does not
+loss is evaluated at `tau=0.4`. This improves boundary exposure but does not
 claim to eliminate the complete rollout distribution mismatch.
 
 The first-stage YAML freezes Qwen3-VL and Action Expert. Trainable modules are:
@@ -119,7 +119,7 @@ The first-stage YAML freezes Qwen3-VL and Action Expert. Trainable modules are:
 In this frozen-Action stage, the Action cascade loss remains a detached
 monitoring metric but is not added to the optimization tensor. If Action is
 unfrozen, configuration validation requires a positive full-range Action loss
-weight so the gate-off `0.6 -> 0` fallback is not silently forgotten.
+weight so the gate-off `0.4 -> 0` fallback is not silently forgotten.
 
 Resolved parameter counts for the configured Qwen3-VL hidden size 2560 were
 computed on the `meta` device (shape allocation only):
@@ -141,7 +141,7 @@ pretrained Action Expert retains its original full-range ability.
 ## Contact Gate and Legacy Mode
 
 TacRGB stays in Prefix because `gate_tactile_rgb=false` and the gate target is
-`marker_only`. When contact is off, inference runs Action Expert from `X0.6` to
+`marker_only`. When contact is off, inference runs Action Expert from `X0.4` to
 `X0`; it does not execute an all-masked Tactile sequence. Mixed batches select
 Tactile or Action fallback per sample.
 
@@ -164,7 +164,7 @@ every batch-one request:
 | Decision | Computation |
 |---|---|
 | `reuse` | Reuse Prefix+Action K/V and run Fast tactile/fallback only |
-| `refresh_action` | Reuse Prefix K/V, rerun Action `1 -> 0.6`, refresh boundary K/V, then Fast |
+| `refresh_action` | Reuse Prefix K/V, rerun Action `1 -> 0.4`, refresh boundary K/V, then Fast |
 | `rebuild` | Re-encode RGB/TacRGB/language, rebuild Prefix and Action Slow plan, then Fast |
 
 Validity is not a single 55-D norm. It independently checks raw 8-D robot
