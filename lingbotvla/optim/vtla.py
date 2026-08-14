@@ -62,6 +62,7 @@ def build_vtla_param_groups(
                 "tactile_action_in_proj.",
                 "tactile_action_out_proj.",
                 "tactile_context_proj.",
+                "tactile_plan_proj.",
                 "tactile_marker_proj.",
                 "tactile_time_mlp.",
             )

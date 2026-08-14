@@ -199,6 +199,30 @@ def sinusoidal_time_embedding(time: Tensor, dim: int) -> Tensor:
     return embedding
 
 
+def sinusoidal_position_embedding(positions: Tensor, dim: int) -> Tensor:
+    """Encode absolute action-step indices without trainable checkpoint state."""
+
+    if positions.ndim != 1:
+        raise ValueError("Action positions must be [T]")
+    half = dim // 2
+    if half == 0:
+        return positions[:, None]
+    frequencies = torch.exp(
+        torch.linspace(
+            0.0,
+            -math.log(10_000.0),
+            half,
+            device=positions.device,
+            dtype=torch.float32,
+        )
+    )
+    angles = positions.float()[:, None] * frequencies[None]
+    embedding = torch.cat([angles.sin(), angles.cos()], dim=-1)
+    if embedding.shape[-1] < dim:
+        embedding = F.pad(embedding, (0, dim - embedding.shape[-1]))
+    return embedding
+
+
 class GroupedQueryAttention(nn.Module):
     """Compact grouped-query attention with a query-specific context mask."""
 
@@ -272,6 +296,8 @@ class TactileActionExpertLayer(nn.Module):
         self.self_attention = GroupedQueryAttention(**kwargs)
         self.marker_norm = nn.LayerNorm(config.hidden_size)
         self.marker_attention = GroupedQueryAttention(**kwargs)
+        self.plan_norm = nn.LayerNorm(config.hidden_size)
+        self.plan_attention = GroupedQueryAttention(**kwargs)
         self.context_norm = nn.LayerNorm(config.hidden_size)
         self.context_attention = GroupedQueryAttention(**kwargs)
         self.ffn_norm = nn.LayerNorm(config.hidden_size)
@@ -286,6 +312,8 @@ class TactileActionExpertLayer(nn.Module):
         hidden: Tensor,
         marker_tokens: Tensor,
         marker_mask: Tensor,
+        action_context: Tensor,
+        action_context_mask: Tensor,
         slow_context: Tensor,
         slow_context_mask: Tensor,
     ) -> Tensor:
@@ -293,6 +321,9 @@ class TactileActionExpertLayer(nn.Module):
         hidden = hidden + self.self_attention(normalized, normalized)
         hidden = hidden + self.marker_attention(
             self.marker_norm(hidden), marker_tokens, marker_mask
+        )
+        hidden = hidden + self.plan_attention(
+            self.plan_norm(hidden), action_context, action_context_mask
         )
         hidden = hidden + self.context_attention(
             self.context_norm(hidden), slow_context, slow_context_mask
@@ -316,6 +347,8 @@ class TactileActionExpert(nn.Module):
         hidden: Tensor,
         marker_tokens: Tensor,
         marker_mask: Tensor,
+        action_context: Tensor,
+        action_context_mask: Tensor,
         slow_context: Tensor,
         slow_context_mask: Tensor,
     ) -> Tensor:
@@ -324,6 +357,8 @@ class TactileActionExpert(nn.Module):
                 hidden,
                 marker_tokens,
                 marker_mask,
+                action_context,
+                action_context_mask,
                 slow_context,
                 slow_context_mask,
             )
@@ -338,5 +373,6 @@ __all__ = [
     "TactileRefinementInferenceConfig",
     "TactileRefinementLossConfig",
     "TactileRefinementTrainingConfig",
+    "sinusoidal_position_embedding",
     "sinusoidal_time_embedding",
 ]

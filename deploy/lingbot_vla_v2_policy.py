@@ -486,6 +486,18 @@ class LingbotVLAv2Server:
                 f"ignored={report['intentionally_ignored_keys']} "
                 f"incompatibilities={report['config_incompatibilities']}"
             )
+        untrained_refinement_keys = sorted(
+            set(report.get("tactile_refinement_initialized_keys", []))
+            | set(
+                report.get("tactile_refinement_upgrade_initialized_keys", [])
+            )
+        )
+        if untrained_refinement_keys:
+            raise RuntimeError(
+                "Checkpoint has untrained tactile-refinement parameters and cannot "
+                "be used for inference before retraining; newly initialized "
+                f"parameters={untrained_refinement_keys}"
+            )
         return report
 
     def merge_qwen_config(self, qwen_config):

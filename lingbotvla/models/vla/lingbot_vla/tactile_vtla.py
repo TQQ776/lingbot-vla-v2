@@ -1543,8 +1543,15 @@ _TACTILE_REFINEMENT_PREFIXES = (
     "tactile_action_in_proj.",
     "tactile_action_out_proj.",
     "tactile_context_proj.",
+    "tactile_plan_proj.",
     "tactile_marker_proj.",
     "tactile_time_mlp.",
+)
+
+_TACTILE_REFINEMENT_UPGRADE_FRAGMENTS = (
+    ".plan_norm.",
+    ".plan_attention.",
+    "tactile_plan_proj.",
 )
 
 
@@ -1586,6 +1593,14 @@ def load_vtla_checkpoint_state_dict(
     refinement_initialized = (
         refinement_target if refinement_target and not supplied_has_refinement else set()
     )
+    refinement_upgrade_initialized = {
+        name
+        for name in refinement_target
+        if name not in supplied
+        and any(
+            fragment in name for fragment in _TACTILE_REFINEMENT_UPGRADE_FRAGMENTS
+        )
+    }
     intentionally_ignored: list[str] = []
     reinitialized: list[str] = []
     config_incompatibilities: list[str] = []
@@ -1681,7 +1696,12 @@ def load_vtla_checkpoint_state_dict(
     incompatible = model.load_state_dict(supplied, strict=False)
     missing = sorted(incompatible.missing_keys)
     unexpected = sorted(set(unexpected) | set(incompatible.unexpected_keys))
-    allowed_missing = set(reinitialized) | config_initialized | refinement_initialized
+    allowed_missing = (
+        set(reinitialized)
+        | config_initialized
+        | refinement_initialized
+        | refinement_upgrade_initialized
+    )
     missing_config_initialized = set(missing) & config_initialized
     forbidden_missing = sorted(set(missing) - allowed_missing)
     if forbidden_missing or unexpected:
@@ -1706,6 +1726,9 @@ def load_vtla_checkpoint_state_dict(
         "config_incompatibilities": sorted(set(config_incompatibilities)),
         "tactile_refinement_initialized_keys": sorted(
             set(missing) & refinement_initialized
+        ),
+        "tactile_refinement_upgrade_initialized_keys": sorted(
+            set(missing) & refinement_upgrade_initialized
         ),
     }
 

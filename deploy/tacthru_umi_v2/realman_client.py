@@ -1597,15 +1597,28 @@ def run_realman(
             if use_slow_fast:
                 if tactile_frame is None or tactile_frame.tactile_rgb is None:
                     raise SafetyViolation("Slow/fast VTLA cache requires current tactile RGB")
+                plan_exhausted = bool(
+                    use_cascaded
+                    and slow_plan_version is not None
+                    and action_offset >= chunk_size
+                )
+                periodic_refresh_due = bool(
+                    args.slow_refresh_every > 0
+                    and step_index > 0
+                    and step_index % args.slow_refresh_every == 0
+                )
                 refresh_due = bool(
                     context_version is None
-                    or (
-                        args.slow_refresh_every > 0
-                        and step_index > 0
-                        and step_index % args.slow_refresh_every == 0
-                    )
+                    or periodic_refresh_due
+                    or plan_exhausted
                 )
                 if refresh_due:
+                    if context_version is None:
+                        refresh_reason = "initial"
+                    elif plan_exhausted:
+                        refresh_reason = "slow_plan_exhausted"
+                    else:
+                        refresh_reason = "periodic"
                     refresh = SlowContextRequest(
                         instruction=args.instruction,
                         wrist_rgb=camera_frame.rgb,
@@ -1614,7 +1627,10 @@ def run_realman(
                         session_id=session_id,
                         scene_timestamp=camera_frame.capture_timestamp,
                         tactile_rgb_timestamp=tactile_frame.capture_timestamp,
-                        metadata={"episode_reset": step_index == 0},
+                        metadata={
+                            "episode_reset": step_index == 0,
+                            "refresh_reason": refresh_reason,
+                        },
                     )
                     refresh_response = client.refresh_slow_context(refresh)
                     context_version = int(refresh_response["context_version"])
@@ -1626,6 +1642,7 @@ def run_realman(
                             "event": "slow_context_refreshed",
                             "timestamp": time.time(),
                             "step": step_index,
+                            "refresh_reason": refresh_reason,
                             **refresh_response,
                         },
                     )

@@ -37,6 +37,7 @@ from .utils import (
 from .tactile_action_expert import (
     TactileActionExpert,
     TactileRefinementConfig,
+    sinusoidal_position_embedding,
     sinusoidal_time_embedding,
 )
 from .tactile_vtla import TactileTokenEncoder, TactileVTLAConfig
@@ -98,6 +99,7 @@ class SlowActionPlan:
     """Reusable intermediate action state at the cascaded FM split."""
 
     x_split: Tensor
+    action_context: Tensor
     tau_split: float
     noise: Tensor
     state: Tensor
@@ -607,6 +609,7 @@ class FlowMatchingV2(FlowMatchingV1):
         self.tactile_action_in_proj: nn.Linear | None = None
         self.tactile_action_out_proj: nn.Linear | None = None
         self.tactile_context_proj: nn.Linear | None = None
+        self.tactile_plan_proj: nn.Linear | None = None
         self.tactile_marker_proj: nn.Linear | None = None
         self.tactile_time_mlp: nn.Sequential | None = None
         if self.tactile_refinement_settings.cascaded_enabled:
@@ -624,6 +627,9 @@ class FlowMatchingV2(FlowMatchingV1):
             )
             self.tactile_context_proj = nn.Linear(
                 vlm_hidden_size, expert_cfg.hidden_size
+            )
+            self.tactile_plan_proj = nn.Linear(
+                self.config.proj_width, expert_cfg.hidden_size
             )
             self.tactile_marker_proj = nn.Linear(
                 vlm_hidden_size, expert_cfg.hidden_size
@@ -687,6 +693,7 @@ class FlowMatchingV2(FlowMatchingV1):
                 self.tactile_action_in_proj,
                 self.tactile_action_out_proj,
                 self.tactile_context_proj,
+                self.tactile_plan_proj,
                 self.tactile_marker_proj,
                 self.tactile_time_mlp,
             ):
@@ -2027,7 +2034,8 @@ class FlowMatchingV2(FlowMatchingV1):
                 deepstack_visual_embeds=deepstack_visual_embeds,
             )
         )
-        suffix_out = suffix_out[:, -self.config.n_action_steps :]
+        action_context = suffix_out[:, -self.config.n_action_steps :]
+        suffix_out = action_context
         slow_velocity = self.action_out_proj(
             suffix_out.to(self.action_out_proj.weight.dtype)
         ).to(dtype=dtype)
@@ -2048,6 +2056,10 @@ class FlowMatchingV2(FlowMatchingV1):
             timestep=tactile_time,
             marker_tokens=marker_tokens,
             marker_mask=marker_mask,
+            action_context_tokens=action_context,
+            action_context_mask=torch.ones(
+                action_context.shape[:2], device=device, dtype=torch.bool
+            ),
             slow_context_tokens=slow_hidden,
             slow_context_mask=self._slow_context_mask_from_pad(prefix_pad_masks),
         )
@@ -2569,6 +2581,8 @@ class FlowMatchingV2(FlowMatchingV1):
         timestep: Tensor,
         marker_tokens: Tensor,
         marker_mask: Tensor,
+        action_context_tokens: Tensor,
+        action_context_mask: Tensor,
         slow_context_tokens: Tensor,
         slow_context_mask: Tensor,
     ) -> Tensor:
@@ -2578,6 +2592,7 @@ class FlowMatchingV2(FlowMatchingV1):
             self.tactile_action_in_proj,
             self.tactile_action_out_proj,
             self.tactile_context_proj,
+            self.tactile_plan_proj,
             self.tactile_marker_proj,
             self.tactile_time_mlp,
         )
@@ -2588,10 +2603,19 @@ class FlowMatchingV2(FlowMatchingV1):
         assert self.tactile_action_in_proj is not None
         assert self.tactile_action_out_proj is not None
         assert self.tactile_context_proj is not None
+        assert self.tactile_plan_proj is not None
         assert self.tactile_marker_proj is not None
         assert self.tactile_time_mlp is not None
         if state.ndim != 2 or x_t.ndim != 3:
             raise ValueError("state and x_t must be [B,D] and [B,T,D]")
+        if action_context_tokens.ndim != 3 or action_context_mask.ndim != 2:
+            raise ValueError("action context and mask must be [B,T,D] and [B,T]")
+        if action_context_tokens.shape[:2] != action_context_mask.shape:
+            raise ValueError("action context and mask lengths differ")
+        if action_context_tokens.shape[0] != state.shape[0]:
+            raise ValueError("action context batch does not match state")
+        if action_context_tokens.shape[1] != x_t.shape[1]:
+            raise ValueError("action context must cover the full action horizon")
         hidden_dtype = self.tactile_action_in_proj.weight.dtype
         state_token = self.tactile_state_proj(state.to(hidden_dtype)).unsqueeze(1)
         action_tokens = self.tactile_action_in_proj(x_t.to(hidden_dtype))
@@ -2599,8 +2623,17 @@ class FlowMatchingV2(FlowMatchingV1):
             timestep.to(device=x_t.device), action_tokens.shape[-1]
         ).to(dtype=hidden_dtype)
         time_embedding = self.tactile_time_mlp(time_embedding).unsqueeze(1)
-        hidden = torch.cat([state_token, action_tokens + time_embedding], dim=1)
+        action_positions = sinusoidal_position_embedding(
+            torch.arange(x_t.shape[1], device=x_t.device), action_tokens.shape[-1]
+        ).to(dtype=hidden_dtype)
+        hidden = torch.cat(
+            [state_token, action_tokens + time_embedding + action_positions.unsqueeze(0)],
+            dim=1,
+        )
         marker_context = self.tactile_marker_proj(marker_tokens.to(hidden_dtype))
+        action_context = self.tactile_plan_proj(
+            action_context_tokens.to(hidden_dtype)
+        )
         slow_context = self.tactile_context_proj(
             slow_context_tokens.to(hidden_dtype)
         )
@@ -2608,6 +2641,8 @@ class FlowMatchingV2(FlowMatchingV1):
             hidden,
             marker_context,
             marker_mask,
+            action_context,
+            action_context_mask,
             slow_context,
             slow_context_mask,
         )
@@ -2663,9 +2698,29 @@ class FlowMatchingV2(FlowMatchingV1):
                 prefix_position_ids=slow_context.position_ids,
             )
             x_t = x_t - step_size * velocity
-        profile = {"slow_action_stage_ms": (time.perf_counter() - started) * 1000.0}
+        context_started = time.perf_counter()
+        _, action_context = self.predict_velocity(
+            state,
+            slow_context.pad_masks,
+            slow_context.past_key_values,
+            x_t,
+            torch.full(
+                (batch,), settings.tau_split, device=device, dtype=dtype
+            ),
+            prefix_position_ids=slow_context.position_ids,
+            return_action_hidden=True,
+        )
+        context_finished = time.perf_counter()
+        profile = {
+            "slow_action_stage_ms": (context_started - started) * 1000.0,
+            "slow_action_plan_ms": (context_finished - started) * 1000.0,
+        }
+        profile["slow_action_context_ms"] = (
+            context_finished - context_started
+        ) * 1000.0
         return SlowActionPlan(
             x_split=x_t.detach().clone(),
+            action_context=action_context.detach().clone(),
             tau_split=settings.tau_split,
             noise=noise.detach().clone(),
             state=state.detach().clone(),
@@ -2731,30 +2786,37 @@ class FlowMatchingV2(FlowMatchingV1):
             fixed_prefix = fixed_action_prefix.to(
                 device=state.device, dtype=state.dtype
             ).detach().clone()
-        future = x_t[:, offset:].clone()
         settings = self.tactile_refinement_settings
         step_size = settings.tau_split / settings.inference.tactile_steps
         slow_tokens = plan.slow_context.final_hidden_states.to(device=state.device)
         slow_mask = self._tactile_slow_context_mask(plan.slow_context).to(
             device=state.device
         )
+        action_context = plan.action_context.to(device=state.device)
+        action_context_mask = torch.ones(
+            action_context.shape[:2], device=state.device, dtype=torch.bool
+        )
         expert_started = time.perf_counter()
         for step in range(settings.inference.tactile_steps):
             tau = settings.tau_split - step * step_size
             velocity = self._predict_tactile_velocity(
                 state=state,
-                x_t=future,
+                x_t=x_t,
                 timestep=torch.full(
                     (state.shape[0],), tau, device=state.device, dtype=state.dtype
                 ),
                 marker_tokens=marker_tokens,
                 marker_mask=marker_mask,
+                action_context_tokens=action_context,
+                action_context_mask=action_context_mask,
                 slow_context_tokens=slow_tokens,
                 slow_context_mask=slow_mask,
             )
-            future = future - step_size * velocity
+            x_t = x_t - step_size * velocity
+            if offset:
+                x_t[:, :offset] = fixed_prefix
         expert_ms = (time.perf_counter() - expert_started) * 1000.0
-        output = torch.cat([fixed_prefix, future], dim=1)
+        output = x_t
         profile = {
             "tactile_marker_encode_ms": marker_ms,
             "tactile_expert_ms": expert_ms,
@@ -2939,6 +3001,7 @@ class FlowMatchingV2(FlowMatchingV1):
         x_t,
         timestep,
         prefix_position_ids=None,
+        return_action_hidden: bool = False,
     ):
         """Predict velocity at time t using cached Qwen3-VL prefix states."""
         if prefix_position_ids is None:
@@ -2998,6 +3061,8 @@ class FlowMatchingV2(FlowMatchingV1):
             if suffix_out.dtype != self.action_out_proj.weight.dtype:
                 suffix_out = suffix_out.to(self.action_out_proj.weight.dtype)
             v_t = self.action_out_proj(suffix_out)
+        if return_action_hidden:
+            return v_t, suffix_out
         return v_t
 
     def _moe_losses_and_metrics(self, router_logits_list, losses):
@@ -3180,6 +3245,7 @@ class LingbotVlaV2Policy(PreTrainedModel):
             "model.tactile_action_in_proj.",
             "model.tactile_action_out_proj.",
             "model.tactile_context_proj.",
+            "model.tactile_plan_proj.",
             "model.tactile_marker_proj.",
             "model.tactile_time_mlp.",
         )
@@ -3207,6 +3273,18 @@ class LingbotVlaV2Policy(PreTrainedModel):
                 name
                 for name in names
                 if any(name.startswith(prefix) for prefix in refinement_prefixes)
+            )
+        if refinement_enabled and checkpoint_has_refinement:
+            allowed.update(
+                name
+                for name in names
+                if (
+                    name.startswith("model.tactile_plan_proj.")
+                    or (
+                        name.startswith("model.tactile_action_expert.")
+                        and (".plan_norm." in name or ".plan_attention." in name)
+                    )
+                )
             )
         if allowed:
             logger.warning(

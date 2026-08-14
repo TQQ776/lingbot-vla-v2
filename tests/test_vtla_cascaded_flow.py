@@ -13,6 +13,7 @@ from lingbotvla.models.vla.lingbot_vla.tactile_action_expert import (
     TactileActionExpert,
     TactileExpertConfig,
     TactileRefinementConfig,
+    sinusoidal_position_embedding,
 )
 from lingbotvla.models.vla.lingbot_vla.tactile_vtla import (
     load_vtla_checkpoint_state_dict,
@@ -59,6 +60,7 @@ def _load_cascaded_methods():
             "lingbotvla.models.vla.lingbot_vla.tactile_action_expert",
             fromlist=["sinusoidal_time_embedding"],
         ).sinusoidal_time_embedding,
+        "sinusoidal_position_embedding": sinusoidal_position_embedding,
         "SlowActionPlan": SimpleNamespace,
         "VTLASlowCache": SimpleNamespace,
     }
@@ -155,6 +157,7 @@ def _harness() -> SimpleNamespace:
         tactile_action_in_proj=nn.Linear(55, hidden),
         tactile_action_out_proj=nn.Linear(hidden, 55),
         tactile_context_proj=nn.Linear(20, hidden),
+        tactile_plan_proj=nn.Linear(12, hidden),
         tactile_marker_proj=nn.Linear(20, hidden),
         tactile_time_mlp=nn.Sequential(
             nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, hidden)
@@ -162,6 +165,9 @@ def _harness() -> SimpleNamespace:
         use_depth_align=False,
         slow_calls=[],
         tactile_calls=[],
+        tactile_action_shapes=[],
+        tactile_context_shapes=[],
+        action_context_calls=[],
     )
     for name in (
         "_predict_tactile_velocity",
@@ -171,14 +177,33 @@ def _harness() -> SimpleNamespace:
     ):
         setattr(harness, name, MethodType(getattr(CascadedHarness, name), harness))
 
-    def predict_velocity(self, state, pad, cache, x_t, timestep, **_):
+    def predict_velocity(
+        self,
+        state,
+        pad,
+        cache,
+        x_t,
+        timestep,
+        *,
+        return_action_hidden=False,
+        **_,
+    ):
+        velocity = torch.ones_like(x_t)
+        if return_action_hidden:
+            self.action_context_calls.append(timestep.detach().clone())
+            context = torch.ones(x_t.shape[0], x_t.shape[1], 12)
+            return velocity, context.to(device=x_t.device, dtype=x_t.dtype)
         self.slow_calls.append(timestep.detach().clone())
-        return torch.ones_like(x_t)
+        return velocity
 
     original_tactile = harness._predict_tactile_velocity
 
     def tactile_velocity(self, **kwargs):
         self.tactile_calls.append(kwargs["timestep"].detach().clone())
+        self.tactile_action_shapes.append(tuple(kwargs["x_t"].shape))
+        self.tactile_context_shapes.append(
+            tuple(kwargs["action_context_tokens"].shape)
+        )
         return original_tactile(**kwargs)
 
     harness.predict_velocity = MethodType(predict_velocity, harness)
@@ -226,6 +251,10 @@ def test_cascaded_intervals_cover_one_to_zero_without_gap_or_overlap():
         0.1,
     ]
     assert plan.tau_split == 0.4
+    assert [round(float(value.item()), 7) for value in harness.action_context_calls] == [
+        0.4
+    ]
+    assert plan.action_context.shape == (1, 50, 12)
 
 
 def test_refinement_does_not_call_slow_model_or_vit():
@@ -291,6 +320,8 @@ def test_action_offset_keeps_executed_prefix_fixed():
     )
     torch.testing.assert_close(output[:, :2], plan.x_split[:, :2])
     assert not torch.allclose(output[:, 2:], plan.x_split[:, 2:])
+    assert harness.tactile_action_shapes == [(1, 50, 55)] * 4
+    assert harness.tactile_context_shapes == [(1, 50, 12)] * 4
 
 
 def test_action_offset_can_reuse_a_previous_legal_refined_prefix():
@@ -312,11 +343,14 @@ def test_tactile_expert_preserves_action_shape_and_backward():
     batch, action_steps, hidden = 2, 50, settings.expert.hidden_size
     action = torch.randn(batch, action_steps + 1, hidden, requires_grad=True)
     marker = torch.randn(batch, 192, hidden, requires_grad=True)
+    action_context = torch.randn(batch, action_steps, hidden, requires_grad=True)
     slow = torch.randn(batch, 11, hidden, requires_grad=True)
     output = expert(
         action,
         marker,
         torch.ones(batch, 192, dtype=torch.bool),
+        action_context,
+        torch.ones(batch, action_steps, dtype=torch.bool),
         slow,
         torch.ones(batch, 11, dtype=torch.bool),
     )
@@ -324,7 +358,18 @@ def test_tactile_expert_preserves_action_shape_and_backward():
     output.square().mean().backward()
     assert action.grad is not None
     assert marker.grad is not None
+    assert action_context.grad is not None
     assert slow.grad is not None
+
+
+def test_action_position_embedding_is_absolute_and_deterministic():
+    positions = torch.arange(50)
+    first = sinusoidal_position_embedding(positions, 16)
+    second = sinusoidal_position_embedding(positions, 16)
+    assert first.shape == (50, 16)
+    torch.testing.assert_close(first, second)
+    assert not torch.allclose(first[0], first[1])
+    assert not torch.allclose(first[2], first[12])
 
 
 def test_configuration_rejects_gap_and_defaults_to_full_replan():
@@ -388,12 +433,40 @@ def test_old_checkpoint_may_initialize_only_complete_refinement_namespace():
         load_vtla_checkpoint_state_dict(TinyCheckpointModel(), partial_state)
 
 
+def test_pre_plan_context_checkpoint_initializes_only_new_plan_attention():
+    class UpgradeModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.tactile_action_expert = TactileActionExpert(_settings().expert)
+            self.tactile_plan_proj = nn.Linear(12, _settings().expert.hidden_size)
+
+    source = UpgradeModel()
+    old_state = {
+        name: value.clone()
+        for name, value in source.state_dict().items()
+        if ".plan_norm." not in name
+        and ".plan_attention." not in name
+        and not name.startswith("tactile_plan_proj.")
+    }
+    report = load_vtla_checkpoint_state_dict(UpgradeModel(), old_state)
+    assert report["forbidden_missing_keys"] == []
+    initialized = report["tactile_refinement_upgrade_initialized_keys"]
+    assert initialized
+    assert all(
+        ".plan_norm." in name
+        or ".plan_attention." in name
+        or name.startswith("tactile_plan_proj.")
+        for name in initialized
+    )
+
+
 def test_refinement_parameters_use_new_module_optimizer_group():
     class TinyOptimizerModel(nn.Module):
         def __init__(self):
             super().__init__()
             self.tactile_encoder = nn.Linear(2, 2)
             self.tactile_action_expert = nn.Linear(2, 2)
+            self.tactile_plan_proj = nn.Linear(2, 2)
             self.qwen_expert = nn.Linear(2, 2)
 
     model = TinyOptimizerModel()
@@ -408,6 +481,7 @@ def test_refinement_parameters_use_new_module_optimizer_group():
     tactile_ids = {id(parameter) for parameter in by_name["tactile"]["params"]}
     assert id(model.tactile_encoder.weight) in tactile_ids
     assert id(model.tactile_action_expert.weight) in tactile_ids
+    assert id(model.tactile_plan_proj.weight) in tactile_ids
     assert id(model.qwen_expert.weight) not in tactile_ids
 
 
@@ -423,3 +497,12 @@ def test_cascaded_source_keeps_baseline_hidden_optional_and_marker_freeze_scoped
         source.index("marker_parameter_prefixes = (") :
         source.index("for module in (", source.index("marker_parameter_prefixes = ("))
     ]
+
+
+def test_real_client_refreshes_slow_context_when_plan_is_exhausted():
+    source = (
+        ROOT / "deploy/tacthru_umi_v2/realman_client.py"
+    ).read_text(encoding="utf-8")
+    assert "plan_exhausted = bool(" in source
+    assert "or plan_exhausted" in source
+    assert 'refresh_reason = "slow_plan_exhausted"' in source
