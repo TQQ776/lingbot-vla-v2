@@ -65,6 +65,45 @@ def test_observation_roundtrip_preserves_rgb_state_ids_and_gripper_metres() -> N
     assert decoded.wrist_rgb[..., 2].mean() < 20
 
 
+def test_observation_roundtrip_preserves_slow_fast_scheduler_metadata() -> None:
+    observation = Observation(
+        instruction="Pull the tissue",
+        state=identity_state(),
+        wrist_rgb=np.zeros((224, 224, 3), dtype=np.uint8),
+        metadata={
+            "episode_reset": False,
+            "vtla_mode": "auto",
+            "scene_version": 2,
+            "executed_offset": 12,
+        },
+    )
+
+    decoded = observation_from_payload(observation_to_payload(observation))
+
+    assert decoded.metadata["vtla_mode"] == "auto"
+    assert decoded.metadata["scene_version"] == 2
+    assert decoded.metadata["executed_offset"] == 12
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"vtla_mode": "unknown"},
+        {"scene_version": -1},
+        {"executed_offset": 1.5},
+    ],
+)
+def test_protocol_rejects_invalid_slow_fast_scheduler_metadata(metadata) -> None:
+    observation = Observation(
+        instruction="Pull the tissue",
+        state=identity_state(),
+        wrist_rgb=np.zeros((224, 224, 3), dtype=np.uint8),
+        metadata=metadata,
+    )
+    with pytest.raises(ValueError, match="metadata"):
+        observation_to_payload(observation)
+
+
 def test_protocol_rejects_version_mismatch_and_nonfinite_state() -> None:
     payload = observation_to_payload(
         Observation(instruction="Pull", state=identity_state(), wrist_rgb=np.zeros((224, 224, 3), dtype=np.uint8))

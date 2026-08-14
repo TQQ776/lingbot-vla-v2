@@ -599,6 +599,22 @@ def _validate_metadata(value: Any) -> dict[str, Any]:
     metadata = dict(value)
     if "episode_reset" in metadata and not isinstance(metadata["episode_reset"], bool):
         raise ValueError("metadata.episode_reset must be a JSON boolean")
+    if "vtla_mode" in metadata and metadata["vtla_mode"] not in {
+        "auto",
+        "slow",
+        "fast",
+        "slow_and_fast",
+    }:
+        raise ValueError(
+            "metadata.vtla_mode must be auto|slow|fast|slow_and_fast"
+        )
+    for key in ("scene_version", "executed_offset"):
+        if key in metadata and (
+            isinstance(metadata[key], bool)
+            or not isinstance(metadata[key], int)
+            or metadata[key] < 0
+        ):
+            raise ValueError(f"metadata.{key} must be a non-negative integer")
     return metadata
 
 

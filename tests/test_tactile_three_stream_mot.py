@@ -96,6 +96,16 @@ def test_three_stream_config_and_split_schedule():
         TactileRefinementConfig.from_mapping(
             {"enabled": True, "tau_split": 0.5}
         )
+    with pytest.raises(ValueError, match="full tau range"):
+        TactileRefinementConfig.from_mapping(
+            {
+                "enabled": True,
+                "training": {
+                    "freeze_action_expert": False,
+                    "action_full_range_loss_weight": 0.0,
+                },
+            }
+        )
 
 
 def test_training_yaml_resolves_exact_first_version_contract():
@@ -149,7 +159,9 @@ def test_three_stream_mask_preserves_original_prefix_action_semantics():
 
 
 def test_tactile_sequence_layout_is_marker192_time1_action50():
-    Harness = _method_harness("build_tactile_sequence")
+    Harness = _method_harness(
+        "build_tactile_sequence", "_build_tactile_sequence_from_encoded_marker"
+    )
     harness = Harness()
     harness.tactile_refinement_settings = SimpleNamespace(enabled=True)
     harness.config = SimpleNamespace(n_action_steps=50, max_action_dim=55)
@@ -347,7 +359,9 @@ def test_model_source_builds_independent_three_models_and_dynamic_spans():
     source = MODEL_PATH.read_text(encoding="utf-8")
     assert "models.append(self.tactile_expert.model)" in source
     assert "tactile_num_layers == action_num_layers == num_layers" in source
-    forward = ast.unparse(_flow_method("build_tactile_sequence"))
+    forward = ast.unparse(
+        _flow_method("_build_tactile_sequence_from_encoded_marker")
+    )
     assert "torch.cat([marker_tokens.to(hidden_dtype), time_token, action_tokens]" in forward
     joint_forward = ast.unparse(
         next(
@@ -378,6 +392,7 @@ def test_fast_path_uses_only_tactile_stream_and_gate_off_action_fallback():
     assert "inputs_embeds=[None, None, tactile_embs]" in velocity
     assert "outputs[2][:, -self.config.n_action_steps:]" in velocity
     assert "_action_fallback_from_boundary" in refine
+    assert "if not contact_active.any()" in refine
     assert "torch.where(contact_active[:, None, None], x_t, fallback)" in refine
 
 
@@ -433,20 +448,29 @@ def test_fast_refinement_is_deterministic_marker_sensitive_and_does_not_run_slow
         tau_split=0.6,
         inference=SimpleNamespace(tactile_steps=6),
     )
-    calls = {"tactile": 0, "fallback": 0}
+    calls = {"encode": 0, "tactile": 0, "fallback": 0}
+
+    def encode(self, **kwargs):
+        calls["encode"] += 1
+        marker = kwargs["marker_displacement_history"]
+        scale = marker.mean(dim=(1, 2, 3, 4))[:, None, None]
+        tokens = scale.expand(marker.shape[0], 192, 8).clone()
+        return (
+            tokens,
+            torch.ones(marker.shape[0], 192, dtype=torch.bool),
+            torch.ones(marker.shape[0], dtype=torch.bool),
+        )
 
     def tactile(self, **kwargs):
         calls["tactile"] += 1
-        marker = kwargs["marker_displacement_history"]
-        scale = marker.mean(dim=(1, 2, 3, 4))[:, None, None]
-        return torch.ones_like(kwargs["x_t"]) * scale, torch.ones(
-            marker.shape[0], dtype=torch.bool
-        )
+        scale = kwargs["marker_tokens"].mean(dim=(1, 2))[:, None, None]
+        return torch.ones_like(kwargs["x_t"]) * scale
 
     def fallback(self, plan, *, state):
         calls["fallback"] += 1
         return torch.full_like(plan.x_split, 99.0)
 
+    harness._encode_tactile_marker_tokens = MethodType(encode, harness)
     harness._predict_tactile_velocity = MethodType(tactile, harness)
     harness._action_fallback_from_boundary = MethodType(fallback, harness)
     plan = CascadedSlowPlan(
@@ -493,8 +517,71 @@ def test_fast_refinement_is_deterministic_marker_sensitive_and_does_not_run_slow
     )
     assert torch.equal(result_a1, result_a2)
     assert not torch.equal(result_a1, result_b)
-    assert calls == {"tactile": 18, "fallback": 0}
+    assert calls == {"encode": 3, "tactile": 18, "fallback": 0}
     assert torch.equal(plan.x_split, torch.zeros_like(plan.x_split))
+
+
+def test_gate_off_routes_before_tactile_expert_and_encodes_marker_once():
+    Harness = _method_harness("refine_action_with_tactile")
+    harness = Harness()
+    harness.tactile_refinement_settings = SimpleNamespace(
+        tau_split=0.6,
+        inference=SimpleNamespace(tactile_steps=6),
+    )
+    calls = {"encode": 0, "tactile": 0, "fallback": 0}
+
+    def encode(self, **kwargs):
+        calls["encode"] += 1
+        batch = kwargs["batch_size"]
+        return (
+            torch.zeros(batch, 192, 8),
+            torch.zeros(batch, 192, dtype=torch.bool),
+            torch.zeros(batch, dtype=torch.bool),
+        )
+
+    def tactile(self, **kwargs):
+        calls["tactile"] += 1
+        raise AssertionError("Tactile Expert must not run when Gate is OFF")
+
+    def fallback(self, plan, *, state):
+        calls["fallback"] += 1
+        return torch.full_like(plan.x_split, 7.0)
+
+    harness._encode_tactile_marker_tokens = MethodType(encode, harness)
+    harness._predict_tactile_velocity = MethodType(tactile, harness)
+    harness._action_fallback_from_boundary = MethodType(fallback, harness)
+    plan = CascadedSlowPlan(
+        x_split=torch.zeros(1, 50, 55),
+        tau_split=0.6,
+        noise=torch.zeros(1, 50, 55),
+        prefix_past_key_values={},
+        past_key_values={},
+        prefix_pad_masks=torch.ones(1, 1, dtype=torch.bool),
+        action_pad_masks=torch.ones(1, 51, dtype=torch.bool),
+        prefix_position_ids=torch.zeros(3, 1, 1, dtype=torch.long),
+        prefix_len=1,
+        action_len=51,
+    )
+    result = harness.refine_action_with_tactile(
+        plan,
+        state=torch.zeros(1, 55),
+        marker_displacement_history=torch.zeros(1, 1, 4, 48, 2),
+        marker_valid_mask=None,
+        marker_history_valid_mask=None,
+        marker_contact_state=None,
+        tactile_sensor_mask=None,
+    )
+    assert torch.equal(result, torch.full_like(result, 7.0))
+    assert calls == {"encode": 1, "tactile": 0, "fallback": 1}
+
+
+def test_frozen_action_loss_is_monitoring_only():
+    source = MODEL_PATH.read_text(encoding="utf-8")
+    forward = ast.unparse(_flow_method("forward"))
+    assert "losses = training.tactile_loss_weight * tactile_losses" in forward
+    assert "action_is_trainable" in forward
+    assert 'getattr(self.config, "train_action_expert", True)' in source
+    assert '"tactile_refinement/action_cascade_loss"' in source
 
 
 def test_old_checkpoint_strict_false_has_only_expected_new_missing_keys():

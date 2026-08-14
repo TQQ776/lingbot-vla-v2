@@ -32,6 +32,11 @@ from lingbotvla.models.vla.lingbot_vla.tactile_vtla import (
     load_vtla_checkpoint_state_dict,
     migrate_legacy_tactile_config,
 )
+from deploy.tacthru_umi_v2.slow_fast_scheduler import (
+    SlowFastValiditySettings,
+    SlowPlanRuntimeState,
+    evaluate_slow_plan,
+)
 
 from lingbotvla.data.vla_data.utils import FeatureTransform
 from lingbotvla.models import build_processor
@@ -103,6 +108,67 @@ class PolicyPreprocessMixin:
                 value = value.to(device=device, dtype=torch.bool)
             result[key] = value
         return result
+
+    def _single_cascaded_model_inputs(
+        self,
+        observation: dict[str, Tensor],
+        *,
+        use_bf16: bool,
+    ) -> tuple[dict, dict]:
+        """Prepare one transformed observation for separate Slow/Fast calls."""
+
+        device = next(self.parameters()).device
+        dtype = torch.bfloat16 if use_bf16 else torch.float32
+        images = observation["images"]
+        img_masks = observation["img_masks"]
+        if images.ndim == 4:
+            images = images.unsqueeze(0)
+            img_masks = img_masks.unsqueeze(0)
+        lang_tokens = observation["lang_tokens"]
+        lang_masks = observation["lang_masks"]
+        state = observation["state"]
+        if lang_tokens.ndim == 1:
+            lang_tokens = lang_tokens.unsqueeze(0)
+            lang_masks = lang_masks.unsqueeze(0)
+        if state.ndim == 1:
+            state = state.unsqueeze(0)
+        tactile = self._tactile_model_kwargs(
+            observation,
+            device=device,
+            dtype=dtype,
+            batched=False,
+        )
+        common = {
+            "state": state.to(device=device, dtype=dtype),
+            **tactile,
+        }
+        slow = {
+            "images": images.to(device=device, dtype=dtype),
+            "img_masks": img_masks.to(device=device),
+            "lang_tokens": lang_tokens.to(device=device),
+            "lang_masks": lang_masks.to(device=device),
+            "image_grid_thw": self._to_device_image_grid_thw(
+                observation.get("image_grid_thw"), device
+            ),
+            "tactile_rgb": tactile.get("tactile_rgb"),
+            "tactile_rgb_grid_thw": tactile.get("tactile_rgb_grid_thw"),
+            "tactile_sensor_mask": tactile.get("tactile_sensor_mask"),
+            "tactile_rgb_mask": tactile.get("tactile_rgb_mask"),
+            "state": common["state"],
+        }
+        fast = {
+            "state": common["state"],
+            "marker_displacement_history": tactile.get(
+                "marker_displacement_history"
+            ),
+            "marker_valid_mask": tactile.get("marker_valid_mask"),
+            "marker_history_valid_mask": tactile.get(
+                "marker_history_valid_mask"
+            ),
+            "marker_contact_state": tactile.get("marker_contact_state"),
+            "tactile_sensor_mask": tactile.get("tactile_sensor_mask"),
+        }
+        return slow, fast
 
     @torch.no_grad
     def select_action(
@@ -283,6 +349,24 @@ class LingbotVLAv2Server:
         self.use_bf16 = use_bf16
         self.use_fp32 = use_fp32
         self.action_key: str= "action"
+        self.vtla_scheduler_mode = os.environ.get(
+            "LINGBOT_V2_VTLA_SCHEDULER", "auto"
+        ).strip().lower()
+        if self.vtla_scheduler_mode not in {
+            "legacy",
+            "auto",
+            "slow",
+            "fast",
+            "slow_and_fast",
+        }:
+            raise ValueError(
+                "LINGBOT_V2_VTLA_SCHEDULER must be one of "
+                "legacy|auto|slow|fast|slow_and_fast"
+            )
+        self.vtla_validity_settings = SlowFastValiditySettings.from_env()
+        self._online_slow_plan = None
+        self._online_plan_runtime = None
+        self.last_inference_metadata = {}
 
     def load_model_weights(self, path_to_pi_model, strict=True):
         all_safetensors = glob(os.path.join(path_to_pi_model, "*.safetensors"))
@@ -438,6 +522,9 @@ class LingbotVLAv2Server:
         self.global_step = 0
         self.last_action_chunk = None
         self.last_normalized_action_chunk = None
+        self._online_slow_plan = None
+        self._online_plan_runtime = None
+        self.last_inference_metadata = {}
 
         robot_config = f'configs/robot_configs/{robo_name}.yaml'
         
@@ -499,6 +586,122 @@ class LingbotVLAv2Server:
             observation['state'] = observation['state'].to(torch.bfloat16)
         return observation
 
+    def _three_stream_online_enabled(self) -> bool:
+        settings = getattr(self.vla.model, "tactile_refinement_settings", None)
+        return bool(
+            self.vtla_scheduler_mode != "legacy"
+            and settings is not None
+            and settings.enabled
+        )
+
+    def _infer_cascaded_single(self, observation, *, return_normalized=False):
+        """Run a stateful Slow/Fast request while preserving the legacy output."""
+
+        source = dict(observation)
+        request = dict(source.pop("_vtla_request", {}) or {})
+        transformed = self._prepare_model_input(source)
+        slow_inputs, fast_inputs = self.vla._single_cascaded_model_inputs(
+            transformed,
+            use_bf16=self.use_bf16,
+        )
+        raw_state = np.asarray(source["observation.state"], dtype=np.float32)
+        instruction = str(source["task"])
+        scene_version = int(request.get("scene_version", 0))
+        executed_offset = int(request.get("executed_offset", 0))
+        if executed_offset < 0:
+            raise ValueError("executed_offset must be non-negative")
+        mode = str(request.get("vtla_mode", self.vtla_scheduler_mode)).strip().lower()
+        if mode not in {"auto", "slow", "fast", "slow_and_fast"}:
+            raise ValueError(
+                "vtla_mode must be one of auto|slow|fast|slow_and_fast"
+            )
+        decision = evaluate_slow_plan(
+            self._online_plan_runtime,
+            current_state=raw_state,
+            instruction=instruction,
+            scene_version=scene_version,
+            executed_offset=executed_offset,
+            settings=self.vtla_validity_settings,
+        )
+        if mode in {"slow", "slow_and_fast"}:
+            decision = type(decision)(
+                "rebuild",
+                f"forced_{mode}",
+                decision.age_s,
+                decision.prefix_age_s,
+                decision.position_drift_m,
+                decision.rotation_drift_rad,
+                decision.gripper_drift_m,
+                decision.executed_offset_delta,
+            )
+        elif mode == "fast" and decision.level != "reuse":
+            raise RuntimeError(
+                "Forced fast VTLA request requires a reusable Slow plan; "
+                f"current decision is {decision.level}:{decision.reason}"
+            )
+
+        stage_timing_s = {"slow_s": 0.0, "action_refresh_s": 0.0, "fast_s": 0.0}
+        if decision.level == "rebuild":
+            started = time.perf_counter()
+            self._online_slow_plan = self.vla.build_cascaded_slow_plan(
+                **slow_inputs,
+                executed_offset=executed_offset,
+                scene_version=scene_version,
+            )
+            if slow_inputs["state"].device.type == "cuda":
+                torch.cuda.synchronize(slow_inputs["state"].device)
+            stage_timing_s["slow_s"] = time.perf_counter() - started
+            self._online_plan_runtime = SlowPlanRuntimeState(
+                state=raw_state.copy(),
+                created_at_s=self._online_slow_plan.created_at_s,
+                prefix_created_at_s=self._online_slow_plan.prefix_created_at_s,
+                executed_offset=executed_offset,
+                instruction=instruction,
+                scene_version=scene_version,
+                plan_version=self._online_slow_plan.plan_version,
+            )
+        elif decision.level == "refresh_action":
+            started = time.perf_counter()
+            self._online_slow_plan = self.vla.refresh_cascaded_action_plan(
+                self._online_slow_plan,
+                state=fast_inputs["state"],
+                executed_offset=executed_offset,
+            )
+            if fast_inputs["state"].device.type == "cuda":
+                torch.cuda.synchronize(fast_inputs["state"].device)
+            stage_timing_s["action_refresh_s"] = time.perf_counter() - started
+            self._online_plan_runtime = SlowPlanRuntimeState(
+                state=raw_state.copy(),
+                created_at_s=self._online_slow_plan.created_at_s,
+                prefix_created_at_s=self._online_slow_plan.prefix_created_at_s,
+                executed_offset=executed_offset,
+                instruction=instruction,
+                scene_version=scene_version,
+                plan_version=self._online_slow_plan.plan_version,
+            )
+
+        started = time.perf_counter()
+        normalized_actions = self.vla.refine_action_with_tactile(
+            self._online_slow_plan,
+            **fast_inputs,
+        ).to(dtype=torch.float32, device="cpu")
+        stage_timing_s["fast_s"] = time.perf_counter() - started
+        unnormalized_actions = self._unapply_batched_actions(
+            [transformed], normalized_actions
+        )
+        self.last_inference_metadata = {
+            "enabled": True,
+            "request_mode": mode,
+            "decision": decision.to_dict(),
+            "plan_version": self._online_slow_plan.plan_version,
+            "scene_version": self._online_slow_plan.scene_version,
+            "executed_offset": executed_offset,
+            "timing_s": stage_timing_s,
+        }
+        if return_normalized:
+            return unnormalized_actions, normalized_actions
+        return unnormalized_actions
+
     @staticmethod
     def _pad_and_stack_tensors(values):
         shapes = [tuple(value.shape) for value in values]
@@ -524,6 +727,11 @@ class LingbotVLAv2Server:
     def _infer_batch(self, observations, return_normalized=False):
         if not isinstance(observations, (list, tuple)) or len(observations) == 0:
             raise ValueError("batch observation must be a non-empty list")
+        if len(observations) == 1 and self._three_stream_online_enabled():
+            return self._infer_cascaded_single(
+                observations[0], return_normalized=return_normalized
+            )
+        self.last_inference_metadata = {"enabled": False, "mode": "legacy"}
         applied = [self._prepare_model_input(obs) for obs in observations] # bsize, dict{key }
         batch_observation = {}
         for key in applied[0].keys():
@@ -609,6 +817,9 @@ class LingbotVLAv2Server:
                 normalized_action = normalized_action[0]
 
         result = action
+        if not is_batch and self.last_inference_metadata:
+            result = dict(result)
+            result["_vtla_scheduler"] = dict(self.last_inference_metadata)
         if return_normalized:
             result = dict(result)
             result["_normalized_actions"] = normalized_action

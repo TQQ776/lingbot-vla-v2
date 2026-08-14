@@ -1292,6 +1292,7 @@ def run_realman(
             runtime.reset_episode_start()
 
         period = 1.0 / args.rate_hz if args.rate_hz > 0 else 0.0
+        executed_action_offset = 0
         for step_index in range(args.steps):
             loop_start = time.time()
             camera_frame = camera.capture()
@@ -1356,6 +1357,7 @@ def run_realman(
                 metadata={
                     "episode_reset": step_index == 0,
                     "client_step": step_index,
+                    "executed_offset": executed_action_offset,
                     "pose_frame": POSE_FRAME,
                     "dry_run": not args.execute,
                     "camera_capture_timestamp": camera_frame.capture_timestamp,
@@ -1432,6 +1434,8 @@ def run_realman(
                 control_frequency_hz=args.control_frequency,
             )
             execution = runtime.execute_plan(plan) if args.execute else None
+            if execution and execution.get("dispatched"):
+                executed_action_offset += int(len(plan.selected_indices))
             verification = None
             if args.execute and not args.stream_replan and len(plan.timestamps):
                 wait_until = float(plan.timestamps[-1]) + 0.05

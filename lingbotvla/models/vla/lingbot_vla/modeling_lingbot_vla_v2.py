@@ -1,4 +1,5 @@
 import einops
+import time
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
@@ -1685,6 +1686,42 @@ class FlowMatchingV2(FlowMatchingV1):
                 tactile_sensor_mask=tactile_sensor_mask,
             )
         )
+        tactile_seq, tactile_pad_masks = (
+            self._build_tactile_sequence_from_encoded_marker(
+                x_t=x_t,
+                timestep=timestep,
+                marker_tokens=marker_tokens,
+                marker_mask=marker_mask,
+            )
+        )
+        return tactile_seq, tactile_pad_masks, contact_active
+
+    def _build_tactile_sequence_from_encoded_marker(
+        self,
+        *,
+        x_t: Tensor,
+        timestep: Tensor,
+        marker_tokens: Tensor,
+        marker_mask: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Rebuild only dynamic ``tau``/``X_tau`` tokens for one Euler step."""
+
+        batch_size = x_t.shape[0]
+        marker_count = (
+            self.tactile_settings.num_sensors
+            * self.tactile_settings.marker_history_length
+            * self.tactile_settings.marker_tokenization.num_regions
+        )
+        if marker_tokens.shape[:2] != (batch_size, marker_count):
+            raise ValueError(
+                "Encoded Marker tokens must have shape "
+                f"[B,{marker_count},D], got {tuple(marker_tokens.shape)}"
+            )
+        if marker_mask.shape != (batch_size, marker_count):
+            raise ValueError(
+                "Encoded Marker mask must have shape "
+                f"[B,{marker_count}], got {tuple(marker_mask.shape)}"
+            )
         hidden_dtype = self.tactile_action_in_proj.weight.dtype
         time_token = self.tactile_time_embedder(
             timestep,
@@ -1701,18 +1738,13 @@ class FlowMatchingV2(FlowMatchingV1):
             dtype=torch.bool,
         )
         tactile_pad_masks = torch.cat([marker_mask, always_valid], dim=1)
-        marker_count = (
-            self.tactile_settings.num_sensors
-            * self.tactile_settings.marker_history_length
-            * self.tactile_settings.marker_tokenization.num_regions
-        )
         expected_length = marker_count + 1 + self.config.n_action_steps
         if tactile_seq.shape[1] != expected_length:
             raise RuntimeError(
                 f"Expected a {expected_length}-token tactile stream, "
                 f"got {tactile_seq.shape[1]}"
             )
-        return tactile_seq, tactile_pad_masks, contact_active
+        return tactile_seq, tactile_pad_masks
 
     def _cached_action_attention_mask(
         self,
@@ -1997,21 +2029,32 @@ class FlowMatchingV2(FlowMatchingV1):
             prefix_len=prefix_pad_masks.shape[1],
             action_len=action_pad_masks.shape[1],
         )
-        tactile_velocity, _ = self._predict_tactile_velocity(
-            plan=plan,
-            x_t=tactile_x_t,
-            timestep=tactile_time,
+        marker_tokens, marker_mask, _ = self._encode_tactile_marker_tokens(
+            batch_size=state.shape[0],
+            device=state.device,
             marker_displacement_history=marker_displacement_history,
             marker_valid_mask=marker_valid_mask,
             marker_history_valid_mask=marker_history_valid_mask,
             marker_contact_state=marker_contact_state,
             tactile_sensor_mask=tactile_sensor_mask,
+        )
+        tactile_velocity = self._predict_tactile_velocity(
+            plan=plan,
+            x_t=tactile_x_t,
+            timestep=tactile_time,
+            marker_tokens=marker_tokens,
+            marker_mask=marker_mask,
             past_key_values=boundary_cache,
         )
 
         auxiliary_velocity = None
+        action_is_trainable = (
+            not training.freeze_action_expert
+            and getattr(self.config, "train_action_expert", True)
+        )
         auxiliary_exposed = (
-            training.action_full_range_loss_weight > 0
+            action_is_trainable
+            and training.action_full_range_loss_weight > 0
             and torch.rand((), device=state.device).item()
             < training.action_full_range_exposure_prob
         )
@@ -2273,7 +2316,13 @@ class FlowMatchingV2(FlowMatchingV1):
             )
         if self.tactile_refinement_settings.enabled:
             training = self.tactile_refinement_settings.training
-            losses = action_losses + training.tactile_loss_weight * tactile_losses
+            losses = training.tactile_loss_weight * tactile_losses
+            action_is_trainable = (
+                not training.freeze_action_expert
+                and getattr(self.config, "train_action_expert", True)
+            )
+            if action_is_trainable:
+                losses = losses + action_losses
             auxiliary_velocity = cascaded["auxiliary_velocity"]
             if auxiliary_velocity is not None:
                 if loss_type == "fm":
@@ -2460,6 +2509,8 @@ class FlowMatchingV2(FlowMatchingV1):
         tactile_rgb_grid_thw: Tensor | None = None,
         tactile_sensor_mask: Tensor | None = None,
         tactile_rgb_mask: Tensor | None = None,
+        executed_offset: int = 0,
+        scene_version: int = 0,
     ) -> CascadedSlowPlan:
         """Run Prefix once and Action only from ``tau=1`` to ``tau_split``."""
 
@@ -2532,6 +2583,9 @@ class FlowMatchingV2(FlowMatchingV1):
             prefix_position_ids=prefix_position_ids,
             prefix_past_key_values=prefix_cache,
         )
+        plan_version = int(getattr(self, "_cascaded_plan_version", 0)) + 1
+        self._cascaded_plan_version = plan_version
+        created_at_s = time.monotonic()
         return CascadedSlowPlan(
             x_split=x_split,
             tau_split=self.tactile_refinement_settings.tau_split,
@@ -2543,6 +2597,62 @@ class FlowMatchingV2(FlowMatchingV1):
             prefix_position_ids=prefix_position_ids.detach().clone(),
             prefix_len=prefix_pad_masks.shape[1],
             action_len=action_pad_masks.shape[1],
+            created_at_s=created_at_s,
+            prefix_created_at_s=created_at_s,
+            state_at_plan=state.detach().clone(),
+            executed_offset=int(executed_offset),
+            plan_version=plan_version,
+            scene_version=int(scene_version),
+        )
+
+    @torch.no_grad()
+    def refresh_cascaded_action_plan(
+        self,
+        plan: CascadedSlowPlan,
+        *,
+        state: Tensor,
+        executed_offset: int = 0,
+    ) -> CascadedSlowPlan:
+        """Reuse Prefix K/V while rebuilding Action ``1 -> tau_split`` for new state."""
+
+        if state.shape[0] != plan.x_split.shape[0]:
+            raise ValueError("State batch size does not match the cached Slow plan")
+        x_split = self._rollout_action_to_boundary(
+            state=state,
+            noise=plan.noise,
+            prefix_pad_masks=plan.prefix_pad_masks,
+            prefix_position_ids=plan.prefix_position_ids,
+            prefix_cache=plan.prefix_past_key_values,
+        ).detach()
+        boundary_cache, action_pad_masks = self._refresh_action_boundary_cache(
+            state=state,
+            x_split=x_split,
+            prefix_pad_masks=plan.prefix_pad_masks,
+            prefix_position_ids=plan.prefix_position_ids,
+            prefix_past_key_values=plan.prefix_past_key_values,
+        )
+        plan_version = int(getattr(self, "_cascaded_plan_version", 0)) + 1
+        self._cascaded_plan_version = plan_version
+        created_at_s = time.monotonic()
+        return CascadedSlowPlan(
+            x_split=x_split.clone(),
+            tau_split=plan.tau_split,
+            noise=plan.noise,
+            prefix_past_key_values=clone_kv_cache(plan.prefix_past_key_values),
+            past_key_values=clone_kv_cache(boundary_cache),
+            prefix_pad_masks=plan.prefix_pad_masks,
+            action_pad_masks=action_pad_masks.detach().clone(),
+            prefix_position_ids=plan.prefix_position_ids,
+            prefix_len=plan.prefix_len,
+            action_len=action_pad_masks.shape[1],
+            created_at_s=created_at_s,
+            prefix_created_at_s=(
+                plan.prefix_created_at_s or plan.created_at_s or created_at_s
+            ),
+            state_at_plan=state.detach().clone(),
+            executed_offset=int(executed_offset),
+            plan_version=plan_version,
+            scene_version=plan.scene_version,
         )
 
     def _predict_tactile_velocity(
@@ -2551,21 +2661,17 @@ class FlowMatchingV2(FlowMatchingV1):
         plan: CascadedSlowPlan,
         x_t: Tensor,
         timestep: Tensor,
-        marker_displacement_history: Tensor | None,
-        marker_valid_mask: Tensor | None,
-        marker_history_valid_mask: Tensor | None,
-        marker_contact_state: Tensor | None,
-        tactile_sensor_mask: Tensor | None,
+        marker_tokens: Tensor,
+        marker_mask: Tensor,
         past_key_values: dict[int, dict[str, Tensor]],
-    ) -> tuple[Tensor, Tensor]:
-        tactile_embs, tactile_pad_masks, contact_active = self.build_tactile_sequence(
-            x_t,
-            timestep,
-            marker_displacement_history=marker_displacement_history,
-            marker_valid_mask=marker_valid_mask,
-            marker_history_valid_mask=marker_history_valid_mask,
-            marker_contact_state=marker_contact_state,
-            tactile_sensor_mask=tactile_sensor_mask,
+    ) -> Tensor:
+        tactile_embs, tactile_pad_masks = (
+            self._build_tactile_sequence_from_encoded_marker(
+                x_t=x_t,
+                timestep=timestep,
+                marker_tokens=marker_tokens,
+                marker_mask=marker_mask,
+            )
         )
         attention_mask = self._cached_tactile_attention_mask(
             plan.prefix_pad_masks,
@@ -2603,7 +2709,7 @@ class FlowMatchingV2(FlowMatchingV1):
             raise RuntimeError("Tactile velocity head must read the final Action tokens")
         output_dtype = self.tactile_action_out_proj.weight.dtype
         velocity = self.tactile_action_out_proj(tactile_hidden.to(output_dtype))
-        return velocity.to(dtype=x_t.dtype), contact_active
+        return velocity.to(dtype=x_t.dtype)
 
     @torch.no_grad()
     def _action_fallback_from_boundary(
@@ -2650,13 +2756,21 @@ class FlowMatchingV2(FlowMatchingV1):
         if abs(plan.tau_split - self.tactile_refinement_settings.tau_split) > 1e-6:
             raise ValueError("Slow plan tau_split does not match model configuration")
         original_x_split = plan.x_split.clone()
+        marker_tokens, marker_mask, contact_active = self._encode_tactile_marker_tokens(
+            batch_size=state.shape[0],
+            device=state.device,
+            marker_displacement_history=marker_displacement_history,
+            marker_valid_mask=marker_valid_mask,
+            marker_history_valid_mask=marker_history_valid_mask,
+            marker_contact_state=marker_contact_state,
+            tactile_sensor_mask=tactile_sensor_mask,
+        )
+        if not contact_active.any():
+            return self._action_fallback_from_boundary(plan, state=state)
         x_t = plan.x_split.clone()
         cache = clone_kv_cache(plan.past_key_values)
         steps = self.tactile_refinement_settings.inference.tactile_steps
         dt = -plan.tau_split / steps
-        contact_active = torch.ones(
-            state.shape[0], device=state.device, dtype=torch.bool
-        )
         for index in range(steps):
             timestep = torch.full(
                 (state.shape[0],),
@@ -2664,15 +2778,12 @@ class FlowMatchingV2(FlowMatchingV1):
                 device=state.device,
                 dtype=state.dtype,
             )
-            velocity, contact_active = self._predict_tactile_velocity(
+            velocity = self._predict_tactile_velocity(
                 plan=plan,
                 x_t=x_t,
                 timestep=timestep,
-                marker_displacement_history=marker_displacement_history,
-                marker_valid_mask=marker_valid_mask,
-                marker_history_valid_mask=marker_history_valid_mask,
-                marker_contact_state=marker_contact_state,
-                tactile_sensor_mask=tactile_sensor_mask,
+                marker_tokens=marker_tokens,
+                marker_mask=marker_mask,
                 past_key_values=cache,
             )
             x_t = x_t + dt * velocity
@@ -3131,6 +3242,15 @@ class LingbotVlaV2Policy(PreTrainedModel):
         """Expose a Fast tactile-only tick without rerunning Prefix or Action."""
 
         return self.model.refine_action_with_tactile(plan, **kwargs)
+
+    def refresh_cascaded_action_plan(
+        self,
+        plan: CascadedSlowPlan,
+        **kwargs,
+    ) -> CascadedSlowPlan:
+        """Reuse Prefix K/V and refresh the Action boundary for current state."""
+
+        return self.model.refresh_cascaded_action_plan(plan, **kwargs)
 
 
 ModelClass = LingbotVlaV2Policy

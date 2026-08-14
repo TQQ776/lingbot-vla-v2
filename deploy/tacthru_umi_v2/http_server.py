@@ -53,8 +53,13 @@ class BackendBusy(RuntimeError):
         self.timing_s = dict(timing_s or {})
 
 
+def _online_scheduler_enabled(policy) -> bool:
+    probe = getattr(policy, "_three_stream_online_enabled", None)
+    return bool(probe()) if callable(probe) else False
+
+
 class LingBotV2Backend:
-    """Serialized, stateless-request facade around ``LingbotVLAv2Server``."""
+    """Serialized facade around legacy or stateful Slow/Fast policy inference."""
 
     def __init__(
         self,
@@ -181,7 +186,11 @@ class LingBotV2Backend:
             "dtype": self.dtype,
             "use_compile": self.use_compile,
             "max_concurrent_inference": 1,
-            "requests_are_stateless": True,
+            "requests_are_stateless": not _online_scheduler_enabled(self.policy),
+            "vtla_slow_fast_scheduler": {
+                "enabled": _online_scheduler_enabled(self.policy),
+                "mode": getattr(self.policy, "vtla_scheduler_mode", "legacy"),
+            },
             "contract": self.contract,
             "request_count": self._request_count,
             "uptime_s": time.time() - self.started_at,
@@ -231,6 +240,13 @@ class LingBotV2Backend:
                 CAMERA_KEY: np.asarray(observation.wrist_rgb, dtype=np.uint8),
                 "task": observation.instruction,
             }
+            vtla_request = {
+                key: observation.metadata[key]
+                for key in ("vtla_mode", "scene_version", "executed_offset")
+                if key in observation.metadata
+            }
+            if vtla_request or _online_scheduler_enabled(self.policy):
+                model_observation["_vtla_request"] = vtla_request
             model_observation.update(
                 _model_tactile_observation(observation, self.tactile_contract)
             )
@@ -244,6 +260,7 @@ class LingBotV2Backend:
             if action.ndim == 3 and action.shape[0] == 1:
                 action = action[0]
             action = validate_action_chunk(action, expected_steps=self.chunk_size)
+            scheduler_metadata = result.get("_vtla_scheduler")
             postprocess_s = time.perf_counter() - postprocess_started
             inference_time_s = time.perf_counter() - inference_started
             server_timing_s = {
@@ -271,6 +288,7 @@ class LingBotV2Backend:
                     "input_state": "episode-start-frame xyz+quaternion_xyzw+gripper_width_m",
                     "output_action": "episode-start-frame absolute xyz+quaternion_xyzw+gripper_width_m",
                     "contract_sha256": self.contract.get("combined_sha256"),
+                    "vtla_scheduler": scheduler_metadata,
                 },
                 server_timestamp=time.time(),
             )

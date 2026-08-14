@@ -171,6 +171,14 @@ class TactileTrainingSettings:
                 raise ValueError(f"{name} must be in [0,1]")
         if result.tactile_loss_weight <= 0 or result.action_full_range_loss_weight < 0:
             raise ValueError("Cascaded loss weights must be non-negative")
+        if (
+            not result.freeze_action_expert
+            and result.action_full_range_loss_weight <= 0
+        ):
+            raise ValueError(
+                "Trainable Action Expert requires action_full_range_loss_weight > 0 "
+                "so gate-off fallback retains the full tau range"
+            )
         return result
 
 
@@ -252,6 +260,12 @@ class CascadedSlowPlan:
     prefix_position_ids: Tensor
     prefix_len: int
     action_len: int
+    created_at_s: float = 0.0
+    prefix_created_at_s: float = 0.0
+    state_at_plan: Tensor | None = None
+    executed_offset: int = 0
+    plan_version: int = 0
+    scene_version: int = 0
 
 
 def clone_kv_cache(

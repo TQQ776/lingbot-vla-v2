@@ -91,6 +91,12 @@ Every Fast call clones the cache containers and starts from a clone of the same
 `CascadedSlowPlan.x_split`. It does not feed the previous Fast result back as a
 new boundary.
 
+Marker encoding and contact routing happen once before the Fast Euler loop.
+Gate ON reuses the encoded Marker tokens for all six Tactile steps. Gate OFF
+skips the Tactile Expert entirely and runs only the Action fallback. A mixed
+batch keeps static shapes and evaluates both lower-flow branches before the
+per-sample selection; the real-robot batch-one path never pays for both.
+
 ## Training
 
 Action cascade training samples `tau_A ~ U(0.6, 1)` and constructs
@@ -109,6 +115,11 @@ The first-stage YAML freezes Qwen3-VL and Action Expert. Trainable modules are:
 - independent 36-layer Tactile Expert;
 - `tactile_time_embedder`;
 - tactile Action input/output projections.
+
+In this frozen-Action stage, the Action cascade loss remains a detached
+monitoring metric but is not added to the optimization tensor. If Action is
+unfrozen, configuration validation requires a positive full-range Action loss
+weight so the gate-off `0.6 -> 0` fallback is not silently forgotten.
 
 Resolved parameter counts for the configured Qwen3-VL hidden size 2560 were
 computed on the `meta` device (shape allocation only):
@@ -144,6 +155,57 @@ copies shape-compatible loaded Action decoder/projection values into independent
 Tactile parameters. A newly migrated checkpoint still requires Tactile training
 before deployment.
 
+## Online Slow/Fast Scheduler
+
+The deployment policy now owns one Slow plan per active robot session. The
+default `LINGBOT_V2_VTLA_SCHEDULER=auto` path makes a three-level decision before
+every batch-one request:
+
+| Decision | Computation |
+|---|---|
+| `reuse` | Reuse Prefix+Action K/V and run Fast tactile/fallback only |
+| `refresh_action` | Reuse Prefix K/V, rerun Action `1 -> 0.6`, refresh boundary K/V, then Fast |
+| `rebuild` | Re-encode RGB/TacRGB/language, rebuild Prefix and Action Slow plan, then Fast |
+
+Validity is not a single 55-D norm. It independently checks raw 8-D robot
+position drift, quaternion rotation drift, gripper drift, plan age, executed
+action offset, instruction, and an optional explicit scene version. The Realman
+client sends cumulative `executed_offset`; callers may additionally send:
+
+Action refresh updates the Action-plan timestamp but preserves the original
+Prefix timestamp. Therefore repeated Action-only refreshes cannot keep stale
+RGB/TacRGB Prefix K/V alive indefinitely.
+
+```text
+metadata.vtla_mode = auto | slow | fast | slow_and_fast
+metadata.scene_version = non-negative integer
+metadata.executed_offset = non-negative integer
+```
+
+`fast` is strict: it fails instead of using a stale/missing Slow plan. `slow`
+and `slow_and_fast` force a full rebuild followed by Fast refinement. Set
+`LINGBOT_V2_VTLA_SCHEDULER=legacy` before server startup to retain the original
+one-request full `sample_actions()` path.
+
+Thresholds are configurable without changing model weights:
+
+```text
+LINGBOT_V2_VTLA_REUSE_MAX_AGE_S
+LINGBOT_V2_VTLA_ACTION_REFRESH_MAX_AGE_S
+LINGBOT_V2_VTLA_REUSE_MAX_POSITION_DRIFT_M
+LINGBOT_V2_VTLA_ACTION_REFRESH_MAX_POSITION_DRIFT_M
+LINGBOT_V2_VTLA_REUSE_MAX_ROTATION_DRIFT_RAD
+LINGBOT_V2_VTLA_ACTION_REFRESH_MAX_ROTATION_DRIFT_RAD
+LINGBOT_V2_VTLA_REUSE_MAX_GRIPPER_DRIFT_M
+LINGBOT_V2_VTLA_ACTION_REFRESH_MAX_GRIPPER_DRIFT_M
+LINGBOT_V2_VTLA_REUSE_MAX_EXECUTED_OFFSET
+LINGBOT_V2_VTLA_ACTION_REFRESH_MAX_EXECUTED_OFFSET
+```
+
+Every response reports the selected level/reason, drift metrics, plan version,
+and wall-clock `slow_s`, `action_refresh_s`, and `fast_s` fields under
+`metadata.vtla_scheduler`.
+
 ## Files
 
 - `tactile_action_expert.py`: validated configuration, independent expert
@@ -156,19 +218,25 @@ before deployment.
 - `optim/vtla.py` and `train_lingbotvla.py`: optimizer groups, freezing and
   runtime metadata.
 - `test_tactile_three_stream_mot.py`: architecture and behavioral tests.
+- `slow_fast_scheduler.py`: pure raw-state validity policy for cached plans.
+- `lingbot_vla_v2_policy.py` and `http_server.py`: stateful online scheduler,
+  response profiling, and backward-compatible request routing.
+- `test_tactile_slow_fast_scheduler.py` and
+  `test_tactile_online_scheduler_policy.py`: validity and policy routing tests.
 
 ## Verification and Profiling
 
 Unit tests verify the 243-token shape, 36/36/36 layer contract, independent
 parameters, mask matrix, Marker sensitivity, deterministic Fast behavior,
 immutable boundary/cache semantics, gate fallback, schedule, checkpoint
-compatibility, and first-stage gradients.
+compatibility, first-stage gradients, protocol metadata, and online plan
+routing. The model/deployment and legacy VTLA regression groups report
+`138 passed`; two existing PyTorch DCP deprecation warnings remain.
 
-Slow and Fast latency must be profiled on the target GPU with the actual 6B
-checkpoint. This development environment does not contain the Qwen3-VL assets
-or CUDA runtime needed to report meaningful hardware latency.
-
-Known remaining system-level work: the model exposes separate
-`build_cascaded_slow_plan()` and `refine_action_with_tactile()` APIs, but a
-robot controller must schedule those APIs at its desired Slow/Fast rates and
-replace a Slow plan when observations or the executed horizon make it stale.
+Slow and Fast latency must still be profiled on the target GPU with the actual
+6B checkpoint. The response now exposes the required stage timings, but this
+development environment does not contain a trained three-stream checkpoint, so
+it cannot report representative latency or memory usage. The roughly 415M new
+tactile-side parameters remain randomly/copy initialized until a `three_vtla`
+checkpoint is trained; code and unit-test completion does not make the current
+baseline checkpoint robot-ready.

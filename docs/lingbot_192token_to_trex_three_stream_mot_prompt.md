@@ -1137,7 +1137,11 @@ Fast tactile tick 不重新跑 ViT / Prefix-Qwen / Action upper-flow。
 - Action `1 -> 0.6`、边界 Action KV 刷新；
 - Tactile `0.6 -> 0`、不可变 `X0.6` 与缓存复用；
 - gate-off Action fallback；
+- Marker/Gate在Fast Euler循环前只计算一次，Gate OFF跳过Tactile Expert；
 - cascaded tau 训练和 rollout boundary exposure；
+- 冻结Action阶段的Action loss仅监控，不混入优化loss；
+- 带plan age、位姿/夹爪漂移、执行offset和scene version的三级Slow Plan有效性判断；
+- 部署侧`reuse / refresh_action / rebuild`在线Slow/Fast调度和分段耗时回传；
 - 第一阶段冻结与新模块优化器分组；
 - legacy/checkpoint 兼容；
 - 专用配置、测试和架构报告。
@@ -1148,5 +1152,10 @@ Fast tactile tick 不重新跑 ViT / Prefix-Qwen / Action upper-flow。
 docs/VTLA_THREE_STREAM_MOT_ARCHITECTURE.md
 ```
 
-验证状态：专用及相关回归 `170 passed`；另有一个基线测试在收集阶段
-要求当前基线并不存在的 `RetryableInferenceError`，与本改造文件无关。
+最新增量验证覆盖模型、Gate、调度、HTTP、in-process、Realman安全路径及
+旧VTLA/区域门控，共 `138 passed`、2条既有PyTorch DCP弃用warning。另有
+一个基线测试在收集阶段要求当前基线并不存在的 `RetryableInferenceError`，
+与本改造文件无关。
+
+仍未完成：必须先训练约415M新增触觉侧参数，并在目标GPU用真实6B checkpoint
+测量Slow/Fast/Gate-OFF latency和显存，才能判断是否达到真机实时频率。
