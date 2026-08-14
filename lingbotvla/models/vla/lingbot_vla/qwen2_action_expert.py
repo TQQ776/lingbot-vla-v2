@@ -76,7 +76,10 @@ from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2Model as _Qwen2Model,
     Qwen2ForCausalLM as _Qwen2ForCausalLM,
 )
-from lingbotvla.ops.robby_moe import robby_moe_forward
+try:
+    from lingbotvla.ops.robby_moe import robby_moe_forward
+except (ImportError, ModuleNotFoundError):
+    robby_moe_forward = None
 # from transformers.models.mistral.modeling_mistral import MistralMLP
 
 # Modified from transformers.models.mistral.modeling_mistral.MistralMLP with Mistral->Qwen2Moe

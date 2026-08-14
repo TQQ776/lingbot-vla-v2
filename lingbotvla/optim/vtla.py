@@ -16,6 +16,15 @@ ACTION_PARAMETER_FRAGMENTS = (
     "action_time_mlp_out.",
 )
 
+TACTILE_PARAMETER_FRAGMENTS = (
+    "tactile_encoder.",
+    "tactile_expert.",
+    "marker_to_tactile_proj.",
+    "tactile_time_embedder.",
+    "tactile_action_in_proj.",
+    "tactile_action_out_proj.",
+)
+
 
 def build_vtla_param_groups(
     model: nn.Module,
@@ -54,7 +63,7 @@ def build_vtla_param_groups(
         if identifier in seen:
             raise ValueError(f"Trainable parameter {name} appears more than once")
         seen.add(identifier)
-        if "tactile_encoder." in name:
+        if any(fragment in name for fragment in TACTILE_PARAMETER_FRAGMENTS):
             target = "tactile"
         elif any(fragment in name for fragment in ACTION_PARAMETER_FRAGMENTS):
             target = "action_expert"
@@ -103,6 +112,7 @@ def summarize_vtla_param_groups(
 
 __all__ = [
     "ACTION_PARAMETER_FRAGMENTS",
+    "TACTILE_PARAMETER_FRAGMENTS",
     "build_vtla_param_groups",
     "summarize_vtla_param_groups",
 ]

@@ -94,6 +94,65 @@ def make_att_2d_masks(pad_masks, att_masks):
     return att_2d_masks
 
 
+def build_three_stream_attention_mask(
+    prefix_pad_masks: Tensor,
+    prefix_att_masks: Tensor,
+    action_pad_masks: Tensor,
+    action_att_masks: Tensor,
+    tactile_pad_masks: Tensor,
+) -> Tensor:
+    """Preserve legacy P/A masks and add the one-way P -> A -> T blocks.
+
+    The returned square mask uses ``True`` for a visible Q/K edge. Prefix and
+    Action intra/inter-stream semantics are copied byte-for-byte from the
+    original two-stream mask. Tactile queries can read every valid Prefix,
+    Action, and Tactile token; Prefix and Action queries cannot read Tactile.
+    """
+
+    for name, value in (
+        ("prefix_pad_masks", prefix_pad_masks),
+        ("prefix_att_masks", prefix_att_masks),
+        ("action_pad_masks", action_pad_masks),
+        ("action_att_masks", action_att_masks),
+        ("tactile_pad_masks", tactile_pad_masks),
+    ):
+        if value.ndim != 2:
+            raise ValueError(f"{name} must be [B,L]")
+    batch = prefix_pad_masks.shape[0]
+    if any(
+        value.shape[0] != batch
+        for value in (action_pad_masks, tactile_pad_masks)
+    ):
+        raise ValueError("All three stream masks must have the same batch size")
+
+    pa_pad = torch.cat([prefix_pad_masks, action_pad_masks], dim=1)
+    pa_att = torch.cat([prefix_att_masks, action_att_masks], dim=1)
+    pa_mask = make_att_2d_masks(pa_pad, pa_att)
+    prefix_len = prefix_pad_masks.shape[1]
+    action_len = action_pad_masks.shape[1]
+    tactile_len = tactile_pad_masks.shape[1]
+    pa_len = prefix_len + action_len
+    full = torch.zeros(
+        batch,
+        pa_len + tactile_len,
+        pa_len + tactile_len,
+        device=prefix_pad_masks.device,
+        dtype=torch.bool,
+    )
+    full[:, :pa_len, :pa_len] = pa_mask
+    tactile_query_valid = tactile_pad_masks[:, :, None]
+    full[:, pa_len:, :prefix_len] = (
+        tactile_query_valid & prefix_pad_masks[:, None, :]
+    )
+    full[:, pa_len:, prefix_len:pa_len] = (
+        tactile_query_valid & action_pad_masks[:, None, :]
+    )
+    full[:, pa_len:, pa_len:] = (
+        tactile_query_valid & tactile_pad_masks[:, None, :]
+    )
+    return full
+
+
 def prefix_query_segments(
     use_depth_align,
     use_future_depth,

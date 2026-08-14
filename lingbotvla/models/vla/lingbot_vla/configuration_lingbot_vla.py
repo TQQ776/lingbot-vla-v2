@@ -19,6 +19,7 @@ from typing import Any, Dict, Literal, Optional
 from transformers import AutoConfig, PretrainedConfig
 
 from .tactile_vtla import TactileVTLAConfig
+from .tactile_action_expert import TactileRefinementConfig
 
 class LingbotVLAConfig(PretrainedConfig):
     """Configuration class for Lingbot-VLA.
@@ -96,6 +97,7 @@ class LingbotVLAConfig(PretrainedConfig):
         train_state_proj: bool = True,
 
         tactile: Optional[Dict[str, Any]] = None,
+        tactile_refinement: Optional[Dict[str, Any]] = None,
         freeze_vlm: bool = False,
         train_action_expert: bool = True,
         new_modules_lr: float = 1.0e-4,
@@ -117,6 +119,31 @@ class LingbotVLAConfig(PretrainedConfig):
             raise ValueError("new_modules_lr and action_expert_lr must be positive")
         self.tactile = TactileVTLAConfig.from_mapping(tactile).to_dict()
         self.tactile_enabled = bool(self.tactile["enabled"])
+        self.tactile_refinement = TactileRefinementConfig.from_mapping(
+            tactile_refinement
+        ).to_dict()
+        self.tactile_refinement_enabled = bool(self.tactile_refinement["enabled"])
+        if self.tactile_refinement_enabled:
+            tactile_settings = TactileVTLAConfig.from_mapping(tactile)
+            if not tactile_settings.enabled or not tactile_settings.use_markers:
+                raise ValueError(
+                    "three-stream tactile refinement requires tactile Marker encoding"
+                )
+            expected_markers = (
+                tactile_settings.num_sensors
+                * tactile_settings.marker_history_length
+                * tactile_settings.marker_tokenization.num_regions
+            )
+            if expected_markers != 192:
+                raise ValueError(
+                    "The first three-stream configuration requires exactly 192 "
+                    f"Marker tokens, got {expected_markers}"
+                )
+            if chunk_size != 50 or action_dim != 55 or max_action_dim != 55:
+                raise ValueError(
+                    "The first three-stream configuration requires chunk_size=50 "
+                    "and action_dim=max_action_dim=55"
+                )
         self.use_cache = False
         self.attention_implementation = attention_implementation
         self.num_steps = 10

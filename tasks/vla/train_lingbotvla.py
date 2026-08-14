@@ -45,6 +45,9 @@ from lingbotvla.utils.arguments import EvalArguments, DataArguments, ModelArgume
 from lingbotvla.utils.dist_utils import all_reduce
 from lingbotvla.models.config_registry import get_config_registry
 from lingbotvla.models.vla.lingbot_vla.tactile_vtla import TactileVTLAConfig
+from lingbotvla.models.vla.lingbot_vla.tactile_action_expert import (
+    TactileRefinementConfig,
+)
 
 from lingbotvla.models.vla.vision_models.module_utils import (
     build_depth_model,
@@ -155,7 +158,17 @@ def log_vtla_parameter_stats(model: "torch.nn.Module", param_groups) -> None:
     tactile = sum(
         parameter.numel()
         for name, parameter in model.named_parameters()
-        if parameter.requires_grad and ".tactile_encoder." in name
+        if parameter.requires_grad and any(
+            fragment in name
+            for fragment in (
+                ".tactile_encoder.",
+                ".tactile_expert.",
+                ".marker_to_tactile_proj.",
+                ".tactile_time_embedder.",
+                ".tactile_action_in_proj.",
+                ".tactile_action_out_proj.",
+            )
+        )
     )
     action = sum(
         parameter.numel()
@@ -197,6 +210,10 @@ def save_vtla_runtime_metadata(model: "torch.nn.Module", args_train) -> dict[str
         if parameter.requires_grad
     )
     resolved = settings.to_dict()
+    refinement = TactileRefinementConfig.from_mapping(
+        getattr(args_train, "tactile_refinement", None)
+    )
+    resolved["tactile_refinement"] = refinement.to_dict()
     marker_tokens_per_sensor = (
         settings.marker_tokens_per_sensor if settings.use_markers else 0
     )
@@ -439,6 +456,12 @@ class MyTrainingArguments(TrainingArguments):
     tactile: Dict[str, Any] = field(
         default_factory=dict,
         metadata={"help": "Minimal TacThru VTLA input configuration."},
+    )
+    tactile_refinement: Dict[str, Any] = field(
+        default_factory=dict,
+        metadata={
+            "help": "Three-stream Tactile Expert and cascaded-flow configuration."
+        },
     )
     freeze_vlm: bool = field(
         default=False,

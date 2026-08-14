@@ -242,6 +242,7 @@ def load_model_weights(
     buffer_dict     = {name: buffer.clone() for name, buffer in model.named_buffers()}
     parameter_names = {name for name, _ in model.named_parameters()}
     loaded_parameter_names: set[str] = set()
+    initialized_missing_parameters: set[str] = set()
 
     # Get model parameter names
     vlm_param_names  = weight_loader.get_vlm_para_fullnames(model)
@@ -306,6 +307,7 @@ def load_model_weights(
             )
         for name in sorted(allowed_missing):
             _init_parameter(model, name)
+            initialized_missing_parameters.add(name)
         parameter_names.difference_update(allowed_missing)
         if allowed_missing:
             logger.info_rank0(
@@ -340,6 +342,13 @@ def load_model_weights(
             else:
                 if not any(keyword in name for keyword in exclude_keywords):
                     _init_parameter(model, name)
+
+    post_load_hook = getattr(model, "checkpoint_post_load", None)
+    if post_load_hook is not None:
+        post_load_hook(
+            loaded_parameter_names=set(loaded_parameter_names),
+            initialized_missing_parameters=initialized_missing_parameters,
+        )
 
     # we should tie embeddings after loading weights because to_empty() leads to untied weights,
     # except for fsdp1 (custom init) and fsdp2 (swap tensor) contexts.
