@@ -15,6 +15,7 @@ from lingbotvla.models.vla.lingbot_vla.configuration_lingbot_vla import (
 )
 from lingbotvla.models.vla.lingbot_vla.modeling_lingbot_vla_v2 import (
     LingbotVlaV2Policy,
+    QwenvlWithExpertV2Config,
     QwenvlWithExpertV2Model,
 )
 from lingbotvla.models.vla.lingbot_vla.tactile_action_expert import (
@@ -117,6 +118,11 @@ def test_three_stream_config_and_split_schedule():
                 },
             }
         )
+
+
+def test_joint_model_config_preserves_use_cache():
+    assert QwenvlWithExpertV2Config(use_cache=True).use_cache is True
+    assert QwenvlWithExpertV2Config(use_cache=False).use_cache is False
 
 
 def test_training_yaml_resolves_exact_first_version_contract():

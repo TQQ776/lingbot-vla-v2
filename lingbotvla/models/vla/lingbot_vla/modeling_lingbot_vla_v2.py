@@ -92,6 +92,7 @@ class QwenvlWithExpertV2Config(PretrainedConfig):
         self.expert_vision_type = expert_vision_type
         self.vocab_size = vocab_size
         self.use_lm_head = use_lm_head
+        self.use_cache = bool(use_cache)
         self.action_num_attention_heads = action_num_attention_heads
         self.action_num_key_value_heads = action_num_key_value_heads
         self.action_head_dim = action_head_dim
