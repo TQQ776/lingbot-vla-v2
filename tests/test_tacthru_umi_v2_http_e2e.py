@@ -15,7 +15,9 @@ from deploy.tacthru_umi_v2.http_server import (
 from deploy.tacthru_umi_v2.protocol import (
     FastPredictRequest,
     Observation,
+    SlowActionPlanRequest,
     SlowContextRequest,
+    TactileRefineRequest,
 )
 from deploy.tacthru_umi_v2.realman_client import LingBotV2HttpClient, validate_server_health
 
@@ -89,6 +91,36 @@ class FakeCachePolicy(FakePolicy):
         return {"action": actions}, {"fast_replan_total_ms": 2.0}
 
 
+class FakeCascadedPolicy(FakeCachePolicy):
+    def __init__(self):
+        super().__init__()
+        self.config.tactile_refinement = {
+            "enabled": True,
+            "mode": "cascaded_flow",
+        }
+        self.plan_inputs = []
+        self.refine_inputs = []
+
+    def build_slow_action_plan(self, context, observation, *, action_offset):
+        self.plan_inputs.append((context, dict(observation), action_offset))
+        return SimpleNamespace(
+            profile_ms={"slow_action_stage_ms": 6.0},
+            immutable_split=object(),
+        )
+
+    def refine_action_with_tactile(self, plan, observation, *, action_offset):
+        self.refine_inputs.append((plan, dict(observation), action_offset))
+        actions = np.tile(
+            np.asarray(
+                [0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.03],
+                dtype=np.float32,
+            ),
+            (50, 1),
+        )
+        actions[action_offset:, 0] += 0.001 * action_offset
+        return {"action": actions}, {"tactile_refinement_ms": 1.5}
+
+
 def _slow_request(session_id: str = "session-cache", value: int = 10):
     return SlowContextRequest(
         instruction="Insert the Ethernet cable",
@@ -113,6 +145,23 @@ def _fast_request(session_id: str = "session-cache", context_version: int | None
         session_id=session_id,
         context_version=context_version,
         marker_timestamp=10.2,
+    )
+
+
+def _refine_request(context_version: int, plan_version: int, action_offset: int = 2):
+    fast = _fast_request(context_version=context_version)
+    return TactileRefineRequest(
+        state=fast.state,
+        marker_displacement_history=fast.marker_displacement_history,
+        marker_valid_mask=fast.marker_valid_mask,
+        marker_history_valid_mask=fast.marker_history_valid_mask,
+        marker_contact_state=fast.marker_contact_state,
+        tactile_sensor_mask=fast.tactile_sensor_mask,
+        session_id=fast.session_id,
+        context_version=context_version,
+        plan_version=plan_version,
+        action_offset=action_offset,
+        marker_timestamp=fast.marker_timestamp,
     )
 
 
@@ -163,6 +212,19 @@ def test_compile_warmup_uses_the_real_task_instruction() -> None:
     assert result["instruction"] == "Insert the Ethernet cable."
     assert result["action_shape"] == [50, 8]
     assert policy.inputs[-1]["task"] == "Insert the Ethernet cable."
+
+
+def test_cascaded_warmup_exercises_context_plan_and_refine() -> None:
+    policy = FakeCascadedPolicy()
+    backend = make_backend(policy)
+
+    result = backend.warmup(instruction="Insert the Ethernet cable.")
+
+    assert result["warmup_mode"] == "cascaded_flow"
+    assert result["action_shape"] == [50, 8]
+    assert len(policy.slow_contexts) == 1
+    assert len(policy.plan_inputs) == 1
+    assert len(policy.refine_inputs) == 1
 
 
 def tactile_contract(*, gated: bool = False, history_length: int = 8) -> dict:
@@ -405,6 +467,68 @@ def test_http_slow_refresh_then_marker_only_fast_predict_roundtrip() -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2.0)
+
+
+def test_http_cascaded_plan_and_repeated_refine_keep_one_server_plan() -> None:
+    policy = FakeCascadedPolicy()
+    backend = make_backend(policy)
+    server = create_http_server(backend, host="127.0.0.1", port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    client = LingBotV2HttpClient(
+        f"http://{host}:{port}", timeout_s=5.0, jpeg_quality=100
+    )
+    try:
+        health = client.health()
+        assert health["cascaded_tactile_flow"]["supported"] is True
+        refresh = client.refresh_slow_context(_slow_request())
+        plan = client.build_slow_action_plan(
+            SlowActionPlanRequest(
+                state=_fast_request().state,
+                session_id="session-cache",
+                context_version=refresh["context_version"],
+                action_offset=2,
+            )
+        )
+        first, _ = client.refine_action_timed(
+            _refine_request(refresh["context_version"], plan["plan_version"], 2),
+            expected_steps=50,
+        )
+        second, _ = client.refine_action_timed(
+            _refine_request(refresh["context_version"], plan["plan_version"], 4),
+            expected_steps=50,
+        )
+
+        assert len(policy.plan_inputs) == 1
+        assert len(policy.refine_inputs) == 2
+        assert policy.refine_inputs[0][0] is policy.refine_inputs[1][0]
+        assert [entry[2] for entry in policy.refine_inputs] == [2, 4]
+        assert first.metadata["plan_version_used"] == plan["plan_version"]
+        assert second.metadata["action_offset"] == 4
+    finally:
+        client.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+
+
+def test_context_refresh_invalidates_cascaded_plan() -> None:
+    backend = make_backend(FakeCascadedPolicy())
+    first = backend.refresh_slow_context(_slow_request(value=10))
+    plan = backend.build_slow_action_plan(
+        SlowActionPlanRequest(
+            state=_fast_request().state,
+            session_id="session-cache",
+            context_version=first["context_version"],
+            action_offset=2,
+        )
+    )
+    backend.refresh_slow_context(_slow_request(value=11))
+    with pytest.raises(ValueError, match="No active slow action plan"):
+        backend.refine_action_with_tactile(
+            _refine_request(first["context_version"], plan["plan_version"], 2)
+        )
 
 
 def test_vtla_backend_rejects_request_that_omits_checkpoint_modalities() -> None:

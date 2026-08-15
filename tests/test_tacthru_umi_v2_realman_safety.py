@@ -153,6 +153,35 @@ def test_fixed_exec_window_ignores_online_delay_index_shift() -> None:
     assert plan.selected_indices.tolist() == [2, 3, 4, 5]
 
 
+def test_cascaded_rollout_can_advance_absolute_execution_window() -> None:
+    runtime = make_runtime(fixed_exec_window=True, exec_start_step=2, exec_end_step=4)
+    observation_state = np.asarray(
+        [0, 0, 0, 0, 0, 0, 1, 0.04], dtype=np.float32
+    )
+    first = runtime.plan_action_chunk(
+        make_actions(),
+        observation_state=observation_state,
+        observation_timestamp=100.0,
+        control_frequency_hz=30.0,
+        now=100.0,
+        exec_start_step=2,
+        exec_end_step=4,
+    )
+    second = runtime.plan_action_chunk(
+        make_actions(),
+        observation_state=observation_state,
+        observation_timestamp=100.0,
+        control_frequency_hz=30.0,
+        now=100.0,
+        exec_start_step=4,
+        exec_end_step=6,
+    )
+
+    assert first.selected_indices.tolist() == [2, 3]
+    assert second.selected_indices.tolist() == [4, 5]
+    assert second.debug["configured_exec_window"] == [4, 6]
+
+
 def test_large_jump_is_rejected_before_any_robot_call() -> None:
     runtime = make_runtime(max_target_delta_m=0.05)
     actions = make_actions()

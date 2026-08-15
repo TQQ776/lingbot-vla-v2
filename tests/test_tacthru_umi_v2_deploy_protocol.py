@@ -8,15 +8,21 @@ from deploy.tacthru_umi_v2.protocol import (
     ActionResponse,
     FastPredictRequest,
     Observation,
+    SlowActionPlanRequest,
     SlowContextRequest,
+    TactileRefineRequest,
     action_response_from_payload,
     action_response_to_payload,
     fast_predict_from_payload,
     fast_predict_to_payload,
     observation_from_payload,
     observation_to_payload,
+    slow_action_plan_from_payload,
+    slow_action_plan_to_payload,
     slow_context_from_payload,
     slow_context_to_payload,
+    tactile_refine_from_payload,
+    tactile_refine_to_payload,
 )
 
 
@@ -276,3 +282,48 @@ def test_fast_payload_is_marker_only_and_contains_no_rgb_data() -> None:
     assert "rgb" not in payload["tactile"]
     assert decoded.context_version == 2
     assert decoded.marker_displacement_history.shape == (1, 4, 48, 2)
+
+
+def test_cascaded_plan_and_refine_protocol_roundtrip() -> None:
+    tactile = tactile_observation(history_length=4)
+    plan = SlowActionPlanRequest(
+        state=tactile.state,
+        session_id="session-cascade",
+        context_version=3,
+        action_offset=2,
+        request_id="plan-1",
+        timestamp=11.0,
+    )
+    decoded_plan = slow_action_plan_from_payload(slow_action_plan_to_payload(plan))
+    assert decoded_plan.context_version == 3
+    assert decoded_plan.action_offset == 2
+
+    refine = TactileRefineRequest(
+        state=tactile.state,
+        marker_displacement_history=tactile.marker_displacement_history,
+        marker_valid_mask=tactile.marker_valid_mask,
+        marker_history_valid_mask=tactile.marker_history_valid_mask,
+        marker_contact_state=tactile.marker_contact_state,
+        tactile_sensor_mask=tactile.tactile_sensor_mask,
+        session_id="session-cascade",
+        context_version=3,
+        plan_version=7,
+        action_offset=4,
+        request_id="refine-1",
+        marker_timestamp=11.1,
+    )
+    payload = tactile_refine_to_payload(refine)
+    decoded_refine = tactile_refine_from_payload(payload)
+    assert "images" not in payload and "rgb" not in payload["tactile"]
+    assert decoded_refine.plan_version == 7
+    assert decoded_refine.action_offset == 4
+
+    with pytest.raises(ValueError, match="action_offset"):
+        slow_action_plan_to_payload(
+            SlowActionPlanRequest(
+                state=tactile.state,
+                session_id="session-cascade",
+                context_version=3,
+                action_offset=51,
+            )
+        )

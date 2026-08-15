@@ -65,6 +65,14 @@ class PolicySlowContext:
     raw_observation: dict
     profile_ms: dict[str, float]
 
+
+@dataclass
+class PolicySlowActionPlan:
+    plan: object
+    transformed_observation: dict
+    profile_ms: dict[str, float]
+    last_refined_actions: Tensor | None = None
+
 class PolicyPreprocessMixin:
     @staticmethod
     def _to_device_image_grid_thw(image_grid_thw, device):
@@ -271,7 +279,12 @@ class PolicyPreprocessMixin:
         tactile = self._tactile_model_kwargs(
             applied, device=device, dtype=dtype, batched=False
         )
-        cache = self.build_slow_cache(
+        build_cache = (
+            self.build_cascaded_slow_context
+            if getattr(self.config, "tactile_refinement_enabled", False)
+            else self.build_slow_cache
+        )
+        cache = build_cache(
             images.to(device=device, dtype=dtype),
             img_masks.to(device=device),
             lang_tokens.to(device=device),
@@ -292,6 +305,72 @@ class PolicyPreprocessMixin:
             raw_observation=dict(observation),
             profile_ms=profile,
         )
+
+    @torch.no_grad()
+    def build_policy_slow_action_plan(
+        self,
+        context: PolicySlowContext,
+        observation: dict,
+        *,
+        action_offset: int,
+        use_bf16: bool,
+    ) -> PolicySlowActionPlan:
+        applied = dict(context.raw_observation)
+        state = observation["state"]
+        if state.ndim == 1:
+            state = state.unsqueeze(0)
+        applied["state"] = state
+        dtype = torch.bfloat16 if use_bf16 else torch.float32
+        plan = self.build_slow_action_plan(
+            context.cache,
+            state.to(device="cuda", dtype=dtype),
+            action_offset=action_offset,
+        )
+        return PolicySlowActionPlan(
+            plan=plan,
+            transformed_observation=applied,
+            profile_ms=dict(plan.profile_ms),
+        )
+
+    @torch.no_grad()
+    def refine_policy_action_with_tactile(
+        self,
+        policy_plan: PolicySlowActionPlan,
+        observation: dict,
+        *,
+        action_offset: int,
+        use_bf16: bool,
+    ) -> tuple[Tensor, dict[str, float]]:
+        dtype = torch.bfloat16 if use_bf16 else torch.float32
+        state = observation["state"]
+        if state.ndim == 1:
+            state = state.unsqueeze(0)
+        tactile = self._tactile_model_kwargs(
+            observation, device="cuda", dtype=dtype, batched=False
+        )
+        requested_offset = int(action_offset)
+        effective_offset = (
+            0 if policy_plan.last_refined_actions is None else requested_offset
+        )
+        fixed_prefix = None
+        if policy_plan.last_refined_actions is not None and requested_offset > 0:
+            fixed_prefix = policy_plan.last_refined_actions[:, :requested_offset]
+        actions, profile = self.refine_action_with_tactile(
+            policy_plan.plan,
+            state=state.to(device="cuda", dtype=dtype),
+            marker_displacement_history=tactile["marker_displacement_history"],
+            marker_valid_mask=tactile["marker_valid_mask"],
+            marker_history_valid_mask=tactile["marker_history_valid_mask"],
+            marker_contact_state=tactile["marker_contact_state"],
+            tactile_sensor_mask=tactile.get("tactile_sensor_mask"),
+            action_offset=effective_offset,
+            fixed_action_prefix=fixed_prefix,
+            return_profile=True,
+        )
+        policy_plan.last_refined_actions = actions.detach().clone()
+        profile["requested_action_offset"] = float(requested_offset)
+        profile["effective_refinement_offset"] = float(effective_offset)
+        return actions.to(dtype=torch.float32, device="cpu"), profile
 
     @torch.no_grad()
     def infer_fast(
@@ -406,6 +485,18 @@ class LingbotVLAv2Server:
                 f"reinitialized={report['reinitialized_keys']} "
                 f"ignored={report['intentionally_ignored_keys']} "
                 f"incompatibilities={report['config_incompatibilities']}"
+            )
+        untrained_refinement_keys = sorted(
+            set(report.get("tactile_refinement_initialized_keys", []))
+            | set(
+                report.get("tactile_refinement_upgrade_initialized_keys", [])
+            )
+        )
+        if untrained_refinement_keys:
+            raise RuntimeError(
+                "Checkpoint has untrained tactile-refinement parameters and cannot "
+                "be used for inference before retraining; newly initialized "
+                f"parameters={untrained_refinement_keys}"
             )
         return report
 
@@ -652,6 +743,75 @@ class LingbotVLAv2Server:
             use_bf16=self.use_bf16,
         )
         profile["fast_preprocess_ms"] = preprocess_ms
+        return self._unapply_batched_actions([applied], normalized_actions), profile
+
+    def _normalize_policy_state(self, raw_state) -> Tensor:
+        raw = {"observation.state": torch.as_tensor(raw_state)}
+        converted = self.vla.feature_transform.convert_features(raw, w_action=False)
+        converted = self.vla.feature_transform.normalizer.normalize(converted)
+        state_parts = []
+        for joint in self.vla.feature_transform.feature_config.joints:
+            key = f"observation.state.{joint}"
+            width = self.vla.feature_transform.feature_config.joints_max_dim[joint]
+            if key in self.vla.feature_transform.states:
+                value = torch.as_tensor(converted[key], dtype=torch.float32)
+                state_parts.append(F.pad(value, (0, width - value.shape[-1])))
+            else:
+                state_parts.append(torch.zeros(width, dtype=torch.float32))
+        state = torch.cat(state_parts, dim=-1)
+        return F.pad(state, (0, self.config.max_state_dim - state.shape[-1]))
+
+    def build_slow_action_plan(
+        self,
+        context: PolicySlowContext,
+        observation: dict,
+        *,
+        action_offset: int,
+    ) -> PolicySlowActionPlan:
+        started = time.perf_counter()
+        state = self._normalize_policy_state(observation["observation.state"])
+        plan = self.vla.build_policy_slow_action_plan(
+            context,
+            {"state": state},
+            action_offset=action_offset,
+            use_bf16=self.use_bf16,
+        )
+        plan.profile_ms["slow_plan_preprocess_ms"] = (
+            time.perf_counter() - started
+        ) * 1000.0
+        return plan
+
+    def refine_action_with_tactile(
+        self,
+        plan: PolicySlowActionPlan,
+        observation: dict,
+        *,
+        action_offset: int,
+    ):
+        started = time.perf_counter()
+        state = self._normalize_policy_state(observation["observation.state"])
+        transformed = {"state": state}
+        for key in (
+            "marker_displacement_history",
+            "marker_valid_mask",
+            "marker_history_valid_mask",
+            "marker_contact_state",
+            "tactile_sensor_mask",
+        ):
+            value = observation.get(key)
+            if value is not None:
+                transformed[key] = torch.as_tensor(value)
+        normalized_actions, profile = self.vla.refine_policy_action_with_tactile(
+            plan,
+            transformed,
+            action_offset=action_offset,
+            use_bf16=self.use_bf16,
+        )
+        profile["tactile_refine_preprocess_ms"] = (
+            time.perf_counter() - started
+        ) * 1000.0
+        applied = dict(plan.transformed_observation)
+        applied["state"] = state
         return self._unapply_batched_actions([applied], normalized_actions), profile
 
     @staticmethod

@@ -34,6 +34,12 @@ from .utils import (
     prefix_query_token_spans,
     sample_beta,
 )
+from .tactile_action_expert import (
+    TactileActionExpert,
+    TactileRefinementConfig,
+    sinusoidal_position_embedding,
+    sinusoidal_time_embedding,
+)
 from .tactile_vtla import TactileTokenEncoder, TactileVTLAConfig
 from .flex_attention import build_block_mask, flex_attention_forward, flex_attention_with_block_mask
 from lingbotvla.models.loader import LingBotVLAWeightLoader
@@ -72,6 +78,8 @@ class VTLASlowCache:
     scene_timestamp: float | None = None
     tactile_rgb_timestamp: float | None = None
     profile_ms: dict[str, float] = field(default_factory=dict)
+    final_hidden_states: Tensor | None = None
+    includes_task_queries: bool = False
 
 
 @dataclass(frozen=True)
@@ -83,6 +91,21 @@ class VTLAFastPrefix:
     position_ids: Tensor
     marker_token_count: int
     query_token_count: int
+    profile_ms: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class SlowActionPlan:
+    """Reusable intermediate action state at the cascaded FM split."""
+
+    x_split: Tensor
+    action_context: Tensor
+    tau_split: float
+    noise: Tensor
+    state: Tensor
+    slow_context: VTLASlowCache
+    action_offset: int
+    version: int
     profile_ms: dict[str, float] = field(default_factory=dict)
 
 
@@ -578,6 +601,45 @@ class FlowMatchingV2(FlowMatchingV1):
             self.future_video_share_future_depth_query = False
             self.block_future_depth_to_action = False
 
+        self.tactile_refinement_settings = TactileRefinementConfig.from_mapping(
+            getattr(self.config, "tactile_refinement", None)
+        )
+        self.tactile_action_expert: TactileActionExpert | None = None
+        self.tactile_state_proj: nn.Linear | None = None
+        self.tactile_action_in_proj: nn.Linear | None = None
+        self.tactile_action_out_proj: nn.Linear | None = None
+        self.tactile_context_proj: nn.Linear | None = None
+        self.tactile_plan_proj: nn.Linear | None = None
+        self.tactile_marker_proj: nn.Linear | None = None
+        self.tactile_time_mlp: nn.Sequential | None = None
+        if self.tactile_refinement_settings.cascaded_enabled:
+            self._require_cascaded_tactile_contract()
+            expert_cfg = self.tactile_refinement_settings.expert
+            self.tactile_action_expert = TactileActionExpert(expert_cfg)
+            self.tactile_state_proj = nn.Linear(
+                self.config.max_state_dim, expert_cfg.hidden_size
+            )
+            self.tactile_action_in_proj = nn.Linear(
+                self.config.max_action_dim, expert_cfg.hidden_size
+            )
+            self.tactile_action_out_proj = nn.Linear(
+                expert_cfg.hidden_size, self.config.max_action_dim
+            )
+            self.tactile_context_proj = nn.Linear(
+                vlm_hidden_size, expert_cfg.hidden_size
+            )
+            self.tactile_plan_proj = nn.Linear(
+                self.config.proj_width, expert_cfg.hidden_size
+            )
+            self.tactile_marker_proj = nn.Linear(
+                vlm_hidden_size, expert_cfg.hidden_size
+            )
+            self.tactile_time_mlp = nn.Sequential(
+                nn.Linear(expert_cfg.hidden_size, expert_cfg.hidden_size),
+                nn.SiLU(),
+                nn.Linear(expert_cfg.hidden_size, expert_cfg.hidden_size),
+            )
+
         self.set_requires_grad()
 
     def set_requires_grad(self):
@@ -593,6 +655,70 @@ class FlowMatchingV2(FlowMatchingV1):
                 self.action_time_mlp_out,
             ):
                 module.requires_grad_(False)
+        if self.tactile_refinement_settings.cascaded_enabled:
+            training = self.tactile_refinement_settings.training
+            if training.freeze_vlm:
+                self.qwenvl_with_expert.qwenvl.requires_grad_(False)
+            if training.freeze_action_expert:
+                self.qwenvl_with_expert.qwen_expert.requires_grad_(False)
+                for module in (
+                    self.state_proj,
+                    self.action_in_proj,
+                    self.action_out_proj,
+                    self.action_time_mlp_in,
+                    self.action_time_mlp_out,
+                ):
+                    module.requires_grad_(False)
+            if self.tactile_encoder is not None:
+                # TacRGB and Marker share this container. The cascaded stage may
+                # train the Marker encoder, but it must not silently unfreeze the
+                # TacRGB projection or shared sensor embedding.
+                self.tactile_encoder.requires_grad_(False)
+                marker_parameter_prefixes = (
+                    "marker_encoder.",
+                    "regional_marker_encoder.",
+                    "point_spatiotemporal_marker_encoder.",
+                    "marker_temporal_embedding.",
+                    "marker_spatial_embedding.",
+                )
+                marker_parameter_names = {"marker_modality_embedding"}
+                for name, parameter in self.tactile_encoder.named_parameters():
+                    if name in marker_parameter_names or name.startswith(
+                        marker_parameter_prefixes
+                    ):
+                        parameter.requires_grad_(training.train_marker_encoder)
+            for module in (
+                self.tactile_action_expert,
+                self.tactile_state_proj,
+                self.tactile_action_in_proj,
+                self.tactile_action_out_proj,
+                self.tactile_context_proj,
+                self.tactile_plan_proj,
+                self.tactile_marker_proj,
+                self.tactile_time_mlp,
+            ):
+                assert module is not None
+                module.requires_grad_(training.train_tactile_expert)
+
+    def _require_cascaded_tactile_contract(self) -> None:
+        settings = self.tactile_settings
+        if self.tactile_encoder is None or not settings.enabled:
+            raise RuntimeError("cascaded_flow requires tactile encoding")
+        if not settings.use_rgb or not settings.use_markers:
+            raise RuntimeError("cascaded_flow requires TacThru RGB and markers")
+        if (
+            settings.num_sensors != 1
+            or settings.marker_history_length != 4
+            or settings.num_markers != 48
+            or settings.marker_tokenization.mode != "point_spatiotemporal"
+        ):
+            raise RuntimeError(
+                "cascaded_flow requires one sensor and 4x48 point-spatiotemporal tokens"
+            )
+        if settings.marker_contact_gate.target != "marker_only":
+            raise RuntimeError("cascaded_flow requires gate target marker_only")
+        if not getattr(self.config, "vlm_causal", False):
+            raise RuntimeError("cascaded_flow requires vlm_causal=true")
 
     def embed_prefix(
         self,
@@ -877,6 +1003,7 @@ class FlowMatchingV2(FlowMatchingV1):
         tactile_sensor_mask,
         tactile_rgb_mask,
         _slow_only: bool = False,
+        _include_task_queries: bool = False,
         _return_cache_metadata: bool = False,
         _profile_ms: dict[str, float] | None = None,
     ):
@@ -1314,7 +1441,7 @@ class FlowMatchingV2(FlowMatchingV1):
                     _append(lang_emb, lang_masks, lang_tokens.to(device))
                     for block in tactile_blocks:
                         _append(*block)
-                elif _slow_only:
+                elif _slow_only and not _include_task_queries:
                     continue
                 elif segment_name == "current_depth":
                     _append(align_embs, align_pad_masks, fake_align_ids)
@@ -1670,6 +1797,343 @@ class FlowMatchingV2(FlowMatchingV1):
         start, end = query_spans["current_depth"]
         return hidden_states[:, start:end, :]
 
+    def sample_cascaded_times(
+        self,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        base_time: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """Sample one time in each non-overlapping cascaded FM interval."""
+
+        split = self.tactile_refinement_settings.tau_split
+        if base_time is None:
+            base_slow = torch.rand(batch_size, device=device, dtype=dtype)
+            base_tactile = torch.rand(batch_size, device=device, dtype=dtype)
+        elif base_time.ndim == 1:
+            if tuple(base_time.shape) != (batch_size,):
+                raise ValueError("base_time must be [B] or [B,2]")
+            base_slow = base_time.to(device=device, dtype=dtype)
+            # A legacy [B] training time controls the slow sample. The tactile
+            # half still receives an independent sample as required by the
+            # two-loss cascaded objective. Use [B,2] for fully explicit times.
+            base_tactile = torch.rand(batch_size, device=device, dtype=dtype)
+        elif base_time.ndim == 2 and tuple(base_time.shape) == (batch_size, 2):
+            slow_time = base_time[:, 0].to(device=device, dtype=dtype)
+            tactile_time = base_time[:, 1].to(device=device, dtype=dtype)
+            if not ((slow_time >= split).all() and (slow_time <= 1).all()):
+                raise ValueError("Explicit slow time must lie in [tau_split, 1]")
+            if not ((tactile_time >= 0).all() and (tactile_time <= split).all()):
+                raise ValueError("Explicit tactile time must lie in [0, tau_split]")
+            return slow_time, tactile_time
+        else:
+            raise ValueError("base_time must be [B] or [B,2]")
+        if not ((base_slow >= 0).all() and (base_slow <= 1).all()):
+            raise ValueError("base_time values must lie in [0,1]")
+        slow_time = split + (1.0 - split) * base_slow
+        tactile_time = split * base_tactile
+        return slow_time, tactile_time
+
+    def _slow_context_mask_from_pad(self, pad_mask: Tensor) -> Tensor:
+        cache = VTLASlowCache(
+            past_key_values={},
+            pad_masks=pad_mask,
+            att_masks=torch.ones_like(pad_mask),
+            input_ids=torch.zeros_like(pad_mask, dtype=torch.long),
+            position_ids=torch.zeros(
+                3, pad_mask.shape[0], pad_mask.shape[1],
+                device=pad_mask.device, dtype=torch.long,
+            ),
+            rope_grid_thw=torch.empty(0, 3, device=pad_mask.device, dtype=torch.long),
+            prefix_len=pad_mask.shape[1],
+            includes_task_queries=True,
+        )
+        return self._tactile_slow_context_mask(cache)
+
+    def _compute_alignment_losses(
+        self,
+        outputs_embeds: Tensor,
+        *,
+        depth_targets,
+        img_masks,
+        future_depth_targets,
+        future_video_targets,
+        future_video_cls_targets,
+        future_video_current_patch,
+    ):
+        align_metrics: dict[str, Tensor] = {}
+        if self.config.align_params == {}:
+            return 0, 0, 0, None, None, None, None, align_metrics
+        loss_depth, loss_future_depth, depth_preds, future_depth_preds = (
+            self.depth_emb_forward(
+                outputs_embeds, depth_targets, img_masks, future_depth_targets
+            )
+        )
+        loss_depth = loss_depth * self.config.align_params["depth_loss_weight"]
+        loss_future_depth = loss_future_depth * self.config.align_params.get(
+            "future_depth_loss_weight", 1.0
+        )
+        loss_future_video = 0
+        future_video_preds = None
+        current_video_preds = None
+        if getattr(self, "use_future_video", False):
+            loss_video, future_video_preds, video_metrics = self.video_emb_forward(
+                outputs_embeds,
+                future_video_targets,
+                future_video_cls_targets=future_video_cls_targets,
+                future_video_current_patch=future_video_current_patch,
+            )
+            video_total_loss = loss_video
+            if (
+                getattr(self, "use_current_video_patch", False)
+                and future_video_current_patch is not None
+            ):
+                (
+                    current_video_loss,
+                    current_video_preds,
+                    current_video_metrics,
+                ) = self.current_video_emb_forward(
+                    outputs_embeds, future_video_current_patch
+                )
+                video_total_loss = video_total_loss + current_video_loss
+                video_metrics.update(current_video_metrics)
+                video_metrics["align/current_video_loss"] = current_video_loss.detach()
+            video_cfg = self.config.align_params.get("video", {})
+            video_weight = video_cfg.get(
+                "future_video_loss_weight",
+                self.config.align_params.get(
+                    "future_video_loss_weight",
+                    self.config.align_params["depth_loss_weight"],
+                ),
+            )
+            loss_future_video = video_total_loss * video_weight
+            align_metrics.update(video_metrics)
+            if "align/current_video_loss" in align_metrics:
+                align_metrics["align/current_video_loss_weighted"] = (
+                    align_metrics["align/current_video_loss"] * video_weight
+                )
+            align_metrics["align/future_video_loss"] = loss_video.detach()
+            align_metrics["align/future_video_loss_weighted"] = (
+                loss_video * video_weight
+            ).detach()
+            align_metrics["align/video_loss"] = video_total_loss.detach()
+            align_metrics["align/video_loss_weighted"] = loss_future_video.detach()
+        self.steps += 1
+        return (
+            loss_depth,
+            loss_future_depth,
+            loss_future_video,
+            depth_preds,
+            future_depth_preds,
+            future_video_preds,
+            current_video_preds,
+            align_metrics,
+        )
+
+    def _forward_cascaded(
+        self,
+        *,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        actions,
+        noise,
+        time_values,
+        loss_type,
+        depth_targets,
+        image_grid_thw,
+        future_depth_targets,
+        future_video_targets,
+        future_video_cls_targets,
+        future_video_current_patch,
+        tactile_rgb,
+        tactile_rgb_grid_thw,
+        marker_displacement_history,
+        marker_valid_mask,
+        marker_history_valid_mask,
+        marker_contact_state,
+        tactile_sensor_mask,
+        tactile_rgb_mask,
+    ):
+        """Train both halves of cascaded Flow Matching on every batch."""
+
+        dtype, device, batch = state.dtype, state.device, state.shape[0]
+        if noise is None:
+            noise = torch.randn_like(actions)
+        slow_time, tactile_time = self.sample_cascaded_times(
+            batch, device, dtype, time_values
+        )
+        target_velocity = noise - actions
+        x_slow = slow_time[:, None, None] * noise + (
+            1.0 - slow_time[:, None, None]
+        ) * actions
+        x_tactile = tactile_time[:, None, None] * noise + (
+            1.0 - tactile_time[:, None, None]
+        ) * actions
+        (
+            prefix_embs,
+            prefix_pad_masks,
+            prefix_att_masks,
+            prefix_position_ids,
+            visual_pos_masks,
+            deepstack_visual_embeds,
+        ) = self._embed_prefix_vtla(
+            images=images,
+            img_masks=img_masks,
+            lang_tokens=lang_tokens,
+            lang_masks=lang_masks,
+            image_grid_thw=image_grid_thw,
+            tactile_rgb=tactile_rgb,
+            tactile_rgb_grid_thw=tactile_rgb_grid_thw,
+            marker_displacement_history=None,
+            marker_valid_mask=None,
+            marker_history_valid_mask=None,
+            marker_contact_state=None,
+            tactile_sensor_mask=tactile_sensor_mask,
+            tactile_rgb_mask=tactile_rgb_mask,
+            _slow_only=True,
+            _include_task_queries=True,
+        )
+        slow_time_embs, suffix_embs, suffix_pad_masks, suffix_att_masks = (
+            self.embed_suffix(state, x_slow, slow_time)
+        )
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        attention = make_att_2d_masks(pad_masks, att_masks)
+        prefix_len = prefix_pad_masks.shape[1]
+        if self.block_future_depth_to_action:
+            attention = block_suffix_to_fv_(
+                attention,
+                suffix_row_start=prefix_len,
+                prefix_len=prefix_len,
+                num_task_tokens=self.num_task_tokens,
+            )
+        attention = self._block_suffix_to_future_video_if_enabled_(
+            attention, suffix_row_start=prefix_len, prefix_len=prefix_len
+        )
+        position_ids = self._build_full_position_ids(
+            prefix_position_ids, prefix_pad_masks, suffix_pad_masks
+        )
+        (slow_hidden, suffix_out), _, router_logits = (
+            self.qwenvl_with_expert.forward(
+                attention_mask=attention,
+                position_ids=position_ids,
+                vlm_position_ids=prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, suffix_embs],
+                use_cache=self.config.use_cache,
+                fill_kv_cache=True,
+                ada_cond=(
+                    slow_time_embs
+                    if getattr(self.config, "adanorm_time", False)
+                    else None
+                ),
+                visual_pos_masks=visual_pos_masks,
+                deepstack_visual_embeds=deepstack_visual_embeds,
+            )
+        )
+        action_context = suffix_out[:, -self.config.n_action_steps :]
+        suffix_out = action_context
+        slow_velocity = self.action_out_proj(
+            suffix_out.to(self.action_out_proj.weight.dtype)
+        ).to(dtype=dtype)
+        marker_tokens, marker_mask = self.tactile_encoder.encode_markers(
+            marker_displacement_history.to(
+                device=device, dtype=self.tactile_encoder.marker_dtype
+            ),
+            marker_valid_mask.to(device=device, dtype=torch.bool),
+            marker_history_valid_mask.to(device=device, dtype=torch.bool),
+            tactile_sensor_mask,
+            marker_contact_state.to(device=device),
+        )
+        marker_tokens = marker_tokens.flatten(1, 2)
+        marker_mask = marker_mask.flatten(1, 2)
+        tactile_velocity = self._predict_tactile_velocity(
+            state=state,
+            x_t=x_tactile,
+            timestep=tactile_time,
+            marker_tokens=marker_tokens,
+            marker_mask=marker_mask,
+            action_context_tokens=action_context,
+            action_context_mask=torch.ones(
+                action_context.shape[:2], device=device, dtype=torch.bool
+            ),
+            slow_context_tokens=slow_hidden,
+            slow_context_mask=self._slow_context_mask_from_pad(prefix_pad_masks),
+        )
+        if loss_type == "fm":
+            slow_losses = F.mse_loss(
+                target_velocity, slow_velocity, reduction="none"
+            )
+            tactile_losses = F.mse_loss(
+                target_velocity, tactile_velocity, reduction="none"
+            )
+        elif loss_type == "L1_fm":
+            slow_losses = F.l1_loss(
+                target_velocity, slow_velocity, reduction="none"
+            )
+            tactile_losses = F.l1_loss(
+                target_velocity, tactile_velocity, reduction="none"
+            )
+        else:
+            raise ValueError(f"Unsupported cascaded loss_type={loss_type!r}")
+        loss_cfg = self.tactile_refinement_settings.loss
+        losses = (
+            loss_cfg.slow_weight * slow_losses
+            + loss_cfg.tactile_weight * tactile_losses
+        )
+        seq_wise_loss, router_z_loss, metrics = self._moe_losses_and_metrics(
+            router_logits, slow_losses
+        )
+        metrics.update(
+            {
+                "loss/slow_fm": slow_losses.mean().detach(),
+                "loss/tactile_fm": tactile_losses.mean().detach(),
+                "tactile_refinement/marker_valid_ratio": marker_mask.float()
+                .mean()
+                .detach(),
+                "tactile_refinement/gate_on_ratio": self.tactile_encoder
+                .last_marker_diagnostics["contact_on_ratio"],
+                "tactile_refinement/tau_split": losses.new_tensor(
+                    self.tactile_refinement_settings.tau_split
+                ),
+            }
+        )
+        (
+            loss_depth,
+            loss_future_depth,
+            loss_future_video,
+            depth_preds,
+            future_depth_preds,
+            future_video_preds,
+            current_video_preds,
+            align_metrics,
+        ) = self._compute_alignment_losses(
+            slow_hidden,
+            depth_targets=depth_targets,
+            img_masks=img_masks,
+            future_depth_targets=future_depth_targets,
+            future_video_targets=future_video_targets,
+            future_video_cls_targets=future_video_cls_targets,
+            future_video_current_patch=future_video_current_patch,
+        )
+        metrics.update(align_metrics)
+        return (
+            losses,
+            loss_depth,
+            loss_future_depth,
+            loss_future_video,
+            depth_preds,
+            seq_wise_loss,
+            router_z_loss,
+            metrics,
+            future_depth_preds,
+            future_video_preds,
+            current_video_preds,
+        )
+
     def forward(
         self,
         images,
@@ -1696,6 +2160,32 @@ class FlowMatchingV2(FlowMatchingV1):
         tactile_sensor_mask=None,
         tactile_rgb_mask=None,
     ) -> Tensor:
+        if self.tactile_refinement_settings.cascaded_enabled:
+            return self._forward_cascaded(
+                images=images,
+                img_masks=img_masks,
+                lang_tokens=lang_tokens,
+                lang_masks=lang_masks,
+                state=state,
+                actions=actions,
+                noise=noise,
+                time_values=time,
+                loss_type=loss_type,
+                depth_targets=depth_targets,
+                image_grid_thw=image_grid_thw,
+                future_depth_targets=future_depth_targets,
+                future_video_targets=future_video_targets,
+                future_video_cls_targets=future_video_cls_targets,
+                future_video_current_patch=future_video_current_patch,
+                tactile_rgb=tactile_rgb,
+                tactile_rgb_grid_thw=tactile_rgb_grid_thw,
+                marker_displacement_history=marker_displacement_history,
+                marker_valid_mask=marker_valid_mask,
+                marker_history_valid_mask=marker_history_valid_mask,
+                marker_contact_state=marker_contact_state,
+                tactile_sensor_mask=tactile_sensor_mask,
+                tactile_rgb_mask=tactile_rgb_mask,
+            )
         dtype = state.dtype
         device = state.device
         if noise is None:
@@ -1975,6 +2465,7 @@ class FlowMatchingV2(FlowMatchingV1):
         tactile_rgb_mask=None,
         scene_timestamp: float | None = None,
         tactile_rgb_timestamp: float | None = None,
+        include_task_queries: bool = False,
     ) -> VTLASlowCache:
         """Build the reusable Scene -> Language -> tactile RGB VLM cache."""
 
@@ -2005,6 +2496,7 @@ class FlowMatchingV2(FlowMatchingV1):
             tactile_sensor_mask=tactile_sensor_mask,
             tactile_rgb_mask=tactile_rgb_mask,
             _slow_only=True,
+            _include_task_queries=include_task_queries,
             _return_cache_metadata=True,
             _profile_ms=profile,
         )
@@ -2015,7 +2507,7 @@ class FlowMatchingV2(FlowMatchingV1):
             vlm_start.record()
         else:
             vlm_started = time.perf_counter()
-        _, slow_kv, _ = self.qwenvl_with_expert.forward(
+        slow_outputs, slow_kv, _ = self.qwenvl_with_expert.forward(
             attention_mask=slow_attention,
             position_ids=slow_position_ids,
             vlm_position_ids=slow_position_ids,
@@ -2047,7 +2539,290 @@ class FlowMatchingV2(FlowMatchingV1):
             scene_timestamp=scene_timestamp,
             tactile_rgb_timestamp=tactile_rgb_timestamp,
             profile_ms=profile,
+            final_hidden_states=slow_outputs[0] if include_task_queries else None,
+            includes_task_queries=include_task_queries,
         )
+
+    @torch.no_grad()
+    def build_cascaded_slow_context(self, *args, **kwargs) -> VTLASlowCache:
+        """Build Scene/Language/TacRGB/Query context for cascaded inference."""
+
+        if not self.tactile_refinement_settings.cascaded_enabled:
+            raise RuntimeError("cascaded_flow is not enabled")
+        kwargs["include_task_queries"] = True
+        return self.build_slow_cache(*args, **kwargs)
+
+    def _tactile_slow_context_mask(self, slow_cache: VTLASlowCache) -> Tensor:
+        mask = slow_cache.pad_masks.clone().to(dtype=torch.bool)
+        if not slow_cache.includes_task_queries or not self.use_depth_align:
+            return mask
+        spans = prefix_query_token_spans(
+            prefix_len=mask.shape[1],
+            num_task_tokens=self.num_task_tokens,
+            use_depth_align=True,
+            use_future_depth=getattr(self, "use_future_depth", False),
+            use_future_video=getattr(self, "use_future_video", False),
+            use_future_video_cls=getattr(self, "use_future_video_cls", False),
+            use_future_video_patch=getattr(self, "use_future_video_patch", True),
+            future_video_share_future_depth_query=getattr(
+                self, "future_video_share_future_depth_query", False
+            ),
+        )
+        for name, (start, end) in spans.items():
+            if name.startswith("future_"):
+                mask[:, start:end] = False
+        return mask
+
+    def _predict_tactile_velocity(
+        self,
+        *,
+        state: Tensor,
+        x_t: Tensor,
+        timestep: Tensor,
+        marker_tokens: Tensor,
+        marker_mask: Tensor,
+        action_context_tokens: Tensor,
+        action_context_mask: Tensor,
+        slow_context_tokens: Tensor,
+        slow_context_mask: Tensor,
+    ) -> Tensor:
+        modules = (
+            self.tactile_action_expert,
+            self.tactile_state_proj,
+            self.tactile_action_in_proj,
+            self.tactile_action_out_proj,
+            self.tactile_context_proj,
+            self.tactile_plan_proj,
+            self.tactile_marker_proj,
+            self.tactile_time_mlp,
+        )
+        if any(module is None for module in modules):
+            raise RuntimeError("Cascaded tactile modules are not initialized")
+        assert self.tactile_action_expert is not None
+        assert self.tactile_state_proj is not None
+        assert self.tactile_action_in_proj is not None
+        assert self.tactile_action_out_proj is not None
+        assert self.tactile_context_proj is not None
+        assert self.tactile_plan_proj is not None
+        assert self.tactile_marker_proj is not None
+        assert self.tactile_time_mlp is not None
+        if state.ndim != 2 or x_t.ndim != 3:
+            raise ValueError("state and x_t must be [B,D] and [B,T,D]")
+        if action_context_tokens.ndim != 3 or action_context_mask.ndim != 2:
+            raise ValueError("action context and mask must be [B,T,D] and [B,T]")
+        if action_context_tokens.shape[:2] != action_context_mask.shape:
+            raise ValueError("action context and mask lengths differ")
+        if action_context_tokens.shape[0] != state.shape[0]:
+            raise ValueError("action context batch does not match state")
+        if action_context_tokens.shape[1] != x_t.shape[1]:
+            raise ValueError("action context must cover the full action horizon")
+        hidden_dtype = self.tactile_action_in_proj.weight.dtype
+        state_token = self.tactile_state_proj(state.to(hidden_dtype)).unsqueeze(1)
+        action_tokens = self.tactile_action_in_proj(x_t.to(hidden_dtype))
+        time_embedding = sinusoidal_time_embedding(
+            timestep.to(device=x_t.device), action_tokens.shape[-1]
+        ).to(dtype=hidden_dtype)
+        time_embedding = self.tactile_time_mlp(time_embedding).unsqueeze(1)
+        action_positions = sinusoidal_position_embedding(
+            torch.arange(x_t.shape[1], device=x_t.device), action_tokens.shape[-1]
+        ).to(dtype=hidden_dtype)
+        hidden = torch.cat(
+            [state_token, action_tokens + time_embedding + action_positions.unsqueeze(0)],
+            dim=1,
+        )
+        marker_context = self.tactile_marker_proj(marker_tokens.to(hidden_dtype))
+        action_context = self.tactile_plan_proj(
+            action_context_tokens.to(hidden_dtype)
+        )
+        slow_context = self.tactile_context_proj(
+            slow_context_tokens.to(hidden_dtype)
+        )
+        hidden = self.tactile_action_expert(
+            hidden,
+            marker_context,
+            marker_mask,
+            action_context,
+            action_context_mask,
+            slow_context,
+            slow_context_mask,
+        )
+        return self.tactile_action_out_proj(hidden[:, 1:]).to(dtype=x_t.dtype)
+
+    @torch.no_grad()
+    def build_slow_action_plan(
+        self,
+        slow_context: VTLASlowCache,
+        state: Tensor,
+        *,
+        noise: Tensor | None = None,
+        action_offset: int = 0,
+    ) -> SlowActionPlan:
+        """Integrate the original 36-layer Action Expert from 1 to tau_split."""
+
+        if not self.tactile_refinement_settings.cascaded_enabled:
+            raise RuntimeError("cascaded_flow is not enabled")
+        if not slow_context.includes_task_queries:
+            raise ValueError("Cascaded slow context must include task queries")
+        if slow_context.final_hidden_states is None:
+            raise ValueError("Cascaded slow context is missing final hidden states")
+        if not 0 <= action_offset <= self.config.n_action_steps:
+            raise ValueError("action_offset is outside the action chunk")
+        batch, device, dtype = state.shape[0], state.device, state.dtype
+        if noise is None:
+            noise = torch.randn(
+                batch,
+                self.config.n_action_steps,
+                self.config.max_action_dim,
+                device=device,
+                dtype=dtype,
+            )
+        expected_shape = (
+            batch,
+            self.config.n_action_steps,
+            self.config.max_action_dim,
+        )
+        if tuple(noise.shape) != expected_shape:
+            raise ValueError(f"noise must be {expected_shape}, got {tuple(noise.shape)}")
+        settings = self.tactile_refinement_settings
+        step_size = (1.0 - settings.tau_split) / settings.inference.slow_steps
+        x_t = noise.clone()
+        started = time.perf_counter()
+        for step in range(settings.inference.slow_steps):
+            tau = 1.0 - step * step_size
+            velocity = self.predict_velocity(
+                state,
+                slow_context.pad_masks,
+                slow_context.past_key_values,
+                x_t,
+                torch.full((batch,), tau, device=device, dtype=dtype),
+                prefix_position_ids=slow_context.position_ids,
+            )
+            x_t = x_t - step_size * velocity
+        context_started = time.perf_counter()
+        _, action_context = self.predict_velocity(
+            state,
+            slow_context.pad_masks,
+            slow_context.past_key_values,
+            x_t,
+            torch.full(
+                (batch,), settings.tau_split, device=device, dtype=dtype
+            ),
+            prefix_position_ids=slow_context.position_ids,
+            return_action_hidden=True,
+        )
+        context_finished = time.perf_counter()
+        profile = {
+            "slow_action_stage_ms": (context_started - started) * 1000.0,
+            "slow_action_plan_ms": (context_finished - started) * 1000.0,
+        }
+        profile["slow_action_context_ms"] = (
+            context_finished - context_started
+        ) * 1000.0
+        return SlowActionPlan(
+            x_split=x_t.detach().clone(),
+            action_context=action_context.detach().clone(),
+            tau_split=settings.tau_split,
+            noise=noise.detach().clone(),
+            state=state.detach().clone(),
+            slow_context=slow_context,
+            action_offset=int(action_offset),
+            version=slow_context.version,
+            profile_ms=profile,
+        )
+
+    @torch.no_grad()
+    def refine_action_with_tactile(
+        self,
+        plan: SlowActionPlan,
+        *,
+        marker_displacement_history: Tensor,
+        marker_valid_mask: Tensor,
+        marker_history_valid_mask: Tensor,
+        marker_contact_state: Tensor,
+        state: Tensor,
+        tactile_sensor_mask: Tensor | None = None,
+        action_offset: int | None = None,
+        fixed_action_prefix: Tensor | None = None,
+        return_profile: bool = False,
+    ):
+        """Integrate only the tactile expert from tau_split to zero."""
+
+        if not self.tactile_refinement_settings.cascaded_enabled:
+            raise RuntimeError("cascaded_flow is not enabled")
+        if plan.version != plan.slow_context.version:
+            raise ValueError("SlowActionPlan context version is inconsistent")
+        if plan.slow_context.final_hidden_states is None:
+            raise ValueError("SlowActionPlan has no reusable Slow hidden states")
+        offset = plan.action_offset if action_offset is None else int(action_offset)
+        if not 0 <= offset <= plan.x_split.shape[1]:
+            raise ValueError("action_offset is outside the action chunk")
+        if state.shape[0] != plan.x_split.shape[0]:
+            raise ValueError("latest state batch does not match SlowActionPlan")
+        total_started = time.perf_counter()
+        marker_started = time.perf_counter()
+        marker_tokens, marker_mask = self.tactile_encoder.encode_markers(
+            marker_displacement_history.to(
+                device=state.device, dtype=self.tactile_encoder.marker_dtype
+            ),
+            marker_valid_mask.to(device=state.device, dtype=torch.bool),
+            marker_history_valid_mask.to(device=state.device, dtype=torch.bool),
+            tactile_sensor_mask,
+            marker_contact_state.to(device=state.device),
+        )
+        marker_tokens = marker_tokens.flatten(1, 2)
+        marker_mask = marker_mask.flatten(1, 2)
+        marker_ms = (time.perf_counter() - marker_started) * 1000.0
+        if marker_tokens.shape[1] != 192:
+            raise RuntimeError(f"Expected 192 Marker tokens, got {marker_tokens.shape[1]}")
+        x_t = plan.x_split.detach().clone().to(device=state.device, dtype=state.dtype)
+        fixed_prefix = x_t[:, :offset].clone()
+        if fixed_action_prefix is not None:
+            expected_prefix_shape = (x_t.shape[0], offset, x_t.shape[2])
+            if tuple(fixed_action_prefix.shape) != expected_prefix_shape:
+                raise ValueError(
+                    "fixed_action_prefix must have shape "
+                    f"{expected_prefix_shape}, got {tuple(fixed_action_prefix.shape)}"
+                )
+            fixed_prefix = fixed_action_prefix.to(
+                device=state.device, dtype=state.dtype
+            ).detach().clone()
+        settings = self.tactile_refinement_settings
+        step_size = settings.tau_split / settings.inference.tactile_steps
+        slow_tokens = plan.slow_context.final_hidden_states.to(device=state.device)
+        slow_mask = self._tactile_slow_context_mask(plan.slow_context).to(
+            device=state.device
+        )
+        action_context = plan.action_context.to(device=state.device)
+        action_context_mask = torch.ones(
+            action_context.shape[:2], device=state.device, dtype=torch.bool
+        )
+        expert_started = time.perf_counter()
+        for step in range(settings.inference.tactile_steps):
+            tau = settings.tau_split - step * step_size
+            velocity = self._predict_tactile_velocity(
+                state=state,
+                x_t=x_t,
+                timestep=torch.full(
+                    (state.shape[0],), tau, device=state.device, dtype=state.dtype
+                ),
+                marker_tokens=marker_tokens,
+                marker_mask=marker_mask,
+                action_context_tokens=action_context,
+                action_context_mask=action_context_mask,
+                slow_context_tokens=slow_tokens,
+                slow_context_mask=slow_mask,
+            )
+            x_t = x_t - step_size * velocity
+            if offset:
+                x_t[:, :offset] = fixed_prefix
+        expert_ms = (time.perf_counter() - expert_started) * 1000.0
+        output = x_t
+        profile = {
+            "tactile_marker_encode_ms": marker_ms,
+            "tactile_expert_ms": expert_ms,
+            "tactile_refinement_ms": (time.perf_counter() - total_started) * 1000.0,
+        }
+        return (output, profile) if return_profile else output
 
     @torch.no_grad()
     def extend_slow_cache(
@@ -2226,6 +3001,7 @@ class FlowMatchingV2(FlowMatchingV1):
         x_t,
         timestep,
         prefix_position_ids=None,
+        return_action_hidden: bool = False,
     ):
         """Predict velocity at time t using cached Qwen3-VL prefix states."""
         if prefix_position_ids is None:
@@ -2285,6 +3061,8 @@ class FlowMatchingV2(FlowMatchingV1):
             if suffix_out.dtype != self.action_out_proj.weight.dtype:
                 suffix_out = suffix_out.to(self.action_out_proj.weight.dtype)
             v_t = self.action_out_proj(suffix_out)
+        if return_action_hidden:
+            return v_t, suffix_out
         return v_t
 
     def _moe_losses_and_metrics(self, router_logits_list, losses):
@@ -2461,14 +3239,56 @@ class LingbotVlaV2Policy(PreTrainedModel):
         if not getattr(self.config, "tactile_enabled", False):
             return set()
         tactile_prefix = "model.tactile_encoder."
-        if loaded_parameter_names and any(
-            name.startswith(tactile_prefix) for name in loaded_parameter_names
-        ):
-            return set()
-        allowed = {name for name in names if name.startswith(tactile_prefix)}
+        refinement_prefixes = (
+            "model.tactile_action_expert.",
+            "model.tactile_state_proj.",
+            "model.tactile_action_in_proj.",
+            "model.tactile_action_out_proj.",
+            "model.tactile_context_proj.",
+            "model.tactile_plan_proj.",
+            "model.tactile_marker_proj.",
+            "model.tactile_time_mlp.",
+        )
+        refinement_enabled = getattr(
+            self.config, "tactile_refinement_enabled", False
+        )
+        checkpoint_has_refinement = bool(
+            loaded_parameter_names
+            and any(
+                any(name.startswith(prefix) for prefix in refinement_prefixes)
+                for name in loaded_parameter_names
+            )
+        )
+        checkpoint_has_tactile = bool(
+            loaded_parameter_names
+            and any(name.startswith(tactile_prefix) for name in loaded_parameter_names)
+        )
+        allowed = set()
+        if not checkpoint_has_tactile:
+            allowed.update(
+                name for name in names if name.startswith(tactile_prefix)
+            )
+        if refinement_enabled and not checkpoint_has_refinement:
+            allowed.update(
+                name
+                for name in names
+                if any(name.startswith(prefix) for prefix in refinement_prefixes)
+            )
+        if refinement_enabled and checkpoint_has_refinement:
+            allowed.update(
+                name
+                for name in names
+                if (
+                    name.startswith("model.tactile_plan_proj.")
+                    or (
+                        name.startswith("model.tactile_action_expert.")
+                        and (".plan_norm." in name or ".plan_attention." in name)
+                    )
+                )
+            )
         if allowed:
             logger.warning(
-                "Loading a tactile-free checkpoint; initializing missing VTLA parameters: %s",
+                "Initializing checkpoint-compatible VTLA parameters: %s",
                 sorted(allowed),
             )
         return allowed
@@ -2613,6 +3433,15 @@ class LingbotVlaV2Policy(PreTrainedModel):
     def sample_actions_fast(self, *args, **kwargs):
         return self.model.sample_actions_fast(*args, **kwargs)
 
+    def build_cascaded_slow_context(self, *args, **kwargs) -> VTLASlowCache:
+        return self.model.build_cascaded_slow_context(*args, **kwargs)
+
+    def build_slow_action_plan(self, *args, **kwargs) -> SlowActionPlan:
+        return self.model.build_slow_action_plan(*args, **kwargs)
+
+    def refine_action_with_tactile(self, *args, **kwargs):
+        return self.model.refine_action_with_tactile(*args, **kwargs)
+
 
 ModelClass = LingbotVlaV2Policy
 
@@ -2620,6 +3449,7 @@ __all__ = [
     "LingbotVlaV2Policy",
     "VTLASlowCache",
     "VTLAFastPrefix",
+    "SlowActionPlan",
     "Qwen3VLForConditionalGeneration",
     "Qwen3VLTextModel",
     "Qwen3VLPreTrainedModel",

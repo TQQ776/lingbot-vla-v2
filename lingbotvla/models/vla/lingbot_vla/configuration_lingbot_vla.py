@@ -18,6 +18,7 @@ from typing import Any, Dict, Literal, Optional
 
 from transformers import AutoConfig, PretrainedConfig
 
+from .tactile_action_expert import TactileRefinementConfig
 from .tactile_vtla import TactileVTLAConfig
 
 class LingbotVLAConfig(PretrainedConfig):
@@ -96,6 +97,7 @@ class LingbotVLAConfig(PretrainedConfig):
         train_state_proj: bool = True,
 
         tactile: Optional[Dict[str, Any]] = None,
+        tactile_refinement: Optional[Dict[str, Any]] = None,
         freeze_vlm: bool = False,
         train_action_expert: bool = True,
         new_modules_lr: float = 1.0e-4,
@@ -117,6 +119,15 @@ class LingbotVLAConfig(PretrainedConfig):
             raise ValueError("new_modules_lr and action_expert_lr must be positive")
         self.tactile = TactileVTLAConfig.from_mapping(tactile).to_dict()
         self.tactile_enabled = bool(self.tactile["enabled"])
+        self.tactile_refinement = TactileRefinementConfig.from_mapping(
+            tactile_refinement
+        ).to_dict()
+        self.tactile_refinement_enabled = bool(
+            self.tactile_refinement["enabled"]
+            and self.tactile_refinement["mode"] == "cascaded_flow"
+        )
+        if self.tactile_refinement_enabled and not self.tactile_enabled:
+            raise ValueError("cascaded_flow requires tactile.enabled=true")
         self.use_cache = False
         self.attention_implementation = attention_implementation
         self.num_steps = 10
